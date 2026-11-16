@@ -40,7 +40,7 @@ RUN cargo build --release --locked -p link-in-bio \
  && install -D -m 0755 target/release/link-in-bio /out/link-in-bio
 
 # ── Runtime: minimal distroless image ────────────────────────────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
 
 ARG VERSION=dev
 ARG VENDOR="Meddleware"

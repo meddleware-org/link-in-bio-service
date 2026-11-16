@@ -298,8 +298,10 @@ summary:focus-visible,
   border-radius: var(--lib-radius);
   background: var(--lib-accent);
   color: var(--lib-on-accent);
+  max-inline-size: 100%;
   font-weight: 600;
   text-decoration: none;
+  overflow-wrap: anywhere;
 }
 
 :root:not([data-buttons="filled"]) .button {
