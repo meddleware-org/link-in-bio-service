@@ -1,0 +1,9 @@
+target
+**/node_modules
+page/test-results
+page/playwright-report
+.git
+.github
+*.md
+!spec/*.md
+.env*

@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/assets", "crates/api", "crates/cli"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.94"
+license = "0BSD"
+repository = "https://github.com/meddleware-org/link-in-bio-service"
+publish = false
+
+# Exact pins, as in the rest of the fleet: a version changes only through a reviewed Cargo.lock update.
+[workspace.dependencies]
+link-in-bio-core = { path = "crates/core" }
+link-in-bio-assets = { path = "crates/assets" }
+link-in-bio-api = { path = "crates/api" }
+
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["preserve_order"] }
+thiserror = "=2.0.21"
+url = "=2.5.8"
+unicode-segmentation = "=1.13.3"
+unicode-normalization = "=0.1.26"
+maud = "=0.27.0"
+sha2 = "=0.11.1"
+hex = "=0.4.3"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+resvg = { version = "=0.50.0", default-features = false }
+pulldown-cmark = { version = "=0.13.6", default-features = false, features = ["html"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tower-log"] }
+tower = { version = "=0.5.3", default-features = false, features = ["util", "limit", "timeout"] }
+tower-http = { version = "=0.7.1", default-features = false, features = ["timeout", "limit"] }
+tokio = { version = "=1.54.1", default-features = false }
+clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "json", "env-filter", "ansi"] }
+proptest = "=1.12.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+# Arithmetic overflow aborts instead of wrapping silently, even in release builds.
+overflow-checks = true
+# A panic stops the process (Kubernetes restarts the container with clean state).
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true

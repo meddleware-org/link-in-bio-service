@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "identity": {
+    "kind": "person",
+    "displayName": "Ada Example",
+    "handle": "ada",
+    "bio": "Writes software and tends a small garden. Everything I make is free to copy.",
+    "pronouns": "she/her",
+    "avatar": "avatar.svg"
+  },
+  "items": [
+    { "id": "mastodon", "title": "Mastodon", "url": "https://mastodon.example/@ada", "identity": true, "icon": "mastodon" },
+    { "id": "github", "title": "GitHub", "url": "https://github.com/example", "identity": true },
+    { "id": "blog", "title": "Blog", "url": "https://blog.example.org/", "description": "Notes on software and gardening", "icon": "rss" },
+    {
+      "kind": "group",
+      "id": "projects",
+      "title": "Projects",
+      "items": [
+        { "id": "tool-a", "title": "A small tool", "url": "https://tool.example.org/", "description": "Does one thing well", "icon": "code" },
+        { "id": "docs", "title": "Documentation", "url": "https://docs.example.org/", "icon": "docs" }
+      ]
+    },
+    { "id": "email", "title": "Email me", "url": "mailto:ada@example.org" }
+  ],
+  "theme": { "colorMode": "system", "accent": "season", "buttons": "outline", "radius": "md", "density": "comfortable", "layout": "list", "font": "sans" },
+  "support": [{ "kind": "sui-address", "address": "0x0000000000000000000000000000000000000000000000000000000000000001", "label": "Tips (Sui)" }],
+  "cta": { "title": "Make your own page", "description": "One link for every profile.", "action": "Get started", "url": "https://app.example.org/" },
+  "meta": { "lang": "en", "indexable": false }
+}

@@ -1,0 +1,8 @@
+{ "schema": 1, "identity": { "displayName": "Filled cards", "handle": "cards", "bio": "Filled buttons in a card layout with the serif stack.", "avatar": "avatar.svg" },
+  "items": [
+    { "id": "a", "title": "GitHub", "url": "https://github.com/example", "identity": true, "description": "Code" },
+    { "id": "b", "title": "Blog", "url": "https://blog.example.org/", "icon": "rss" },
+    { "id": "c", "title": "YouTube", "url": "https://www.youtube.com/@example" },
+    { "kind": "group", "id": "g", "title": "More", "open": true, "items": [ { "id": "d", "title": "Docs", "url": "https://docs.example.org/" } ] }
+  ],
+  "theme": { "accent": "blue", "buttons": "filled", "layout": "cards", "font": "serif", "radius": "lg" } }

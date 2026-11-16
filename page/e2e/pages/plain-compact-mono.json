@@ -1,0 +1,7 @@
+{ "schema": 1, "identity": { "displayName": "Plain and compact", "handle": "plain" },
+  "items": [
+    { "id": "a", "title": "Website", "url": "https://example.org/" },
+    { "id": "b", "title": "Email", "url": "mailto:hello@example.org" }
+  ],
+  "contact": [ { "label": "Write to me", "url": "mailto:hello@example.org" } ],
+  "theme": { "accent": "moss", "buttons": "plain", "density": "compact", "font": "mono", "radius": "xs" } }

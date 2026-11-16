@@ -1,0 +1,873 @@
+{
+ "description": "Shared parser vectors: each case is a document (or raw text), whose page it is, and the expected outcome (error or warning codes, in any order). The parser in crates/core and the editor's field checks in link-in-bio-ui both run these.",
+ "cases": [
+  {
+   "name": "minimal",
+   "expect": {
+    "ok": true
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    }
+   }
+  },
+  {
+   "name": "full page",
+   "owner": "operator",
+   "expect": {
+    "ok": true
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "kind": "organization",
+     "displayName": "Meddleware",
+     "handle": "meddleware",
+     "bio": "Tools for Sui and Walrus.",
+     "pronouns": "they/them",
+     "avatar": "kopimi-k.svg",
+     "atprotoDid": "did:plc:abcdefghijklmnopqrstuvwx",
+     "nostrPubkey": "0000000000000000000000000000000000000000000000000000000000000001"
+    },
+    "items": [
+     {
+      "id": "gh",
+      "title": "GitHub",
+      "url": "https://github.com/meddleware-org",
+      "identity": true,
+      "icon": "github"
+     },
+     {
+      "kind": "group",
+      "id": "tools",
+      "title": "Tools",
+      "open": true,
+      "items": [
+       {
+        "id": "docs",
+        "title": "Docs",
+        "url": "https://docs.example.org/",
+        "description": "How to use the tools"
+       }
+      ]
+     },
+     {
+      "id": "mail",
+      "title": "Email",
+      "url": "mailto:hello@example.org?subject=Hello"
+     }
+    ],
+    "theme": {
+     "colorMode": "system",
+     "season": "autumn",
+     "accent": "season",
+     "buttons": "filled",
+     "radius": "lg",
+     "density": "compact",
+     "layout": "cards",
+     "font": "rounded"
+    },
+    "contact": [
+     {
+      "label": "Email",
+      "url": "mailto:hello@example.org"
+     }
+    ],
+    "support": [
+     {
+      "kind": "sui-address",
+      "address": "0xE6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6E6",
+      "label": "Tips"
+     }
+    ],
+    "cta": {
+     "title": "Make your own page",
+     "url": "https://app.example.org/"
+    },
+    "meta": {
+     "lang": "en-GB",
+     "indexable": true
+    }
+   }
+  },
+  {
+   "name": "unknown fields are dropped",
+   "expect": {
+    "ok": true,
+    "warnings": [
+     "unknown_field",
+     "unknown_field"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "payments": {
+     "provider": "moonpay",
+     "config": {
+      "sdkUrl": "https://evil.example/x.js",
+      "secretKey": "sk_live"
+     }
+    },
+    "extra": 1
+   }
+  },
+  {
+   "name": "javascript url",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "url_scheme"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "id": "a",
+      "title": "A",
+      "url": "javascript:alert(document.cookie)"
+     }
+    ]
+   }
+  },
+  {
+   "name": "data url",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "url_scheme"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "id": "a",
+      "title": "A",
+      "url": "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=="
+     }
+    ]
+   }
+  },
+  {
+   "name": "http url",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "url_scheme"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "id": "a",
+      "title": "A",
+      "url": "http://example.org/"
+     }
+    ]
+   }
+  },
+  {
+   "name": "credentials in url",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "url_credentials"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "id": "a",
+      "title": "A",
+      "url": "https://user:pass@example.org/"
+     }
+    ]
+   }
+  },
+  {
+   "name": "ip host",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "url_ip_host"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "id": "a",
+      "title": "A",
+      "url": "https://192.168.0.1/"
+     }
+    ]
+   }
+  },
+  {
+   "name": "bidi override in title",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "bidi_control"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "id": "a",
+      "title": "Pay‮gnp.exe",
+      "url": "https://example.org/"
+     }
+    ]
+   }
+  },
+  {
+   "name": "zero width in name",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "invisible_character"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ad​a",
+     "handle": "ada"
+    }
+   }
+  },
+  {
+   "name": "html in text is kept as text",
+   "expect": {
+    "ok": true
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "<img src=x onerror=alert(1)>",
+     "handle": "ada"
+    }
+   }
+  },
+  {
+   "name": "overlong bio",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "too_long"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada",
+     "handle": "ada",
+     "bio": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    }
+   }
+  },
+  {
+   "name": "duplicate ids",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "id_duplicate"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "id": "a",
+      "title": "A",
+      "url": "https://a.example/"
+     },
+     {
+      "id": "a",
+      "title": "B",
+      "url": "https://b.example/"
+     }
+    ]
+   }
+  },
+  {
+   "name": "nested group",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "nested_group"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "kind": "group",
+      "id": "g",
+      "title": "G",
+      "items": [
+       {
+        "kind": "group",
+        "id": "h",
+        "title": "H",
+        "items": []
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "too many links",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "too_many_links"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "id": "l0",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l1",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l2",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l3",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l4",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l5",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l6",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l7",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l8",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l9",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l10",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l11",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l12",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l13",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l14",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l15",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l16",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l17",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l18",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l19",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l20",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l21",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l22",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l23",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l24",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l25",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l26",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l27",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l28",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l29",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l30",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l31",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l32",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l33",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l34",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l35",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l36",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l37",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l38",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l39",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l40",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l41",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l42",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l43",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l44",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l45",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l46",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l47",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l48",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l49",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l50",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l51",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l52",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l53",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l54",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l55",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l56",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l57",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l58",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l59",
+      "title": "L",
+      "url": "https://example.org/"
+     },
+     {
+      "id": "l60",
+      "title": "L",
+      "url": "https://example.org/"
+     }
+    ]
+   }
+  },
+  {
+   "name": "unknown schema",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "unsupported_schema"
+    ]
+   },
+   "document": {
+    "schema": 2,
+    "identity": {
+     "displayName": "Ada",
+     "handle": "ada"
+    }
+   }
+  },
+  {
+   "name": "failing contrast",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "contrast"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "theme": {
+     "colorMode": "light",
+     "accent": "yellow",
+     "buttons": "plain"
+    }
+   }
+  },
+  {
+   "name": "reserved handle for a tenant",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "handle_reserved"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Admin",
+     "handle": "admin"
+    }
+   }
+  },
+  {
+   "name": "punycode-like handle",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "handle_invalid"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "A",
+     "handle": "xn--80ak6aa92e"
+    }
+   }
+  },
+  {
+   "name": "call to action on a tenant page is dropped",
+   "expect": {
+    "ok": true,
+    "warnings": [
+     "dropped"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "cta": {
+     "title": "x",
+     "url": "https://example.org/"
+    }
+   }
+  },
+  {
+   "name": "svg avatar for a tenant",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "avatar_invalid"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada",
+     "handle": "ada",
+     "avatar": "me.svg"
+    }
+   }
+  },
+  {
+   "name": "mailto with cc",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "mailto_invalid"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "id": "a",
+      "title": "A",
+      "url": "mailto:a@example.org?cc=b@example.org"
+     }
+    ]
+   }
+  },
+  {
+   "name": "identity on an email link",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "identity_mailto"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "items": [
+     {
+      "id": "a",
+      "title": "A",
+      "url": "mailto:a@example.org",
+      "identity": true
+     }
+    ]
+   }
+  },
+  {
+   "name": "bad sui address",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "address_invalid"
+    ]
+   },
+   "document": {
+    "schema": 1,
+    "identity": {
+     "displayName": "Ada Lovelace",
+     "handle": "ada"
+    },
+    "support": [
+     {
+      "kind": "sui-address",
+      "address": "0x1234"
+     }
+    ]
+   }
+  },
+  {
+   "name": "not json",
+   "expect": {
+    "ok": false,
+    "codes": [
+     "not_json"
+    ]
+   },
+   "text": "{schema: 1"
+  }
+ ]
+}

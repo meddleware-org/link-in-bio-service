@@ -1,0 +1,383 @@
+/*
+ * Link in Bio page rules. Every colour, size and radius is a design-token role; every theme choice is a data-* attribute
+ * on <html> (crates/core/src/render.rs). The accent per hue, button style and mode is generated from the contrast table
+ * (crates/core/src/theme.rs) and lands in --lib-accent / --lib-on-accent.
+ */
+
+:root {
+  --lib-accent: var(--accent);
+  --lib-on-accent: var(--accent-contrast);
+  --lib-radius: var(--radius);
+  --lib-gap: var(--space-sm);
+  --lib-pad-block: var(--space-sm);
+  --lib-pad-inline: var(--space-md);
+  --lib-font: var(--mw-font-sans);
+  --lib-column: 34rem;
+
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="system"] { color-scheme: light dark; }
+
+:root[data-radius="xs"] { --lib-radius: var(--radius-xs); }
+:root[data-radius="sm"] { --lib-radius: var(--radius-sm); }
+:root[data-radius="md"] { --lib-radius: var(--radius); }
+:root[data-radius="lg"] { --lib-radius: var(--radius-lg); }
+
+:root[data-density="compact"] {
+  --lib-gap: var(--space-xs);
+  --lib-pad-block: var(--space-xs);
+  --lib-pad-inline: var(--space-sm);
+}
+
+/* System font stacks only: nothing is downloaded. Serif and rounded stacks after modern-font-stacks (CC0). */
+:root[data-font="serif"] { --lib-font: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif; }
+:root[data-font="rounded"] { --lib-font: ui-rounded, "SF Pro Rounded", "Hiragino Maru Gothic ProN", "Arial Rounded MT", Calibri, system-ui, sans-serif; }
+:root[data-font="mono"] { --lib-font: var(--mw-font-mono); }
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--lib-font);
+  font-size: 100%;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.page {
+  width: 100%;
+  max-width: var(--lib-column);
+  padding: var(--space-lg) var(--space-md) var(--space-md);
+  flex: 1 0 auto;
+}
+
+/* ── Profile ───────────────────────────────────────────────────────────── */
+.profile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--space-xs);
+  margin-block-end: var(--space-lg);
+}
+
+.avatar {
+  width: 7.5rem;
+  height: 7.5rem;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.name {
+  margin: var(--space-xs) 0 0;
+  font-size: var(--font-size-xl, 1.75rem);
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.pronouns,
+.address {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--font-size-sm, 0.875rem);
+}
+
+.bio {
+  margin: var(--space-2xs) 0 0;
+  max-width: 30rem;
+  overflow-wrap: anywhere;
+}
+
+/* ── Links ─────────────────────────────────────────────────────────────── */
+.links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--lib-gap);
+}
+
+.links > li { min-width: 0; }
+
+:root[data-layout="cards"] { --lib-column: 50rem; }
+:root[data-layout="cards"] .page > .links { grid-template-columns: repeat(auto-fill, minmax(min(100%, 18rem), 1fr)); }
+:root[data-layout="cards"] .page > .links > .group { grid-column: 1 / -1; }
+
+.link {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-height: 3rem;
+  padding: var(--lib-pad-block) var(--lib-pad-inline);
+  border: 2px solid transparent;
+  border-radius: var(--lib-radius);
+  color: var(--lib-accent);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+:root[data-buttons="filled"] .link {
+  background: var(--lib-accent);
+  color: var(--lib-on-accent);
+}
+
+:root[data-buttons="outline"] .link {
+  border-color: var(--lib-accent);
+  background: transparent;
+}
+
+:root[data-buttons="plain"] .link {
+  padding-inline: var(--space-2xs);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+:root[data-layout="cards"]:not([data-buttons="filled"]) .link { background: var(--surface); }
+
+.link:hover .link-title,
+.link:focus-visible .link-title { text-decoration: underline; text-underline-offset: 0.2em; }
+
+:root[data-buttons="outline"] .link:hover { background: var(--lift); }
+
+.link:focus-visible,
+.button:focus-visible,
+summary:focus-visible,
+.site-footer a:focus-visible,
+.mode button:focus-visible,
+.copy:focus-visible,
+.address a:focus-visible,
+.contact a:focus-visible,
+.support a:focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.icon {
+  flex: 0 0 auto;
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.link-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.link-title { font-weight: 600; }
+
+.link-description {
+  font-size: var(--font-size-sm, 0.875rem);
+  color: var(--muted);
+}
+
+:root[data-buttons="filled"] .link-description { color: inherit; }
+
+/* ── Groups (native <details>) ─────────────────────────────────────────── */
+.group details {
+  border: 1px solid var(--control-border);
+  border-radius: var(--lib-radius);
+  background: var(--surface);
+}
+
+.group summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  min-height: 3rem;
+  padding: var(--lib-pad-block) var(--lib-pad-inline);
+  cursor: pointer;
+  font-weight: 600;
+  border-radius: var(--lib-radius);
+  list-style: none;
+}
+
+.group summary::-webkit-details-marker { display: none; }
+
+.group .chevron {
+  flex: 0 0 auto;
+  width: 1.25rem;
+  height: 1.25rem;
+  color: var(--muted);
+  transition: transform var(--duration-fast, 120ms) ease;
+}
+
+.group details[open] > summary .chevron { transform: rotate(180deg); }
+
+@media (prefers-reduced-motion: reduce) {
+  .group .chevron { transition: none; }
+}
+
+.group details > .links { padding: 0 var(--lib-pad-inline) var(--lib-pad-inline); }
+
+:root[data-layout="cards"]:not([data-buttons="filled"]) .group .link { background: var(--bg); }
+
+/* ── Sections ──────────────────────────────────────────────────────────── */
+.contact,
+.support,
+.cta {
+  margin-block-start: var(--space-lg);
+  padding: var(--space-md);
+  border: 1px solid var(--border);
+  border-radius: var(--lib-radius);
+  background: var(--surface);
+}
+
+.contact h2,
+.support h2,
+.cta h2 {
+  margin: 0 0 var(--space-xs);
+  font-size: var(--font-size-md, 1.125rem);
+}
+
+.plain-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.contact a,
+.support a,
+.address a { color: var(--text); text-underline-offset: 0.2em; }
+
+.support-method + .support-method { margin-block-start: var(--space-sm); }
+.support-label { margin: 0; color: var(--muted); }
+.support-value { margin: var(--space-2xs) 0; }
+
+.address-value {
+  font-family: var(--mw-font-mono);
+  font-size: var(--font-size-sm, 0.875rem);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.support-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  margin: 0;
+}
+
+.copy,
+.mode button {
+  font: inherit;
+  min-height: 2.75rem;
+  padding: var(--space-2xs) var(--space-sm);
+  border: 1px solid var(--control-border);
+  border-radius: var(--lib-radius);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.cta p:last-child { margin-block-end: 0; }
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  padding: var(--space-2xs) var(--space-md);
+  border: 2px solid transparent;
+  border-radius: var(--lib-radius);
+  background: var(--lib-accent);
+  color: var(--lib-on-accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+:root:not([data-buttons="filled"]) .button {
+  background: transparent;
+  color: var(--lib-accent);
+  border-color: var(--lib-accent);
+}
+
+.empty { text-align: center; color: var(--muted); }
+
+/* ── Footer ────────────────────────────────────────────────────────────── */
+.site-footer {
+  width: 100%;
+  max-width: var(--lib-column);
+  padding: var(--space-md);
+  text-align: center;
+  color: var(--muted);
+  font-size: var(--font-size-sm, 0.875rem);
+}
+
+.site-footer p { margin: var(--space-2xs) 0; }
+.site-footer a { color: var(--muted); text-underline-offset: 0.2em; }
+
+.footer-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-sm);
+  margin: var(--space-2xs) 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mode {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2xs);
+  margin: 0 0 var(--space-sm);
+  padding: 0;
+  border: 0;
+}
+
+.mode[hidden],
+.copy[hidden] { display: none; }
+
+.mode legend {
+  float: left;
+  margin-inline-end: var(--space-xs);
+  align-self: center;
+  line-height: 2.75rem;
+}
+
+.mode button[aria-pressed="true"] {
+  border-color: var(--text);
+  font-weight: 600;
+}
+
+/* ── The Profile Links specification page ──────────────────────────────── */
+.spec {
+  max-width: 48rem;
+  padding: var(--space-lg) var(--space-md);
+  overflow-wrap: anywhere;
+}
+
+.spec pre {
+  overflow-x: auto;
+  padding: var(--space-sm);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.spec code { font-family: var(--mw-font-mono); }
+.spec a { color: var(--text); }
+
+@media (forced-colors: active) {
+  .link,
+  .button,
+  .group details { border-color: currentcolor; }
+}

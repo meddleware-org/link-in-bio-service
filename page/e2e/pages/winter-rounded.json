@@ -1,0 +1,4 @@
+{ "schema": 1, "identity": { "displayName": "Winter", "handle": "winter", "pronouns": "they/them" },
+  "items": [ { "id": "a", "title": "Matrix", "url": "https://matrix.to/#/#room:example.org" }, { "id": "b", "title": "Telegram", "url": "https://t.me/example" } ],
+  "support": [ { "kind": "sui-address", "address": "0x00000000000000000000000000000000000000000000000000000000000000ab" } ],
+  "theme": { "season": "winter", "accent": "season", "buttons": "filled", "font": "rounded" } }

@@ -1,0 +1,19 @@
+[package]
+name = "link-in-bio-assets"
+description = "Link in Bio: the avatar pipeline (decode with limits, re-encode, strip metadata). Raster input only for tenants; the operator's own SVG is rasterised with resvg."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+image.workspace = true
+resvg.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

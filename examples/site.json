@@ -1,0 +1,14 @@
+{
+  "baseUrl": "https://links.example.org/",
+  "owner": "operator",
+  "productName": "Link in Bio",
+  "serveSpec": true,
+  "federation": true,
+  "brandIcons": true,
+  "footer": {
+    "links": [{ "text": "Legal notice", "url": "https://example.org/legal/" }],
+    "note": "Example operator page."
+  },
+  "securityContact": "mailto:security@example.org",
+  "hsts": true
+}
