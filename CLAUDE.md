@@ -26,7 +26,17 @@ documents other software reads (Profile Links, JSON-LD, WebFinger, ActivityPub, 
 - **Vendored inputs are checked.** `crates/core/tokens/` (design-tokens), `assets/brand/` (ui brand icons) and
   `assets/icons.svg` (Simple Icons CC0, Lucide ISC) are written only by `page/scripts/*.mjs` from the pinned packages;
   `npm run check:vendored` fails when they drift.
-- **No `unsafe`**, no `unwrap`/`expect` on request paths; release builds keep overflow checks and abort on panic.
+- **The hosted service fails closed.** Sign-up `closed`, third-party pages `off`, billing `manual` only, custom domains
+  off and Web Risk capped are the defaults, and each switch can only close the service further
+  (`crates/api/src/hosted/config.rs`). The page process reads only the `public.*_v1` views as the read-only role. The app
+  API needs `Origin` = the app origin plus `X-Link-In-Bio-Request` on every write. Sessions are `__Host-` cookies stored
+  as SHA-256, and invite codes, recovery codes and session tokens are stored only as hashes. The one exception: codes
+  given to an account are kept readable for their holder until used.
+- **Every route is in a table.** `crates/api/src/hosted/routes.rs` lists every app and admin route. The OpenAPI files in
+  `openapi/` are generated from it, and a test sends a request to each entry
+  (`UPDATE_OPENAPI=1 cargo test -p link-in-bio-api` after a change).
+- **No `unsafe`**, and no `unwrap` or `expect` on request paths, except the operating system's random number generator
+  in `link-in-bio-auth` (it cannot fail on a running Linux). Release builds keep overflow checks and abort on panic.
 
 ## Layers and commands
 
@@ -34,10 +44,15 @@ documents other software reads (Profile Links, JSON-LD, WebFinger, ActivityPub, 
 | --- | --- |
 | `link-in-bio-core` | manifest + parser, text and URL rules, theme + contrast + theme CSS, renderer, interop documents, embedded assets |
 | `link-in-bio-assets` | the picture pipeline |
-| `link-in-bio-api` | site config, the static and local routers, security headers |
-| `link-in-bio` (`crates/cli`) | `serve --mode static|local`, `check`, `render`, `schema`, `theme-table` |
+| `link-in-bio-store` | every SQL statement of the hosted service, the migrations, the connection settings (TLS `verify-full`) |
+| `link-in-bio-auth` | passkeys (webauthn-rs), Sui wallet sign-in, recovery codes, sessions and the CSRF rule (no I/O) |
+| `link-in-bio-billing` | the `BillingProvider` port, the router (switches, country evidence, minimum months), `manual`, `chain_payments` |
+| `link-in-bio-safety` | link screening (built-in checks, blocklist and ThreatFox, Web Risk under a monthly cap) |
+| `link-in-bio-api` | site config, the static and local routers, security headers; `hosted/`: pages, app, admin, internal, jobs |
+| `link-in-bio` (`crates/cli`) | `serve --mode static|local|pages|app|admin`, `worker`, `migrate`, `account create`, `check`, `render`, `schema`, `theme-table` |
 
 ```bash
+bash scripts/test-postgres.sh start && . "${TMPDIR:-/tmp}/link-in-bio-test-pg/env.sh"   # DOCKER=podman works rootless
 cargo +stable test --workspace --locked
 cargo +stable clippy --workspace --all-targets --locked -- -D warnings && cargo +stable fmt --check && cargo deny check
 cd page && npm ci && npm run check:vendored && npm run lint:css && npm run test:e2e   # E2E_BROWSERS=all for five browsers

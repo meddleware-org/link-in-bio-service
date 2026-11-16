@@ -1,6 +1,7 @@
 name: Rust CI
 
-# fmt, clippy, tests (the shared parser vectors and the property tests included), coverage, cargo-deny, the SBOM gate,
+# fmt, clippy, tests (the shared parser vectors and the property tests included; the store, the screening and the hosted
+# service against a real PostgreSQL over TLS: scripts/test-postgres.sh), coverage, cargo-deny, the SBOM gate,
 # MSRV; the page (vendored tokens and sprite current, stylelint, the five-browser end-to-end run with the shared
 # accessibility sweep at AAA, Lighthouse); and the image (configuration scan, licence notices, build, vulnerability
 # scan, smoke test).
@@ -38,12 +39,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # Nothing may be ignored.
+      - name: Start PostgreSQL (TLS)
+        run: bash scripts/test-postgres.sh start
+
+      # Nothing may be ignored or skipped.
       - name: Test
         run: |
           set -o pipefail
           cargo test --workspace --locked 2>&1 | tee test.log
           if grep -E '[1-9][0-9]* ignored' test.log; then echo "::error::a test was ignored"; exit 1; fi
+          if grep -E 'SKIPPED' test.log; then echo "::error::a database test was skipped"; exit 1; fi
           echo "tests run: $(grep -E '^test result' test.log | awk '{ n += $4 } END { print n }')"
 
       - name: Install cargo-llvm-cov and cargo-cyclonedx
@@ -69,6 +74,10 @@ jobs:
       - name: Index gate tests
         run: bash scripts/tests/check-index-test.sh
 
+      - name: Stop PostgreSQL
+        if: always()
+        run: bash scripts/test-postgres.sh stop
+
   msrv:
     name: MSRV (rust-version in Cargo.toml)
     runs-on: ubuntu-latest
@@ -76,8 +85,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the declared minimum toolchain
         run: rustup toolchain install 1.94 --profile minimal --no-self-update && rustup default 1.94
+      - name: Start PostgreSQL (TLS)
+        run: bash scripts/test-postgres.sh start
       - name: Test on the declared minimum toolchain
         run: cargo test --locked --workspace
+      - name: Stop PostgreSQL
+        if: always()
+        run: bash scripts/test-postgres.sh stop
 
   page:
     name: Page (vendored files, stylelint, five browsers with the AAA sweep, Lighthouse)

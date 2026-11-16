@@ -8,6 +8,13 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 # for the whole graph so a replacement can be planned.
 yanked = "deny"
 unmaintained = "all"
+ignore = [
+    # Reviewed 2026-11-16. The Marvin attack is a timing side channel in RSA *private-key* operations (decryption,
+    # signing). `rsa` is here only through webauthn-rs-core, which uses it to verify passkey and attestation signatures
+    # with *public* keys; this service never holds an RSA private key. No fixed `rsa` release exists yet; drop this
+    # entry when one does (Dependabot bumps webauthn-rs).
+    { id = "RUSTSEC-2023-0071", reason = "public-key verification only (webauthn-rs-core); no RSA private key in this service" },
+]
 
 [licenses]
 # Permissive licences present in the dependency tree (2026-10-25). Adding a crate under any other
@@ -25,6 +32,16 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
+# MPL-2.0 (file-level copyleft), reviewed 2026-11-16: kanidm's WebAuthn implementation, used unmodified as a
+# dependency for passkeys. MPL-2.0 permits that in a 0BSD work; the image ships its licence notice (about.toml) and
+# its source is on crates.io. Any change to these crates' files would have to be published under MPL-2.0.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "webauthn-rs" },
+    { allow = ["MPL-2.0"], crate = "webauthn-rs-core" },
+    { allow = ["MPL-2.0"], crate = "webauthn-rs-proto" },
+    { allow = ["MPL-2.0"], crate = "webauthn-attestation-ca" },
+    { allow = ["MPL-2.0"], crate = "crypto-glue" },
+]
 
 [bans]
 # Duplicate versions are common in the async ecosystem; report them without failing.

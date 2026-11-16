@@ -1,0 +1,25 @@
+[package]
+name = "link-in-bio-safety"
+description = "Link in Bio: layered link screening (built-in checks, blocklist and ThreatFox, Google Web Risk behind a monthly cap)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+link-in-bio-store.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+url.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+axum = { workspace = true, features = ["query", "json"] }
+sqlx.workspace = true
+
+[lints]
+workspace = true

@@ -4,7 +4,9 @@
 //! - `serve --mode local`: the editor's backend, loopback only, files in one directory;
 //! - `check`: validates a manifest (and its picture) exactly as the page server will;
 //! - `render`: writes the page and its documents to a directory;
-//! - `schema`, `theme-table`: the limits and the contrast table as JSON.
+//! - `schema`, `theme-table`: the limits and the contrast table as JSON;
+//! - `serve --mode pages|app|admin`, `worker`, `migrate`: the hosted service (configuration from the environment);
+//! - `account create`: the operator's own accounts while sign-up is closed (signed in with a Sui wallet).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -15,7 +17,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use link_in_bio_api::config::SiteConfig;
 use link_in_bio_api::site::{Site, SiteError, load_avatar, parse_options};
-use link_in_bio_api::{local_mode, static_mode};
+use link_in_bio_api::{hosted, local_mode, static_mode};
 use link_in_bio_core::Owner;
 
 #[derive(Parser)]
@@ -31,6 +33,12 @@ enum Mode {
     Static,
     /// The editor's loopback backend.
     Local,
+    /// Hosted: tenant pages by host (read-only database role).
+    Pages,
+    /// Hosted: the account API on the app host, and the internal port (provider notifications, metrics).
+    App,
+    /// Hosted: the operator console's API (behind Cloudflare Access).
+    Admin,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -100,10 +108,37 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Hosted: settle checkouts, screen links, check domains, sync ThreatFox, prune (one process holds the lock).
+    Worker {
+        #[arg(long, env = "WORKER_LISTEN_ADDR", default_value = "0.0.0.0:8081")]
+        listen: SocketAddr,
+    },
+    /// Hosted: apply the database schema (as the owner role).
+    Migrate,
+    /// Hosted: operator account administration.
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
+    },
     /// Print the limits the parser enforces (JSON).
     Schema,
     /// Print the contrast table: every accent × button style × season in both modes (JSON).
     ThemeTable,
+}
+
+#[derive(Subcommand)]
+enum AccountAction {
+    /// Create one of the operator's own accounts (free, served while third-party pages are off). It signs in with
+    /// the given Sui wallet; add a passkey in the app afterwards.
+    Create {
+        #[arg(long)]
+        handle: String,
+        #[arg(long)]
+        wallet: String,
+        /// The terms version recorded (the operator accepts their own terms).
+        #[arg(long, env = "TERMS_VERSION")]
+        terms_version: String,
+    },
 }
 
 fn now() -> u64 {
@@ -168,6 +203,80 @@ fn run(cli: Cli) -> Result<(), String> {
             let app = static_mode::router(Arc::new(site));
             runtime()?.block_on(serve(app, listen))
         }
+        Command::Serve { mode: m @ (Mode::Pages | Mode::App | Mode::Admin), listen, .. } => {
+            let rt = runtime()?;
+            rt.block_on(async move {
+                let pool = match m {
+                    Mode::Pages => 8,
+                    _ => 4,
+                };
+                let app = hosted_app(pool, matches!(m, Mode::Pages))?;
+                match m {
+                    Mode::Pages => serve(hosted::pages::router(app), listen).await,
+                    Mode::Admin => serve(hosted::admin::router(app), listen).await,
+                    _ => {
+                        let internal: SocketAddr = std::env::var("INTERNAL_LISTEN_ADDR")
+                            .unwrap_or_else(|_| "0.0.0.0:8081".into())
+                            .parse()
+                            .map_err(|_| "INTERNAL_LISTEN_ADDR is not an address")?;
+                        let (a, b) = tokio::join!(
+                            serve(hosted::app::router(app.clone()), listen),
+                            serve(hosted::internal::router(app), internal)
+                        );
+                        a.and(b)
+                    }
+                }
+            })
+        }
+        Command::Worker { listen } => runtime()?.block_on(async move {
+            let app = hosted_app(4, false)?;
+            let (_, s) = tokio::join!(
+                hosted::jobs::run(app.clone(), shutdown_signal()),
+                serve(hosted::internal::worker_router(app), listen)
+            );
+            s
+        }),
+        Command::Migrate => runtime()?.block_on(async {
+            store(1, false)?.migrate().await.map_err(|e| e.to_string())?;
+            println!("schema up to date");
+            Ok(())
+        }),
+        Command::Account { action: AccountAction::Create { handle, wallet, terms_version } } => runtime()?.block_on(async move {
+            let store = store(1, false)?;
+            let handle = link_in_bio_core::manifest::check_handle(&handle, false).map_err(|(_, m)| m)?;
+            let wallet = link_in_bio_auth::wallet::canonical_address(&wallet).ok_or("--wallet is not a Sui address")?;
+            if store.wallet_owner(&wallet).await.map_err(|e| e.to_string())?.is_some() {
+                return Err("that wallet already signs in to an account".into());
+            }
+            let draft = serde_json::json!({ "schema": 1, "identity": { "displayName": handle, "handle": handle }, "items": [] }).to_string();
+            let billing_ref = link_in_bio_auth::random_hex(16);
+            let skeleton = link_in_bio_core::limits::handle_skeleton(&handle);
+            let a = store
+                .create_account(
+                    &link_in_bio_store::NewAccount {
+                        id: uuid::Uuid::new_v4(),
+                        handle: &handle,
+                        handle_skeleton: &skeleton,
+                        terms_version: &terms_version,
+                        country_declared: None,
+                        billing_ref: &billing_ref,
+                        operator: true,
+                        draft: &draft,
+                        invite_hash: None,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            store.set_flags(a.id, true, true, true, &[]).await.map_err(|e| e.to_string())?;
+            store.add_wallet(a.id, &wallet).await.map_err(|e| e.to_string())?;
+            store
+                .audit("cli", "operator-account-created", &a.id.to_string(), &serde_json::json!({ "handle": handle }))
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("account {} ({handle}) created; sign in with the wallet {wallet}", a.id);
+            Ok(())
+        }),
         Command::Serve { mode: Mode::Local, dir, port, owner, .. } => {
             let dir = dir.ok_or("--dir is required")?;
             std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -239,6 +348,20 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn store(pool: u32, read_only: bool) -> Result<link_in_bio_store::Store, String> {
+    use link_in_bio_store::config::{Access, DatabaseSettings};
+    let settings = DatabaseSettings::from_env(|k| std::env::var(k).ok()).map_err(|e| e.to_string())?;
+    let access = if read_only { Access::ReadOnly } else { Access::ReadWrite };
+    Ok(link_in_bio_store::Store::new(settings.lazy_pool(pool, access).map_err(|e| e.to_string())?))
+}
+
+fn hosted_app(pool: u32, read_only: bool) -> Result<hosted::Shared, String> {
+    let config = hosted::HostedConfig::from_env(|k| std::env::var(k).ok()).map_err(|e| e.to_string())?;
+    let cache = std::env::var("PAGE_CACHE_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(30).clamp(1, 600);
+    let app = hosted::App::new(store(pool, read_only)?, config, std::time::Duration::from_secs(cache))?;
+    Ok(Arc::new(app))
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, String> {

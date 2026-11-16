@@ -1,6 +1,6 @@
 [package]
 name = "link-in-bio-api"
-description = "Link in Bio: the HTTP routers (static page, local editor), security headers and the site model."
+description = "Link in Bio: the HTTP routers (static page, local editor, hosted pages, app and admin APIs), the worker, security headers and the site model."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,18 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes the throwaway JWT signing key to other crates' tests.
+testing = []
+
 [dependencies]
 link-in-bio-core.workspace = true
 link-in-bio-assets.workspace = true
-axum.workspace = true
+link-in-bio-store.workspace = true
+link-in-bio-auth.workspace = true
+link-in-bio-billing.workspace = true
+link-in-bio-safety.workspace = true
+axum = { workspace = true, features = ["query"] }
 tower.workspace = true
 tower-http.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros", "fs"] }
@@ -20,10 +28,21 @@ serde_json.workspace = true
 url.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+hex.workspace = true
+base64.workspace = true
+ring.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 http-body-util = "=0.1.5"
+sqlx.workspace = true
+webauthn-authenticator-rs = { version = "=0.6.2", features = ["softpasskey"] }
+webauthn-rs.workspace = true
+access-gate-gateway-core.workspace = true
 
 [lints]
 workspace = true

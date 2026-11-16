@@ -1,0 +1,119 @@
+//! The hosted service: tenant pages by host (`pages`), the account API on the app host (`app`), the operator's console
+//! API behind Cloudflare Access (`admin`), provider notifications and metrics inside the cluster (`internal`), and the
+//! worker's duties (`jobs`). One process role per Deployment:
+//!
+//! | role | listens | database role |
+//! | --- | --- | --- |
+//! | `pages` | tenant hosts | read-only (`public.*_v1` views) |
+//! | `app` | the app host's `/api/` + the internal port | writer |
+//! | `admin` | the admin host's `/api/` | writer |
+//! | `worker` | metrics only | writer |
+
+pub mod access;
+pub mod admin;
+pub mod app;
+pub mod config;
+pub mod error;
+pub mod internal;
+pub mod jobs;
+pub mod jwt;
+pub mod metrics;
+pub mod openapi;
+pub mod pages;
+pub mod routes;
+
+#[cfg(test)]
+mod tests;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use link_in_bio_auth::passkey::Passkeys;
+use link_in_bio_billing::chain_payments::{self, ChainPayments};
+use link_in_bio_billing::{BillingProvider, Router as Billing, RouterConfig};
+use link_in_bio_safety::{Screener, WebRisk};
+use link_in_bio_store::Store;
+
+pub use config::{HostedConfig, SignupMode};
+pub use error::{ApiError, ApiResult};
+
+pub struct App {
+    pub store: Store,
+    pub config: HostedConfig,
+    pub billing: Billing,
+    pub passkeys: Passkeys,
+    pub screener: Screener,
+    pub metrics: metrics::Metrics,
+    pub pages: pages::PageCache,
+    pub access: Option<Arc<access::Admins>>,
+}
+
+pub type Shared = Arc<App>;
+
+fn read_secret(path: &str) -> Result<String, String> {
+    std::fs::read_to_string(path).map(|s| s.trim().to_string()).map_err(|e| format!("{path}: {e}"))
+}
+
+impl App {
+    /// Builds the state for any role. `page_cache` is how long a built tenant page is reused (and so how soon a
+    /// suspension or a new version shows).
+    pub fn new(store: Store, config: HostedConfig, page_cache: Duration) -> Result<Self, String> {
+        let passkeys =
+            Passkeys::new(&config.app_host, &config.app_origin, &config.product_name).map_err(|e| e.to_string())?;
+        let mut providers: Vec<Box<dyn BillingProvider>> = vec![Box::new(link_in_bio_billing::manual::Manual)];
+        if let Some(cp) = &config.chain_payments {
+            let key = read_secret(&cp.api_key_file)?;
+            let p = ChainPayments::new(
+                chain_payments::Config {
+                    merchant_api: cp.merchant_api.clone(),
+                    public_api: cp.public_api.clone(),
+                    checkout_origin: cp.checkout_origin.clone(),
+                    api_key: key,
+                    methods: cp.methods.clone(),
+                    webhook_key: cp.webhook_key.clone(),
+                },
+                ChainPayments::http_client(),
+            )
+            .map_err(|e| e.to_string())?;
+            providers.push(Box::new(p));
+        }
+        let billing = Billing::new(
+            RouterConfig {
+                price_pence: config.price_pence,
+                enabled: config.billing_providers.clone(),
+                countries: config.billing_countries.clone(),
+            },
+            providers,
+        );
+        let web_risk = match &config.web_risk_key_file {
+            Some(f) if config.web_risk_monthly_cap > 0 => {
+                Some(WebRisk::new(read_secret(f)?, config.web_risk_monthly_cap))
+            }
+            _ => None,
+        };
+        let access = config.access.as_ref().map(|a| {
+            access::Admins::new(access::AccessConfig {
+                issuer: a.team_domain.clone(),
+                audience: a.audience.clone(),
+                jwks: access::JwksSource::Remote(format!("{}/cdn-cgi/access/certs", a.team_domain)),
+                roles: access::RoleSource::Keto(a.keto_read_url.clone()),
+                admin_origin: a.admin_origin.clone(),
+            })
+        });
+        Ok(Self {
+            store,
+            config,
+            billing,
+            passkeys,
+            screener: Screener { web_risk },
+            metrics: metrics::Metrics::default(),
+            pages: pages::PageCache::new(page_cache),
+            access,
+        })
+    }
+}
+
+/// The current time (one place, so tests can reason about it).
+pub fn now() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}

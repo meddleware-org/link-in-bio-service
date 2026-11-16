@@ -78,6 +78,33 @@ pub const RESERVED_HANDLES: &[&str] = &[
     "www",
 ];
 
+/// The confusable skeleton of a handle: what a reader may take it for. Handles are ASCII, so the confusions are the
+/// lookalike digits and letter pairs (`rn` for `m`, `vv` for `w`, `0` for `o`, `1`/`i` for `l`, `5` for `s`) and the
+/// hyphens a reader skims over. Two handles with one skeleton cannot both exist, and a tenant handle whose skeleton is
+/// a reserved handle's is refused, so `rneddleware` cannot pass for `meddleware`.
+pub fn handle_skeleton(handle: &str) -> String {
+    let mut s = handle.to_ascii_lowercase().replace('-', "");
+    for (from, to) in [("rn", "m"), ("vv", "w"), ("cl", "d")] {
+        s = s.replace(from, to);
+    }
+    s.chars()
+        .map(|c| match c {
+            '0' => 'o',
+            '1' | 'i' | 'j' => 'l',
+            '5' => 's',
+            '8' => 'b',
+            '9' => 'g',
+            _ => c,
+        })
+        .collect()
+}
+
+/// Whether a tenant handle looks like a reserved one.
+pub fn looks_reserved(handle: &str) -> bool {
+    let k = handle_skeleton(handle);
+    RESERVED_HANDLES.iter().any(|r| handle_skeleton(r) == k)
+}
+
 pub fn limits_json() -> serde_json::Value {
     serde_json::json!({
         "manifestBytes": MAX_MANIFEST_BYTES,
@@ -98,4 +125,19 @@ pub fn limits_json() -> serde_json::Value {
         "reservedHandles": RESERVED_HANDLES,
         "icons": crate::icons::Icon::names(),
     })
+}
+
+#[cfg(test)]
+mod skeleton_tests {
+    use super::*;
+
+    #[test]
+    fn skeletons() {
+        assert_eq!(handle_skeleton("rneddleware"), handle_skeleton("meddleware"));
+        assert_eq!(handle_skeleton("b0b-1"), handle_skeleton("bobl"));
+        assert_ne!(handle_skeleton("alice"), handle_skeleton("bob"));
+        assert!(looks_reserved("adrnin"));
+        assert!(looks_reserved("supp0rt"));
+        assert!(!looks_reserved("alice"));
+    }
 }

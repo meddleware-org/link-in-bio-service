@@ -2,6 +2,8 @@
 # licence fails the image build and CI (`cargo about generate --fail`): review it, then add it here
 # deliberately (and to deny.toml).
 accepted = [
+    # MPL-2.0 only for kanidm's WebAuthn crates (deny.toml lists the reviewed exceptions by crate).
+    "MPL-2.0",
     "0BSD",
     "Apache-2.0",
     "BSD-2-Clause",

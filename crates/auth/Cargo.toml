@@ -1,0 +1,29 @@
+[package]
+name = "link-in-bio-auth"
+description = "Link in Bio: passkeys, Sui wallet sign-in, recovery codes, sessions and the CSRF rule (no I/O)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+webauthn-rs.workspace = true
+access-gate-gateway-core.workspace = true
+ring.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+url.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+webauthn-authenticator-rs = { version = "=0.6.2", features = ["softpasskey"] }
+
+[lints]
+workspace = true

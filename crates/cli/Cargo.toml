@@ -1,6 +1,6 @@
 [package]
 name = "link-in-bio"
-description = "Link in Bio: the one binary (serve, render, check, schema, theme-table)."
+description = "Link in Bio: the one binary (serve, render, check, schema, theme-table, worker, migrate, account)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,10 @@ path = "src/main.rs"
 link-in-bio-core.workspace = true
 link-in-bio-assets.workspace = true
 link-in-bio-api.workspace = true
+link-in-bio-store.workspace = true
+link-in-bio-auth.workspace = true
+chrono.workspace = true
+uuid.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "time", "macros", "sync"] }
 clap.workspace = true

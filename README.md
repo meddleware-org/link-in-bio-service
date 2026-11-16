@@ -13,6 +13,10 @@ formats.
   schema.org `ProfilePage`, WebFinger and a read-only ActivityPub actor, Nostr NIP-05 and the AT Protocol handle file.
 - **One binary.** `serve --mode static` serves one page from files; `serve --mode local` is the editor's loopback backend;
   `check` validates a page document; `render` writes the page to a directory.
+- **A hosted service in the same binary.** `serve --mode pages|app|admin`, `worker` and `migrate` run pages for many
+  accounts on PostgreSQL. Accounts sign in with passkeys or a Sui wallet; invite codes come only from the operator; paid
+  periods go through pluggable payment providers; links are screened. Every switch defaults to closed:
+  [docs/HOSTED.md](docs/HOSTED.md).
 
 ## Quick start
 
