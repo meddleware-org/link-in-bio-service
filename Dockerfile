@@ -13,7 +13,7 @@
 # no Node stage is needed. Both base images are pinned by digest (multi-arch index); bump tag and digest together.
 # =============================================================================
 
-FROM docker.io/library/rust:1-slim@sha256:4df2ae8cfdfebdfc13a65da7f253b73d68983dc0339f2719bc17a279c913b13d AS chef
+FROM docker.io/library/rust:1-slim@sha256:cc9edbcadf2c27013a642b1d1bb7504e26b1142d6b5ebe58f64cf2eb2bc128ae AS chef
 RUN cargo install cargo-chef --version 0.1.78 --locked
 WORKDIR /src
 
@@ -40,7 +40,7 @@ RUN cargo build --release --locked -p link-in-bio \
  && install -D -m 0755 target/release/link-in-bio /out/link-in-bio
 
 # ── Runtime: minimal distroless image ────────────────────────────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
 
 ARG VERSION=dev
 ARG VENDOR="Meddleware"
