@@ -13,7 +13,7 @@
 # no Node stage is needed. Both base images are pinned by digest (multi-arch index); bump tag and digest together.
 # =============================================================================
 
-FROM docker.io/library/rust:1-slim@sha256:4df2ae8cfdfebdfc13a65da7f253b73d68983dc0339f2719bc17a279c913b13d AS chef
+FROM docker.io/library/rust:1-slim@sha256:cc9edbcadf2c27013a642b1d1bb7504e26b1142d6b5ebe58f64cf2eb2bc128ae AS chef
 RUN cargo install cargo-chef --version 0.1.78 --locked
 WORKDIR /src
 
