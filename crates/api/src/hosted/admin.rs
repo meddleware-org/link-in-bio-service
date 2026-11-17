@@ -603,6 +603,48 @@ async fn audit(State(app): State<Shared>, Query(q): Query<AuditQuery>) -> ApiRes
     })).collect::<Vec<_>>() })))
 }
 
+/// An ISO 20022 statement from the receiving bank: each booked credit whose creditor reference names a bank-transfer
+/// checkout, in its currency and for at least its amount, pays it (once). The rest is reported, never applied.
+async fn bank_statement(
+    State(app): State<Shared>,
+    Extension(op): Extension<Operator>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<Value>> {
+    use link_in_bio_billing::bank_transfer::{self, Scheme};
+    let Some(bt) = &app.config.bank_transfer else {
+        return Err(ApiError::Unavailable("bank transfer is not switched on"));
+    };
+    let xml =
+        std::str::from_utf8(&body).map_err(|_| ApiError::Unprocessable("the statement is not UTF-8 text".into()))?;
+    let credits = bank_transfer::credits_from_camt(xml).map_err(|e| ApiError::Unprocessable(e.to_string()))?;
+    let (mut paid, mut short, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
+    for c in &credits {
+        let Some(co) = app.store.checkout_by_ref(bank_transfer::ID, &c.reference).await? else {
+            unknown.push(json!({ "reference": c.reference, "amountMinor": c.amount_minor, "currency": c.currency }));
+            continue;
+        };
+        let want = match &bt.scheme {
+            Scheme::Sepa { eur_cents_per_month, .. } => (eur_cents_per_month * co.months as u64, "EUR"),
+            Scheme::FasterPayments { .. } => (co.amount_pence as u64, "GBP"),
+        };
+        if c.currency != want.1 || c.amount_minor < want.0 {
+            short.push(json!({ "reference": c.reference, "checkout": co.id, "got": c.amount_minor, "currency": c.currency, "want": want.0, "wantCurrency": want.1 }));
+            continue;
+        }
+        super::internal::apply_event(&app, bank_transfer::ID, &bank_transfer::paid_event(c)).await?;
+        paid.push(json!({ "reference": c.reference, "checkout": co.id }));
+    }
+    app.store
+        .audit(
+            &actor(&op),
+            "bank-statement-imported",
+            "bank-transfer",
+            &json!({ "credits": credits.len(), "paid": paid.len(), "short": short.len(), "unknown": unknown.len() }),
+        )
+        .await?;
+    Ok(Json(json!({ "credits": credits.len(), "paid": paid, "short": short, "unknown": unknown })))
+}
+
 pub fn router(app: Shared) -> Router {
     Router::new()
         .route("/api/v1/admin/me", get(me))
@@ -626,6 +668,10 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v1/admin/blocklist", get(blocklist).post(block_add).delete(block_remove))
         .route("/api/v1/admin/links", put(link_verdict))
         .route("/api/v1/admin/audit", get(audit))
+        .route(
+            "/api/v1/admin/bank-statements",
+            post(bank_statement).layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(app.clone(), require_admin))
         .route("/healthz", get(|| async { "ok\n" }))
         .fallback(|| async { ApiError::NoRoute.into_response() })

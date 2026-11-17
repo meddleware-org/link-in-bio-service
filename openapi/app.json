@@ -895,6 +895,34 @@
           }
         }
       }
+    },
+    "/api/v1/webhooks/{provider}": {
+      "post": {
+        "summary": "A payment provider's signed notification (square, gocardless, paddle)",
+        "security": [],
+        "responses": {
+          "default": {
+            "description": "An error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
     }
   },
   "components": {

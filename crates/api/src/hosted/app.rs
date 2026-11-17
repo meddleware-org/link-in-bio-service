@@ -981,6 +981,7 @@ async fn checkout_create(
                 b.months,
                 if b.months == 1 { "" } else { "s" }
             ),
+            return_url: format!("{}/billing?checkout={id}", app.config.app_origin),
         })
         .await
         .map_err(|e| {
@@ -1233,12 +1234,32 @@ pub fn router(app: Shared) -> Router {
     let upload = Router::new()
         .route("/api/v1/page/avatar", post(avatar_upload))
         .layer(DefaultBodyLimit::max(link_in_bio_assets::MAX_INPUT_BYTES));
+    // Payment providers' notifications come from the providers' servers (no Origin, no app header): outside the CSRF
+    // guard, authenticated by each adapter's signature check instead.
+    let hooks = Router::new()
+        .route("/api/v1/webhooks/{provider}", post(provider_notification))
+        .layer(DefaultBodyLimit::max(64 * 1024));
     api.merge(upload)
         .route("/_/{file}", get(bundle))
         .route("/healthz", get(|| async { "ok\n" }))
         .fallback(|| async { ApiError::NoRoute.into_response() })
         .layer(middleware::from_fn_with_state(app.clone(), guard))
+        .merge(hooks)
         .with_state(app)
+}
+
+/// A notification from a fiat provider over the internet. Chain Payments notifies on the internal port only, and the
+/// manual provider never notifies.
+async fn provider_notification(
+    State(app): State<Shared>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    if !["square", "gocardless", "paddle"].contains(&provider.as_str()) {
+        return Err(ApiError::NotFound);
+    }
+    super::internal::notification(State(app), Path(provider), headers, body).await
 }
 
 /// Headers as a lower-case map (what billing adapters read).

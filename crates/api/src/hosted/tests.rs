@@ -615,3 +615,90 @@ async fn every_route_in_the_tables_exists_and_the_openapi_documents_match() {
         assert_eq!(committed, text, "openapi/{file} is out of date: UPDATE_OPENAPI=1 cargo test -p link-in-bio-api");
     }
 }
+
+#[tokio::test]
+async fn bank_transfer_paid_by_an_imported_statement() {
+    let Some(s) = store().await else { return };
+    let a = app(
+        s.clone(),
+        config(&[
+            ("BILLING_PROVIDERS", "bank-transfer".into()),
+            ("BANK_TRANSFER_SCHEME", "faster-payments".into()),
+            ("BANK_TRANSFER_PAYEE", "Example Ltd".into()),
+            ("BANK_TRANSFER_SORT_CODE", "12-34-56".into()),
+            ("BANK_TRANSFER_ACCOUNT_NUMBER", "12345678".into()),
+        ]),
+    );
+    let app_r = super::app::router(a.clone());
+    let admin = super::admin::router(a.clone());
+    // An operator account (sign-up is closed) with a session.
+    let id = uuid::Uuid::new_v4();
+    s.create_account(
+        &link_in_bio_store::NewAccount {
+            id,
+            handle: "dora",
+            handle_skeleton: "dora",
+            terms_version: "2026-11",
+            country_declared: Some("GB"),
+            billing_ref: "ref-dora-0000000001",
+            operator: false,
+            draft: r#"{"schema":1,"identity":{"displayName":"Dora","handle":"dora"},"items":[]}"#,
+            invite_hash: None,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    let (value, hash) = link_in_bio_auth::session::new_token();
+    s.create_session(&hash, id, chrono::Utc::now() + chrono::Duration::days(1)).await.unwrap();
+    let cookie = format!("{}={value}", link_in_bio_auth::session::COOKIE);
+
+    let b = send(&app_r, call("GET", "/api/v1/billing", None, Some(&cookie))).await.json();
+    assert_eq!(b["offers"][0]["id"], "bank-transfer:faster-payments");
+    let co = send(
+        &app_r,
+        call(
+            "POST",
+            "/api/v1/billing/checkouts",
+            Some(json!({ "method": "bank-transfer:faster-payments", "months": 2 })),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(co.status, StatusCode::OK, "{}", co.text());
+    let client = co.json()["client"].clone();
+    assert_eq!((client["kind"].as_str(), client["amount"].as_str()), (Some("bank-transfer"), Some("6.00")));
+    let reference = client["reference"].as_str().unwrap().to_string();
+
+    let statement = |amount: &str| {
+        format!(
+            r#"<Document><BkToCstmrDbtCdtNtfctn><Ntfctn><Ntry><Amt Ccy="GBP">{amount}</Amt><CdtDbtInd>CRDT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts><AcctSvcrRef>B{amount}</AcctSvcrRef>
+            <NtryDtls><TxDtls><RmtInf><Ustrd>{reference}</Ustrd></RmtInf></TxDtls></NtryDtls></Ntry></Ntfctn></BkToCstmrDbtCdtNtfctn></Document>"#
+        )
+    };
+    let post = |xml: String| {
+        Request::post("/api/v1/admin/bank-statements")
+            .header(header::ORIGIN, ADMIN)
+            .header("x-link-in-bio-request", "1")
+            .header("cf-access-jwt-assertion", operator_token())
+            .body(Body::from(xml))
+            .unwrap()
+    };
+    let short = send(&admin, post(statement("5.00"))).await.json();
+    assert_eq!(short["short"].as_array().unwrap().len(), 1, "an underpayment is reported, not applied");
+    assert!(s.account(id).await.unwrap().unwrap().paid_until.is_none());
+    let ok = send(&admin, post(statement("6.00"))).await.json();
+    assert_eq!(ok["paid"].as_array().unwrap().len(), 1, "{ok}");
+    let until = s.account(id).await.unwrap().unwrap().paid_until.unwrap();
+    send(&admin, post(statement("6.00"))).await;
+    assert_eq!(
+        s.account(id).await.unwrap().unwrap().paid_until.unwrap(),
+        until,
+        "a statement imported twice pays once"
+    );
+
+    // The public webhook route takes only the internet-facing providers, without the app's CSRF rule.
+    let hook = |p: &str| Request::post(format!("/api/v1/webhooks/{p}")).body(Body::from("{}")).unwrap();
+    assert_eq!(send(&app_r, hook("chain-payments")).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(send(&app_r, hook("square")).await.status, StatusCode::NOT_FOUND, "square is not switched on here");
+}

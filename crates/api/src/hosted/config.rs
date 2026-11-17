@@ -52,7 +52,47 @@ pub struct HostedConfig {
     /// The page-site template (footer, contact, security policy) every tenant page uses.
     pub site: SiteConfigFile,
     pub chain_payments: Option<ChainPaymentsEnv>,
+    pub square: Option<SquareEnv>,
+    pub gocardless: Option<GoCardlessEnv>,
+    pub paddle: Option<PaddleEnv>,
+    pub bank_transfer: Option<BankTransferEnv>,
     pub access: Option<AccessEnv>,
+}
+
+/// Provider credentials are files (mounted from Secrets); the API bases default to each provider's sandbox.
+#[derive(Debug, Clone)]
+pub struct SquareEnv {
+    pub api_base: String,
+    pub access_token_file: String,
+    pub location_id: String,
+    pub signature_key_file: String,
+    pub fixed_pence: u32,
+    pub percent_bps: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct GoCardlessEnv {
+    pub api_base: String,
+    pub access_token_file: String,
+    pub webhook_secret_file: String,
+    pub fixed_pence: u32,
+    pub percent_bps: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaddleEnv {
+    pub api_base: String,
+    pub api_key_file: String,
+    pub webhook_secret_file: String,
+    pub price_id: String,
+    pub fixed_pence: u32,
+    pub percent_bps: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct BankTransferEnv {
+    pub payee: String,
+    pub scheme: link_in_bio_billing::bank_transfer::Scheme,
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +176,7 @@ impl HostedConfig {
             .collect();
         billing_providers.insert("manual".into());
         for p in &billing_providers {
-            if !["manual", "chain-payments"].contains(&p.as_str()) {
+            if !["manual", "chain-payments", "square", "gocardless", "paddle", "bank-transfer"].contains(&p.as_str()) {
                 return Err(HostedConfigError::Invalid("BILLING_PROVIDERS", format!("{p} is not a built-in provider")));
             }
         }
@@ -172,6 +212,73 @@ impl HostedConfig {
                 methods,
                 webhook_key: get("CHAIN_PAYMENTS_WEBHOOK_KEY").filter(|k| !k.trim().is_empty()),
             })
+        } else {
+            None
+        };
+        let need = |v: &'static str| get(v).filter(|x| !x.trim().is_empty()).ok_or(HostedConfigError::Missing(v));
+        let base = |v: &'static str, sandbox: &str| -> Result<String, HostedConfigError> {
+            let b = get(v).unwrap_or_else(|| sandbox.to_string());
+            if b.starts_with("https://") || b.starts_with("http://127.0.0.1:") {
+                Ok(b)
+            } else {
+                Err(HostedConfigError::Invalid(v, "must be https".into()))
+            }
+        };
+        let square = if billing_providers.contains("square") {
+            Some(SquareEnv {
+                api_base: base("SQUARE_API_BASE", "https://connect.squareupsandbox.com")?,
+                access_token_file: need("SQUARE_ACCESS_TOKEN_FILE")?,
+                location_id: need("SQUARE_LOCATION_ID")?,
+                signature_key_file: need("SQUARE_SIGNATURE_KEY_FILE")?,
+                fixed_pence: number(&get, "SQUARE_FIXED_PENCE", 25u32, 0, 1000)?,
+                percent_bps: number(&get, "SQUARE_PERCENT_BPS", 140u32, 0, 2000)?,
+            })
+        } else {
+            None
+        };
+        let gocardless = if billing_providers.contains("gocardless") {
+            Some(GoCardlessEnv {
+                api_base: base("GOCARDLESS_API_BASE", "https://api-sandbox.gocardless.com")?,
+                access_token_file: need("GOCARDLESS_ACCESS_TOKEN_FILE")?,
+                webhook_secret_file: need("GOCARDLESS_WEBHOOK_SECRET_FILE")?,
+                fixed_pence: number(&get, "GOCARDLESS_FIXED_PENCE", 20u32, 0, 1000)?,
+                percent_bps: number(&get, "GOCARDLESS_PERCENT_BPS", 100u32, 0, 2000)?,
+            })
+        } else {
+            None
+        };
+        let paddle = if billing_providers.contains("paddle") {
+            Some(PaddleEnv {
+                api_base: base("PADDLE_API_BASE", "https://sandbox-api.paddle.com")?,
+                api_key_file: need("PADDLE_API_KEY_FILE")?,
+                webhook_secret_file: need("PADDLE_WEBHOOK_SECRET_FILE")?,
+                price_id: need("PADDLE_PRICE_ID")?,
+                fixed_pence: number(&get, "PADDLE_FIXED_PENCE", 40u32, 0, 1000)?,
+                percent_bps: number(&get, "PADDLE_PERCENT_BPS", 500u32, 0, 2000)?,
+            })
+        } else {
+            None
+        };
+        let bank_transfer = if billing_providers.contains("bank-transfer") {
+            use link_in_bio_billing::bank_transfer::Scheme;
+            let scheme = match need("BANK_TRANSFER_SCHEME")?.as_str() {
+                "sepa" => Scheme::Sepa {
+                    iban: need("BANK_TRANSFER_IBAN")?,
+                    bic: get("BANK_TRANSFER_BIC").filter(|b| !b.is_empty()),
+                    eur_cents_per_month: number(&get, "BANK_TRANSFER_EUR_CENTS_PER_MONTH", 0u64, 1, 100_000)?,
+                },
+                "faster-payments" => Scheme::FasterPayments {
+                    sort_code: need("BANK_TRANSFER_SORT_CODE")?,
+                    account_number: need("BANK_TRANSFER_ACCOUNT_NUMBER")?,
+                },
+                o => {
+                    return Err(HostedConfigError::Invalid(
+                        "BANK_TRANSFER_SCHEME",
+                        format!("{o} is not sepa or faster-payments"),
+                    ));
+                }
+            };
+            Some(BankTransferEnv { payee: need("BANK_TRANSFER_PAYEE")?, scheme })
         } else {
             None
         };
@@ -215,6 +322,10 @@ impl HostedConfig {
             app_host,
             site,
             chain_payments,
+            square,
+            gocardless,
+            paddle,
+            bank_transfer,
             access,
         })
     }
@@ -278,6 +389,9 @@ mod tests {
         assert!(with(("THIRD_PARTY_PAGES", "yes")).is_err());
         assert!(with(("BILLING_PROVIDERS", "stripe")).is_err());
         assert!(with(("BILLING_PROVIDERS", "chain-payments")).is_err(), "needs its settings");
+        for p in ["square", "gocardless", "paddle", "bank-transfer"] {
+            assert!(with(("BILLING_PROVIDERS", p)).is_err(), "{p} needs its settings");
+        }
         assert!(with(("CUSTOM_HOSTNAME_CAP", "101")).is_err(), "hard stop at 100");
         assert!(with(("WEB_RISK_MONTHLY_CAP", "100001")).is_err(), "never past the free tier");
         assert!(HostedConfig::from_env(env(&[("PAGES_DOMAIN", "x"), ("APP_HOST", "app.example.link")])).is_err());

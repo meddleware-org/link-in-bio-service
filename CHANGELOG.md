@@ -12,6 +12,14 @@
   of a month), the manual provider (operator grants) and Chain Payments; a conformance suite.
 - Link screening in layers (built-in checks, blocklist and ThreatFox, Web Risk behind a monthly cap); reports without an
   account, decisions with statements of reasons, suspension (410/451/403), appeals, the audit log, retention.
+- Card and bank adapters behind the same port, each with conformance tests against a stand-in API:
+  - Square (payment links);
+  - GoCardless (billing requests over Open Banking);
+  - Paddle (merchant of record);
+  - bank transfer (SEPA with an EPC QR payload, or Faster Payments; ISO 11649 references; camt.053/054 statement import
+    in the console).
+
+  Provider notifications arrive at `/api/v1/webhooks/<provider>`.
 - Custom domains by DNS TXT (off unless `CUSTOM_HOSTNAME_CAP` > 0); `openapi/app.json` and `openapi/admin.json`.
 
 ## 0.0.1 — 2026-11-16

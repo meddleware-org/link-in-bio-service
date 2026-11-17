@@ -93,6 +93,12 @@ pub const APP_ROUTES: &[Route] = &[
     r(Delete, "/api/v1/domains/{hostname}", Session, "Remove a custom domain"),
     r(Post, "/api/v1/reports", Public, "Report a page or a link (no account needed)"),
     r(Post, "/api/v1/appeals", Session, "Appeal a decision about the account's page"),
+    r(
+        Post,
+        "/api/v1/webhooks/{provider}",
+        Public,
+        "A payment provider's signed notification (square, gocardless, paddle)",
+    ),
 ];
 
 pub const ADMIN_ROUTES: &[Route] = &[
@@ -126,4 +132,10 @@ pub const ADMIN_ROUTES: &[Route] = &[
     r(Delete, "/api/v1/admin/blocklist", Operator, "Unblock (?pattern=)"),
     r(Put, "/api/v1/admin/links", Operator, "An operator verdict on a link (clean, flagged, or automatic)"),
     r(Get, "/api/v1/admin/audit", Operator, "The audit log (?subject=)"),
+    r(
+        Post,
+        "/api/v1/admin/bank-statements",
+        Operator,
+        "Import an ISO 20022 camt.053/054 statement: credits pay bank-transfer checkouts by reference",
+    ),
 ];

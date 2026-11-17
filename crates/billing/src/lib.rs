@@ -7,11 +7,18 @@
 //!   and are on that method's list (UK only by default); a merchant of record anywhere.
 //! - [`min_months`]: the fewest months a purchase with a method may buy, so its fixed fee stays at most 3 % of one
 //!   month's price (with a 25 % buffer for exchange rates and fee changes).
-//! - [`manual`] (operator grants) and [`chain_payments`] (Chain Payments, SUI and native USDC) are built in; the fiat
-//!   adapters join later behind the same port.
+//! - The adapters: [`manual`] (operator grants), [`chain_payments`] (Chain Payments, SUI and native USDC), [`square`]
+//!   (UK cards), [`gocardless`] (UK bank payments, Open Banking), [`paddle`] (merchant of record for other countries)
+//!   and [`bank_transfer`] (SEPA with an EPC QR code, or Faster Payments, matched by an ISO 11649 reference from the
+//!   bank's ISO 20022 statements). The fiat ones send the buyer to the provider's own hosted page (a redirect, never a
+//!   provider script in the app).
 
+pub mod bank_transfer;
 pub mod chain_payments;
+pub mod gocardless;
 pub mod manual;
+pub mod paddle;
+pub mod square;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -76,6 +83,8 @@ pub struct CheckoutRequest {
     pub months: u32,
     pub amount_pence: u64,
     pub description: String,
+    /// Where the provider sends the buyer back to (the app's billing view for this checkout).
+    pub return_url: String,
 }
 
 /// What a started checkout gives back: the provider's reference and what the app's checkout page needs (a session id
@@ -262,6 +271,57 @@ impl Router {
             .into_iter()
             .find(|o| o.method.id == method && (o.min_months..=o.max_months).contains(&months))
     }
+}
+
+/// An HTTP client for provider APIs: no redirects followed, short timeouts.
+pub fn http_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .user_agent(concat!("link-in-bio/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default()
+}
+
+/// HMAC-SHA256 of `msg` with `key`.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    ring::hmac::sign(&k, msg).as_ref().to_vec()
+}
+
+/// Constant-time comparison of a received signature with the expected one.
+pub fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn unavailable(e: impl std::fmt::Display) -> BillingError {
+    BillingError::Unavailable(e.to_string())
+}
+
+/// Sends a request and reads a JSON answer; a non-success status is `Refused` with the provider's message.
+pub(crate) async fn send_json(r: reqwest::RequestBuilder) -> Result<Value, BillingError> {
+    let resp = r.send().await.map_err(unavailable)?;
+    let status = resp.status();
+    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    if status.is_success() {
+        Ok(v)
+    } else if status.is_server_error() {
+        Err(BillingError::Unavailable(format!("HTTP {}", status.as_u16())))
+    } else {
+        Err(BillingError::Refused(format!("HTTP {}: {}", status.as_u16(), crate::provider_message(&v))))
+    }
+}
+
+/// The human part of a provider's error answer (each names it differently).
+pub(crate) fn provider_message(v: &Value) -> String {
+    for p in ["/errors/0/detail", "/errors/0/message", "/error/message", "/error/detail", "/message"] {
+        if let Some(m) = v.pointer(p).and_then(Value::as_str) {
+            return m.chars().take(200).collect();
+        }
+    }
+    "refused".into()
 }
 
 /// Whole months strictly ahead of now that an account is already paid for.

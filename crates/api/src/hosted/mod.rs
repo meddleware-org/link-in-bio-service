@@ -77,6 +77,55 @@ impl App {
             .map_err(|e| e.to_string())?;
             providers.push(Box::new(p));
         }
+        let file = |f: &str| read_secret(f);
+        if let Some(c) = &config.square {
+            providers.push(Box::new(link_in_bio_billing::square::Square::new(
+                link_in_bio_billing::square::Config {
+                    api_base: c.api_base.clone(),
+                    access_token: file(&c.access_token_file)?,
+                    location_id: c.location_id.clone(),
+                    signature_key: file(&c.signature_key_file)?,
+                    notification_url: format!("{}/api/v1/webhooks/square", config.app_origin),
+                    fixed_pence: c.fixed_pence,
+                    percent_bps: c.percent_bps,
+                },
+                link_in_bio_billing::http_client(),
+            )));
+        }
+        if let Some(c) = &config.gocardless {
+            providers.push(Box::new(link_in_bio_billing::gocardless::GoCardless::new(
+                link_in_bio_billing::gocardless::Config {
+                    api_base: c.api_base.clone(),
+                    access_token: file(&c.access_token_file)?,
+                    webhook_secret: file(&c.webhook_secret_file)?,
+                    fixed_pence: c.fixed_pence,
+                    percent_bps: c.percent_bps,
+                },
+                link_in_bio_billing::http_client(),
+            )));
+        }
+        if let Some(c) = &config.paddle {
+            providers.push(Box::new(link_in_bio_billing::paddle::Paddle::new(
+                link_in_bio_billing::paddle::Config {
+                    api_base: c.api_base.clone(),
+                    api_key: file(&c.api_key_file)?,
+                    webhook_secret: file(&c.webhook_secret_file)?,
+                    price_id: c.price_id.clone(),
+                    fixed_pence: c.fixed_pence,
+                    percent_bps: c.percent_bps,
+                },
+                link_in_bio_billing::http_client(),
+            )));
+        }
+        if let Some(c) = &config.bank_transfer {
+            providers.push(Box::new(
+                link_in_bio_billing::bank_transfer::BankTransfer::new(link_in_bio_billing::bank_transfer::Config {
+                    payee: c.payee.clone(),
+                    scheme: c.scheme.clone(),
+                })
+                .map_err(|e| e.to_string())?,
+            ));
+        }
         let billing = Billing::new(
             RouterConfig {
                 price_pence: config.price_pence,

@@ -100,6 +100,7 @@ async fn chain_payments_adapter_conforms() {
         months: 3,
         amount_pence: 900,
         description: "Link in Bio, 3 months".into(),
+        return_url: "https://app.example.link/billing?checkout=x".into(),
     };
     let start = p.create_checkout(&req).await.unwrap();
     assert_eq!(start.client["sessionId"], start.provider_ref);
@@ -179,4 +180,224 @@ fn a_configured_key_must_be_well_formed() {
         webhook_key: Some("abcd".into()),
     };
     assert!(ChainPayments::new(c, ChainPayments::http_client()).is_err());
+}
+
+// ── The fiat adapters, each against a stand-in for its provider's API ───────────────────────────────────────────────
+
+use link_in_bio_billing::{bank_transfer, gocardless, paddle, square};
+
+/// Serves fixed JSON answers by path (the stand-in records nothing; the adapters' requests are checked by shape).
+async fn stand_in(routes: Vec<(&'static str, Value)>) -> String {
+    let mut app = Router::new();
+    for (path, body) in routes {
+        let b = body.clone();
+        app = app.route(
+            path,
+            get({
+                let b = b.clone();
+                move || async move { Json(b) }
+            })
+            .post(move || async move { (StatusCode::CREATED, Json(b)) }),
+        );
+    }
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+fn request(method: &str, months: u32) -> CheckoutRequest {
+    CheckoutRequest {
+        checkout_id: Uuid::new_v4(),
+        method: method.into(),
+        billing_ref: "ref-alice-000000001".into(),
+        months,
+        amount_pence: 300 * u64::from(months),
+        description: "Link in Bio".into(),
+        return_url: "https://app.example.link/billing?checkout=x".into(),
+    }
+}
+
+fn h(k: &str, v: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([(k.to_string(), v.to_string())])
+}
+
+#[tokio::test]
+async fn square_adapter_conforms() {
+    let base = stand_in(vec![
+        (
+            "/v2/online-checkout/payment-links",
+            json!({ "payment_link": { "id": "PL1", "url": "https://square.link/u/abc", "order_id": "ORD1" } }),
+        ),
+        ("/v2/orders/{id}", json!({ "order": { "id": "ORD1", "state": "COMPLETED" } })),
+    ])
+    .await;
+    let c = square::Config {
+        api_base: base,
+        access_token: "t".into(),
+        location_id: "L1".into(),
+        signature_key: "sk".into(),
+        notification_url: "https://app.example.link/api/v1/webhooks/square".into(),
+        fixed_pence: 25,
+        percent_bps: 140,
+    };
+    let p = square::Square::new(c.clone(), link_in_bio_billing::http_client());
+    assert_eq!(p.methods()[0].id, "square:card");
+    assert!(matches!(p.create_checkout(&request("square:other", 4)).await, Err(BillingError::NotOffered)));
+    let s = p.create_checkout(&request("square:card", 4)).await.unwrap();
+    assert_eq!(
+        (s.provider_ref.as_str(), s.client["kind"].as_str(), s.client["url"].as_str()),
+        ("ORD1", Some("redirect"), Some("https://square.link/u/abc"))
+    );
+    let body = serde_json::to_vec(&json!({ "type": "payment.updated", "event_id": "E1", "data": { "object": { "payment": {
+        "id": "P1", "order_id": "ORD1", "status": "COMPLETED", "amount_money": { "amount": 1200, "currency": "GBP" } } } } })).unwrap();
+    let sig = square::signature(&c.signature_key, &c.notification_url, &body);
+    let now = Utc::now();
+    let e = p.verify_notification(&h(square::SIGNATURE_HEADER, &sig), &body, now).await.unwrap();
+    assert_eq!((e[0].outcome.clone(), e[0].event_id.clone()), (Outcome::Paid, p.paid_event_id("ORD1")));
+    assert!(matches!(p.verify_notification(&BTreeMap::new(), &body, now).await, Err(BillingError::Unauthentic)));
+    let other_url = square::signature(&c.signature_key, "https://elsewhere.example/hook", &body);
+    assert!(matches!(
+        p.verify_notification(&h(square::SIGNATURE_HEADER, &other_url), &body, now).await,
+        Err(BillingError::Unauthentic)
+    ));
+    let mut altered = body.clone();
+    altered[5] ^= 1;
+    assert!(matches!(
+        p.verify_notification(&h(square::SIGNATURE_HEADER, &sig), &altered, now).await,
+        Err(BillingError::Unauthentic)
+    ));
+    assert_eq!(p.checkout_outcome("ORD1").await.unwrap(), Outcome::Paid);
+    assert!(p.checkout_outcome("../x").await.is_err());
+}
+
+#[tokio::test]
+async fn gocardless_adapter_conforms() {
+    let base = stand_in(vec![
+        ("/billing_requests", json!({ "billing_requests": { "id": "BRQ123", "status": "pending" } })),
+        ("/billing_request_flows", json!({ "billing_request_flows": { "authorisation_url": "https://pay.gocardless.com/billing/static/flow?id=BRF1" } })),
+        ("/billing_requests/{id}", json!({ "billing_requests": { "id": "BRQ123", "status": "fulfilled" } })),
+    ])
+    .await;
+    let c = gocardless::Config {
+        api_base: base,
+        access_token: "t".into(),
+        webhook_secret: "ws".into(),
+        fixed_pence: 20,
+        percent_bps: 100,
+    };
+    let p = gocardless::GoCardless::new(c.clone(), link_in_bio_billing::http_client());
+    let s = p.create_checkout(&request("gocardless:bank", 3)).await.unwrap();
+    assert_eq!(s.provider_ref, "BRQ123");
+    assert!(s.client["url"].as_str().unwrap().starts_with("https://pay.gocardless.com/"));
+    let body = serde_json::to_vec(&json!({ "events": [
+        { "id": "EV1", "resource_type": "billing_requests", "action": "fulfilled", "links": { "billing_request": "BRQ123" } },
+        { "id": "EV2", "resource_type": "mandates", "action": "created", "links": {} }
+    ] })).unwrap();
+    let now = Utc::now();
+    let e = p
+        .verify_notification(&h(gocardless::SIGNATURE_HEADER, &gocardless::signature("ws", &body)), &body, now)
+        .await
+        .unwrap();
+    assert_eq!(e.len(), 1, "events it does not act on are acknowledged and ignored");
+    assert_eq!((e[0].outcome.clone(), e[0].event_id.clone()), (Outcome::Paid, p.paid_event_id("BRQ123")));
+    assert!(matches!(
+        p.verify_notification(&h(gocardless::SIGNATURE_HEADER, &gocardless::signature("other", &body)), &body, now)
+            .await,
+        Err(BillingError::Unauthentic)
+    ));
+    assert_eq!(p.checkout_outcome("BRQ123").await.unwrap(), Outcome::Paid);
+    assert!(p.checkout_outcome("PM123").await.is_err());
+}
+
+#[tokio::test]
+async fn paddle_adapter_conforms() {
+    let base = stand_in(vec![
+        ("/transactions", json!({ "data": { "id": "txn_01", "status": "ready", "checkout": { "url": "https://pay.example.org/?_ptxn=txn_01" } } })),
+        ("/transactions/{id}", json!({ "data": { "id": "txn_01", "status": "completed" } })),
+    ])
+    .await;
+    let c = paddle::Config {
+        api_base: base,
+        api_key: "k".into(),
+        webhook_secret: "pw".into(),
+        price_id: "pri_1".into(),
+        fixed_pence: 40,
+        percent_bps: 500,
+    };
+    let p = paddle::Paddle::new(c, link_in_bio_billing::http_client());
+    assert_eq!(p.methods()[0].seller, link_in_bio_billing::Seller::MerchantOfRecord);
+    let s = p.create_checkout(&request("paddle:checkout", 6)).await.unwrap();
+    assert_eq!(s.provider_ref, "txn_01");
+    let body = serde_json::to_vec(&json!({ "event_id": "evt_1", "event_type": "transaction.completed", "data": { "id": "txn_01", "currency_code": "EUR" } })).unwrap();
+    let now = Utc::now();
+    let ts = now.timestamp().to_string();
+    let sig = format!("ts={ts};h1={}", paddle::h1("pw", &ts, &body));
+    let e = p.verify_notification(&h(paddle::SIGNATURE_HEADER, &sig), &body, now).await.unwrap();
+    assert_eq!((e[0].outcome.clone(), e[0].event_id.clone()), (Outcome::Paid, p.paid_event_id("txn_01")));
+    let old = (now.timestamp() - 3600).to_string();
+    let stale = format!("ts={old};h1={}", paddle::h1("pw", &old, &body));
+    assert!(matches!(
+        p.verify_notification(&h(paddle::SIGNATURE_HEADER, &stale), &body, now).await,
+        Err(BillingError::Unauthentic)
+    ));
+    let forged = format!("ts={ts};h1={}", paddle::h1("nope", &ts, &body));
+    assert!(matches!(
+        p.verify_notification(&h(paddle::SIGNATURE_HEADER, &forged), &body, now).await,
+        Err(BillingError::Unauthentic)
+    ));
+    assert_eq!(p.checkout_outcome("txn_01").await.unwrap(), Outcome::Paid);
+}
+
+#[tokio::test]
+async fn bank_transfer_adapter_conforms() {
+    let sepa = bank_transfer::BankTransfer::new(bank_transfer::Config {
+        payee: "Example Ltd".into(),
+        scheme: bank_transfer::Scheme::Sepa {
+            iban: "DE89370400440532013000".into(),
+            bic: None,
+            eur_cents_per_month: 350,
+        },
+    })
+    .unwrap();
+    let s = sepa.create_checkout(&request("bank-transfer:sepa", 2)).await.unwrap();
+    assert!(bank_transfer::reference_valid(&s.provider_ref));
+    assert_eq!(s.client["amount"], "7.00");
+    assert!(s.client["qr"].as_str().unwrap().starts_with("BCD\n002\n1\nSCT\n"));
+    assert_eq!(bank_transfer::expected(&s.client), Some((700, "EUR".into())));
+    assert!(matches!(
+        sepa.verify_notification(&BTreeMap::new(), b"{}", Utc::now()).await,
+        Err(BillingError::Unauthentic)
+    ));
+    let camt = format!(
+        r#"<Document><BkToCstmrDbtCdtNtfctn><Ntfctn><Ntry><Amt Ccy="EUR">7.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>
+        <NtryDtls><TxDtls><RmtInf><Strd><CdtrRefInf><Ref>{}</Ref></CdtrRefInf></Strd></RmtInf></TxDtls></NtryDtls></Ntry></Ntfctn></BkToCstmrDbtCdtNtfctn></Document>"#,
+        s.provider_ref
+    );
+    let credits = bank_transfer::credits_from_camt(&camt).unwrap();
+    let e = bank_transfer::paid_event(&credits[0]);
+    assert_eq!(e.provider_ref, s.provider_ref);
+    assert_eq!(e.event_id, sepa.paid_event_id(&s.provider_ref), "the same key as reconciliation would use");
+    assert!(
+        bank_transfer::BankTransfer::new(bank_transfer::Config {
+            payee: "X".into(),
+            scheme: bank_transfer::Scheme::Sepa {
+                iban: "DE00370400440532013000".into(),
+                bic: None,
+                eur_cents_per_month: 350
+            },
+        })
+        .is_err(),
+        "a bad IBAN is refused at start"
+    );
+    let fp = bank_transfer::BankTransfer::new(bank_transfer::Config {
+        payee: "Example Ltd".into(),
+        scheme: bank_transfer::Scheme::FasterPayments {
+            sort_code: "12-34-56".into(),
+            account_number: "12345678".into(),
+        },
+    })
+    .unwrap();
+    let s = fp.create_checkout(&request("bank-transfer:faster-payments", 1)).await.unwrap();
+    assert_eq!((s.client["currency"].as_str(), s.client["amount"].as_str()), (Some("GBP"), Some("3.00")));
 }

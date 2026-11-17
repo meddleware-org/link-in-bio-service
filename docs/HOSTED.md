@@ -31,7 +31,7 @@ in the environment. Every switch starts at its safest value, and each one can on
 | `SIGNUP_MODE` | `closed` | `closed`, `invite` (an operator-issued code is needed) or `open` |
 | `TERMS_VERSION` | `unset` | the terms an account accepts at sign-up. While it is `unset`, sign-up stays closed whatever `SIGNUP_MODE` says |
 | `THIRD_PARTY_PAGES` | `off` | when `off`, only the operator's own accounts' pages are served |
-| `BILLING_PROVIDERS` | `manual` | comma list of `manual`, `chain-payments` (the fiat adapters join later) |
+| `BILLING_PROVIDERS` | `manual` | comma list of `manual`, `chain-payments`, `square`, `gocardless`, `paddle`, `bank-transfer` |
 | `<PROVIDER>_COUNTRIES` | `GB` | countries where an operator-as-seller method is offered, e.g. `CHAIN_PAYMENTS_COUNTRIES=GB` |
 | `PRICE_PENCE` | `300` | the price of one month in pence (GBP) |
 | `GRACE_DAYS` | `7` | how long a page stays online after its paid period ends |
@@ -45,6 +45,10 @@ in the environment. Every switch starts at its safest value, and each one can on
 | `SITE_CONFIG` | none | the page-site template for every tenant page (footer, `securityContact`, `securityPolicy`); `baseUrl` is replaced per tenant |
 | `PAGE_CACHE_SECS` | `30` | how long a built tenant page is reused (a suspension, a flagged link or a new version shows within this time) |
 | `CHAIN_PAYMENTS_MERCHANT_API`, `CHAIN_PAYMENTS_PUBLIC_API`, `CHAIN_PAYMENTS_ORIGIN`, `CHAIN_PAYMENTS_KEY_FILE`, `CHAIN_PAYMENTS_METHODS`, `CHAIN_PAYMENTS_WEBHOOK_KEY` | required when `chain-payments` is on | the in-cluster merchant API, the public session API as the service reaches it, the origin the buyer's browser calls, the merchant API key file, `id=label` pairs (`sui-testnet:SUI=SUI,sui-testnet:USDC=USDC`), and optionally the webhook public key (otherwise fetched once) |
+| `SQUARE_ACCESS_TOKEN_FILE`, `SQUARE_LOCATION_ID`, `SQUARE_SIGNATURE_KEY_FILE`, `SQUARE_API_BASE` (sandbox), `SQUARE_FIXED_PENCE` (25), `SQUARE_PERCENT_BPS` (140) | required when `square` is on | a payment link per checkout; notifications at `https://<APP_HOST>/api/v1/webhooks/square` (register exactly that URL: Square signs it) |
+| `GOCARDLESS_ACCESS_TOKEN_FILE`, `GOCARDLESS_WEBHOOK_SECRET_FILE`, `GOCARDLESS_API_BASE` (sandbox), `GOCARDLESS_FIXED_PENCE` (20), `GOCARDLESS_PERCENT_BPS` (100) | required when `gocardless` is on | a billing request and its hosted flow; notifications at `/api/v1/webhooks/gocardless` |
+| `PADDLE_API_KEY_FILE`, `PADDLE_WEBHOOK_SECRET_FILE`, `PADDLE_PRICE_ID`, `PADDLE_API_BASE` (sandbox), `PADDLE_FIXED_PENCE` (40), `PADDLE_PERCENT_BPS` (500) | required when `paddle` is on | a transaction for the one-month catalog price × months, paid on Paddle's default payment link; notifications at `/api/v1/webhooks/paddle` |
+| `BANK_TRANSFER_SCHEME` (`sepa` or `faster-payments`), `BANK_TRANSFER_PAYEE`, `BANK_TRANSFER_IBAN`, `BANK_TRANSFER_BIC`, `BANK_TRANSFER_EUR_CENTS_PER_MONTH`, `BANK_TRANSFER_SORT_CODE`, `BANK_TRANSFER_ACCOUNT_NUMBER` | required when `bank-transfer` is on | payment details with an ISO 11649 reference (and an EPC QR payload for SEPA); paid when the operator imports the bank's camt.053/054 statement in the console |
 | `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, `KETO_READ_URL`, `ADMIN_ORIGIN` | none (the console answers 503) | the operator console's gate |
 
 ## Sign-in
@@ -82,6 +86,13 @@ in the environment. Every switch starts at its safest value, and each one can on
   minimum is `ceil(fixed fee × 1.25 / (3 % × price))`, so its fixed fee stays at most 3 % of a month.
 - **The ledger.** Every change to a paid period (purchase, grant, refund) is one row per provider event, applied once.
   A payment seen both by notification and by the worker's reconciliation extends the period once.
+- **Card and bank providers.** Square (UK cards), GoCardless (UK bank payments over Open Banking), and Paddle (merchant
+  of record, so offered anywhere) each send the buyer to the provider's hosted page. The app loads no provider script.
+  Their signed notifications arrive at `/api/v1/webhooks/<provider>` on the app host.
+- **Bank transfer.** There is no provider. The checkout shows the payee, the account and an `RF…` reference (with an EPC
+  QR payload for SEPA). The operator imports the receiving bank's ISO 20022 statement
+  (`POST /api/v1/admin/bank-statements`). A booked credit with the reference, in the right currency and for at least
+  the amount, pays the checkout once. Underpayments and unknown references are reported and never applied.
 - **Chain Payments.** Chain Payments sessions carry `units` (the months) and the account's opaque billing reference
   (never the handle). Its notifications are ed25519-signed (`Chain-Payments-Signature`) and arrive on the internal
   port.

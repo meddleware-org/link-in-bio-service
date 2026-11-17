@@ -661,6 +661,28 @@
           }
         }
       }
+    },
+    "/api/v1/admin/bank-statements": {
+      "post": {
+        "summary": "Import an ISO 20022 camt.053/054 statement: credits pay bank-transfer checkouts by reference",
+        "security": [
+          {
+            "access": []
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "An error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
