@@ -1215,6 +1215,67 @@ impl Store {
         .await
     }
 
+    // ── Open Payments grants ───────────────────────────────────────────────
+
+    /// Records (or replaces) the grant waiting for the buyer's approval of a checkout. Refused (`false`) once a payment
+    /// was sent for it.
+    pub async fn put_open_payments_grant(&self, checkout: Uuid, buyer: &str, pending: &Value) -> Result<bool, DbError> {
+        let r = sqlx::query(
+            "INSERT INTO lib.open_payments_grants (checkout_id, buyer_wallet, pending) VALUES ($1, $2, $3)
+             ON CONFLICT (checkout_id) DO UPDATE
+                SET buyer_wallet = EXCLUDED.buyer_wallet, pending = EXCLUDED.pending, status = 'pending',
+                    outgoing_payment = NULL, created_at = now(), finished_at = NULL
+              WHERE lib.open_payments_grants.status <> 'sent'",
+        )
+        .bind(checkout)
+        .bind(buyer)
+        .bind(pending)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// A checkout's grant: its status and what is pending.
+    pub async fn open_payments_grant(&self, checkout: Uuid) -> Result<Option<(String, Value)>, DbError> {
+        let row = sqlx::query("SELECT status, pending FROM lib.open_payments_grants WHERE checkout_id = $1")
+            .bind(checkout)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| (r.get("status"), r.get("pending"))))
+    }
+
+    /// Takes a pending grant to continue it (once: a second caller gets `None`).
+    pub async fn take_open_payments_grant(&self, checkout: Uuid) -> Result<Option<Value>, DbError> {
+        sqlx::query_scalar(
+            "UPDATE lib.open_payments_grants SET status = 'finishing'
+              WHERE checkout_id = $1 AND status = 'pending' RETURNING pending",
+        )
+        .bind(checkout)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Ends a grant: `sent` with the outgoing payment's id, or `failed`. What was pending is removed either way.
+    pub async fn finish_open_payments_grant(
+        &self,
+        checkout: Uuid,
+        outgoing_payment: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE lib.open_payments_grants
+                SET status = CASE WHEN $2::text IS NULL THEN 'failed' ELSE 'sent' END, outgoing_payment = $2,
+                    pending = '{}', finished_at = $3
+              WHERE checkout_id = $1",
+        )
+        .bind(checkout)
+        .bind(outgoing_payment)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
     // ── domains ────────────────────────────────────────────────────────────
 
     pub async fn add_domain(&self, account: Uuid, hostname: &str, method: &str, token: &str) -> Result<bool, DbError> {

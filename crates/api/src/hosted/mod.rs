@@ -46,6 +46,8 @@ pub struct App {
     pub metrics: metrics::Metrics,
     pub pages: pages::PageCache,
     pub access: Option<Arc<access::Admins>>,
+    /// The Open Payments adapter (also in `billing`), for the steps of its checkout beyond the port.
+    pub open_payments: Option<Arc<link_in_bio_billing::open_payments::OpenPayments>>,
 }
 
 pub type Shared = Arc<App>;
@@ -126,6 +128,25 @@ impl App {
                 .map_err(|e| e.to_string())?,
             ));
         }
+        let mut open_payments = None;
+        if let Some(c) = &config.open_payments {
+            let p = Arc::new(
+                link_in_bio_billing::open_payments::OpenPayments::new(
+                    link_in_bio_billing::open_payments::Config {
+                        wallet_address: c.wallet_address.clone(),
+                        key_id: c.key_id.clone(),
+                        private_key_pem: file(&c.key_file)?,
+                        asset_code: c.asset_code.clone(),
+                        asset_scale: c.asset_scale,
+                        minor_per_month: c.minor_per_month,
+                    },
+                    link_in_bio_billing::http_client(),
+                )
+                .map_err(|e| e.to_string())?,
+            );
+            providers.push(Box::new(p.clone()));
+            open_payments = Some(p);
+        }
         let billing = Billing::new(
             RouterConfig {
                 price_pence: config.price_pence,
@@ -158,6 +179,7 @@ impl App {
             metrics: metrics::Metrics::default(),
             pages: pages::PageCache::new(page_cache),
             access,
+            open_payments,
         })
     }
 }

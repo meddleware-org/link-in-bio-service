@@ -88,6 +88,18 @@ pub const APP_ROUTES: &[Route] = &[
     r(Get, "/api/v1/billing", Session, "The paid period, the payment methods offered and past payments"),
     r(Post, "/api/v1/billing/checkouts", Session, "Start paying for months with one method"),
     r(Get, "/api/v1/billing/checkouts/{id}", Session, "How a checkout stands"),
+    r(
+        Post,
+        "/api/v1/billing/checkouts/{id}/open-payments",
+        Session,
+        "Open Payments: the buyer's wallet address; returns the wallet's approval page to redirect to",
+    ),
+    r(
+        Post,
+        "/api/v1/billing/checkouts/{id}/open-payments/finish",
+        Session,
+        "Open Payments: back from the wallet (hash, interactRef); sends the payment",
+    ),
     r(Get, "/api/v1/domains", Session, "Custom domains and the TXT records that verify them"),
     r(Post, "/api/v1/domains", Session, "Add a custom domain (when custom domains are on)"),
     r(Delete, "/api/v1/domains/{hostname}", Session, "Remove a custom domain"),

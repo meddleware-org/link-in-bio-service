@@ -401,3 +401,118 @@ async fn bank_transfer_adapter_conforms() {
     let s = fp.create_checkout(&request("bank-transfer:faster-payments", 1)).await.unwrap();
     assert_eq!((s.client["currency"].as_str(), s.client["amount"].as_str()), (Some("GBP"), Some("3.00")));
 }
+
+// ── Open Payments, against a stand-in account servicing entity that checks every signature ────────────────────────
+
+#[path = "support/open_payments.rs"]
+mod op_stand_in;
+
+use link_in_bio_billing::open_payments::{self, OpenPayments};
+use ring::signature::Ed25519KeyPair as Ed;
+
+fn op_config(wallet: &str, key: &str) -> open_payments::Config {
+    open_payments::Config {
+        wallet_address: wallet.into(),
+        key_id: "test-key-ed25519".into(),
+        private_key_pem: key.into(),
+        asset_code: "GBP".into(),
+        asset_scale: 2,
+        minor_per_month: None,
+    }
+}
+
+#[tokio::test]
+async fn open_payments_adapter_conforms() {
+    let public = link_in_bio_billing::keys::ed25519_from_pem(&op_stand_in::test_key_pem())
+        .unwrap()
+        .public_key()
+        .as_ref()
+        .to_vec();
+    let ase = op_stand_in::Ase::start(&public, "test-key-ed25519", ("GBP", 2)).await;
+    let p =
+        OpenPayments::new(op_config(&ase.operator(), &op_stand_in::test_key_pem()), link_in_bio_billing::http_client())
+            .unwrap();
+    assert_eq!(p.methods().into_iter().map(|m| m.id).collect::<Vec<_>>(), vec![open_payments::METHOD]);
+    assert_eq!(p.jwk()["x"], "JrQLj5P_89iXES9-vFgrIy29clF9CC_oPPsw3c5D0bs");
+    assert!(matches!(p.create_checkout(&request("open-payments:other", 2)).await, Err(BillingError::NotOffered)));
+
+    // Step 1: an incoming payment on the operator's wallet for the amount.
+    let s = p.create_checkout(&request(open_payments::METHOD, 2)).await.unwrap();
+    assert!(s.provider_ref.starts_with(&format!("{}/rs/incoming-payments/", ase.base)), "{}", s.provider_ref);
+    assert_eq!(s.client["kind"], "open-payments");
+    assert_eq!(s.client["step"], "wallet-address");
+    assert_eq!((s.client["amount"].as_str(), s.client["amountMinor"].as_str()), (Some("6.00"), Some("600")));
+    assert_eq!(p.checkout_outcome(&s.provider_ref).await.unwrap(), Outcome::Open);
+
+    // Steps 2 and 3: the buyer's wallet address, a quote and an interactive grant limited to our incoming payment.
+    let finish = "https://app.example.link/billing?checkout=x&openPayments=finish";
+    let pending = p.start_payment(&s.provider_ref, &ase.buyer(), finish).await.unwrap();
+    assert_eq!(pending.redirect, format!("{}/interact/1", ase.base));
+    assert_eq!(pending.grant_endpoint, format!("{}/auth/", ase.base));
+    assert_eq!(ase.pending_receiver().as_deref(), Some(s.provider_ref.as_str()));
+    assert_eq!(pending.debit_amount["value"], "600");
+    let (redirect_back, hash, interact_ref) = ase.approve();
+    assert!(redirect_back.starts_with(finish));
+
+    // Step 4: a wrong hash is refused before anything is sent; the right one continues the grant and pays.
+    assert!(matches!(
+        p.finish_payment(&pending, "x-gguKWTj8rQf7d7i3w3UhzvuJ5bpOlKyAlVpLxBffY", &interact_ref).await,
+        Err(BillingError::Unauthentic)
+    ));
+    let mut other = pending.clone();
+    other.client_nonce = "another".into();
+    assert!(!OpenPayments::finish_hash_valid(&other, &hash, &interact_ref), "the hash binds our nonce");
+    assert_eq!(ase.received(&s.provider_ref), 0);
+    let out = p.finish_payment(&pending, &hash, &interact_ref).await.unwrap();
+    assert!(out.starts_with(&format!("{}/rs/outgoing-payments/", ase.base)));
+    assert_eq!(ase.received(&s.provider_ref), 600);
+    assert_eq!(p.checkout_outcome(&s.provider_ref).await.unwrap(), Outcome::Paid);
+    assert!(
+        matches!(p.finish_payment(&pending, &hash, &interact_ref).await, Err(BillingError::Refused(_))),
+        "the interaction is used up"
+    );
+
+    // A short payment is not a payment.
+    ase.set_underpay(true);
+    let s2 = p.create_checkout(&request(open_payments::METHOD, 1)).await.unwrap();
+    let pending = p.start_payment(&s2.provider_ref, &ase.buyer(), finish).await.unwrap();
+    let (_, hash, interact_ref) = ase.approve();
+    p.finish_payment(&pending, &hash, &interact_ref).await.unwrap();
+    assert_eq!(ase.received(&s2.provider_ref), 299);
+    assert_eq!(p.checkout_outcome(&s2.provider_ref).await.unwrap(), Outcome::Open);
+
+    // Every request was signed and verified; an unsigned one is refused by the stand-in, and so is another key.
+    let (refused, ok) = ase.signatures();
+    assert_eq!(refused, 0);
+    assert!(ok >= 12, "{ok}");
+    let unsigned = reqwest::Client::new().post(format!("{}/auth/", ase.base)).json(&json!({})).send().await.unwrap();
+    assert_eq!(unsigned.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let other_key = Ed::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+    let pem = link_in_bio_billing::keys::pem_encode("PRIVATE KEY", other_key.as_ref());
+    let impostor = OpenPayments::new(op_config(&ase.operator(), &pem), link_in_bio_billing::http_client()).unwrap();
+    assert!(matches!(
+        impostor.create_checkout(&request(open_payments::METHOD, 1)).await,
+        Err(BillingError::Refused(_))
+    ));
+
+    // References and wallets it will not touch.
+    assert!(p.checkout_outcome("https://elsewhere.example/incoming-payments/1").await.is_err());
+    for buyer in
+        ["http://10.0.0.1/alice", "https://10.0.0.1/alice", "https://localhost/alice", "https://wallet.example:8443/a"]
+    {
+        assert!(p.start_payment(&s.provider_ref, buyer, finish).await.is_err(), "{buyer}");
+    }
+    assert!(matches!(p.verify_notification(&BTreeMap::new(), b"{}", Utc::now()).await, Err(BillingError::Unauthentic)));
+}
+
+#[test]
+fn open_payments_settings_are_checked() {
+    let ok = op_config("https://wallet.example/operator", &op_stand_in::test_key_pem());
+    assert!(OpenPayments::new(ok.clone(), link_in_bio_billing::http_client()).is_ok());
+    let bad = |c: open_payments::Config| OpenPayments::new(c, link_in_bio_billing::http_client()).is_err();
+    assert!(bad(open_payments::Config { wallet_address: "http://wallet.example/op".into(), ..ok.clone() }));
+    assert!(bad(open_payments::Config { private_key_pem: "nope".into(), ..ok.clone() }));
+    assert!(bad(open_payments::Config { asset_code: "USD".into(), ..ok.clone() }), "another asset needs its price");
+    assert!(!bad(open_payments::Config { asset_code: "USD".into(), minor_per_month: Some(400), ..ok.clone() }));
+    assert!(bad(open_payments::Config { key_id: " ".into(), ..ok }));
+}

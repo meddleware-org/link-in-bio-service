@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use link_in_bio_auth::passkey::{LoginState, Passkeys};
 use link_in_bio_auth::{recovery, session, wallet};
-use link_in_bio_billing::{CheckoutRequest, Evidence, months_ahead};
+use link_in_bio_billing::{BillingError, CheckoutRequest, Evidence, months_ahead, open_payments};
 use link_in_bio_core::assets::Bundle;
 use link_in_bio_core::limits::{handle_skeleton, limits_json, looks_reserved};
 use link_in_bio_core::manifest::check_handle;
@@ -1009,9 +1009,144 @@ async fn checkout_create(
 
 async fn checkout_get(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     let a = account(&app, &headers).await?;
-    let c = app.store.checkout(id).await?.filter(|c| c.account_id == a.id).ok_or(ApiError::NotFound)?;
+    let mut c = app.store.checkout(id).await?.filter(|c| c.account_id == a.id).ok_or(ApiError::NotFound)?;
+    // An Open Payments checkout whose outgoing payment was sent: ask the operator's wallet whether it has arrived.
+    if c.status == "open"
+        && c.provider == open_payments::ID
+        && app.store.open_payments_grant(c.id).await?.is_some_and(|(status, _)| status == "sent")
+    {
+        open_payments_settle(&app, &c, json!({ "source": "poll" })).await?;
+        c = app.store.checkout(id).await?.ok_or(ApiError::NotFound)?;
+    }
     let fresh = app.store.account(a.id).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(json!({ "checkout": c.id, "status": c.status, "months": c.months, "paidUntil": fresh.paid_until })))
+}
+
+// ── Open Payments: the steps after the checkout ──────────────────────────────────────────────────────────────────
+
+/// An open Open Payments checkout of the signed-in account, and the adapter.
+async fn open_payments_checkout(
+    app: &Shared,
+    headers: &HeaderMap,
+    id: Uuid,
+) -> ApiResult<(Checkout, std::sync::Arc<open_payments::OpenPayments>)> {
+    let a = account(app, headers).await?;
+    let c = app
+        .store
+        .checkout(id)
+        .await?
+        .filter(|c| c.account_id == a.id && c.provider == open_payments::ID)
+        .ok_or(ApiError::NotFound)?;
+    if c.status != "open" {
+        return Err(ApiError::Conflict(format!("This checkout is {}.", c.status)));
+    }
+    let p = app.open_payments.clone().ok_or(ApiError::Unavailable("Open Payments is switched off"))?;
+    Ok((c, p))
+}
+
+fn wallet_error(e: BillingError) -> ApiError {
+    tracing::info!(error = %e, "open payments");
+    match e {
+        BillingError::Unavailable(_) => ApiError::Unavailable("the wallet did not answer; try again shortly"),
+        BillingError::Unauthentic => {
+            ApiError::BadRequest("The wallet's answer does not belong to this payment.".into())
+        }
+        BillingError::Malformed(m) => ApiError::Unprocessable(format!("That wallet cannot be used: {m}.")),
+        BillingError::Refused(m) => ApiError::Unprocessable(format!("The wallet refused: {m}.")),
+        BillingError::NotOffered => ApiError::Unprocessable("That payment method is not available.".into()),
+    }
+}
+
+/// Asks the operator's wallet how the checkout's incoming payment stands, and applies the payment once it has
+/// arrived in full.
+async fn open_payments_settle(app: &Shared, c: &Checkout, evidence: Value) -> ApiResult<link_in_bio_billing::Outcome> {
+    let Some(p) = app.billing.provider(open_payments::ID) else { return Ok(link_in_bio_billing::Outcome::Open) };
+    let outcome = p.checkout_outcome(&c.provider_ref).await.map_err(wallet_error)?;
+    if outcome == link_in_bio_billing::Outcome::Paid {
+        let e = link_in_bio_billing::ProviderEvent {
+            event_id: p.paid_event_id(&c.provider_ref),
+            provider_ref: c.provider_ref.clone(),
+            outcome: link_in_bio_billing::Outcome::Paid,
+            months: None,
+            evidence,
+        };
+        super::internal::apply_event(app, open_payments::ID, &e).await?;
+    }
+    Ok(outcome)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OpenPaymentsStart {
+    wallet_address: String,
+}
+
+/// The buyer's wallet address: a quote and an outgoing-payment grant there, approved on the wallet's own page.
+async fn open_payments_start(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(b): Json<OpenPaymentsStart>,
+) -> ApiResult<Json<Value>> {
+    let (c, p) = open_payments_checkout(&app, &headers, id).await?;
+    let finish = format!("{}/billing?checkout={id}&openPayments=finish", app.config.app_origin);
+    let pending = p.start_payment(&c.provider_ref, &b.wallet_address, &finish).await.map_err(wallet_error)?;
+    let stored = serde_json::to_value(&pending).map_err(|_| ApiError::Internal)?;
+    if !app.store.put_open_payments_grant(c.id, &pending.buyer_wallet, &stored).await? {
+        return Err(ApiError::Conflict("A payment was already sent for this checkout.".into()));
+    }
+    Ok(Json(json!({
+        "kind": "open-payments", "step": "redirect", "redirect": pending.redirect, "wallet": pending.buyer_wallet,
+        "debitAmount": pending.debit_amount, "receiveAmount": pending.receive_amount,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OpenPaymentsFinish {
+    hash: String,
+    interact_ref: String,
+}
+
+/// Back from the wallet (the `hash` and `interact_ref` of the finish redirect): the hash is checked, the grant
+/// continued and the outgoing payment created; the checkout is paid once the operator's wallet has received it all.
+async fn open_payments_finish(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(b): Json<OpenPaymentsFinish>,
+) -> ApiResult<Json<Value>> {
+    let (c, p) = open_payments_checkout(&app, &headers, id).await?;
+    let Some((status, stored)) = app.store.open_payments_grant(c.id).await? else {
+        return Err(ApiError::Conflict("No wallet approval is waiting for this checkout.".into()));
+    };
+    let pending: open_payments::PendingPayment = match status.as_str() {
+        "pending" => serde_json::from_value(stored).map_err(|_| ApiError::Internal)?,
+        "sent" => return Err(ApiError::Conflict("The payment was already sent; it is being checked.".into())),
+        _ => return Err(ApiError::Conflict("No wallet approval is waiting for this checkout.".into())),
+    };
+    // A redirect that is not the wallet's answer to this grant changes nothing (the real one still works).
+    if !open_payments::OpenPayments::finish_hash_valid(&pending, &b.hash, &b.interact_ref) {
+        return Err(wallet_error(BillingError::Unauthentic));
+    }
+    if app.store.take_open_payments_grant(c.id).await?.is_none() {
+        return Err(ApiError::Conflict("This approval is already being used.".into()));
+    }
+    let outgoing = match p.finish_payment(&pending, &b.hash, &b.interact_ref).await {
+        Ok(o) => o,
+        Err(e) => {
+            app.store.finish_open_payments_grant(c.id, None, now()).await?;
+            return Err(wallet_error(e));
+        }
+    };
+    app.store.finish_open_payments_grant(c.id, Some(&outgoing), now()).await?;
+    let evidence = json!({ "source": "open-payments", "outgoingPayment": outgoing, "buyerWallet": pending.buyer_wallet,
+                           "debitAmount": pending.debit_amount, "receiveAmount": pending.receive_amount });
+    let outcome = open_payments_settle(&app, &c, evidence).await?;
+    Ok(Json(json!({
+        "checkout": c.id, "status": if outcome == link_in_bio_billing::Outcome::Paid { "paid" } else { "open" },
+        "outgoingPayment": outgoing,
+    })))
 }
 
 // ── custom domains ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -1223,6 +1358,8 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v1/billing", get(billing))
         .route("/api/v1/billing/checkouts", post(checkout_create))
         .route("/api/v1/billing/checkouts/{id}", get(checkout_get))
+        .route("/api/v1/billing/checkouts/{id}/open-payments", post(open_payments_start))
+        .route("/api/v1/billing/checkouts/{id}/open-payments/finish", post(open_payments_finish))
         .route("/api/v1/domains", get(domains).post(domain_add))
         .route("/api/v1/domains/{hostname}", delete(domain_delete))
         .route("/api/v1/reports", post(report))

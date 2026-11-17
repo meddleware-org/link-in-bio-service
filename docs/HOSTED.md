@@ -31,7 +31,7 @@ in the environment. Every switch starts at its safest value, and each one can on
 | `SIGNUP_MODE` | `closed` | `closed`, `invite` (an operator-issued code is needed) or `open` |
 | `TERMS_VERSION` | `unset` | the terms an account accepts at sign-up. While it is `unset`, sign-up stays closed whatever `SIGNUP_MODE` says |
 | `THIRD_PARTY_PAGES` | `off` | when `off`, only the operator's own accounts' pages are served |
-| `BILLING_PROVIDERS` | `manual` | comma list of `manual`, `chain-payments`, `square`, `gocardless`, `paddle`, `bank-transfer` |
+| `BILLING_PROVIDERS` | `manual` | comma list of `manual`, `chain-payments`, `square`, `gocardless`, `paddle`, `bank-transfer`, `open-payments` |
 | `<PROVIDER>_COUNTRIES` | `GB` | countries where an operator-as-seller method is offered, e.g. `CHAIN_PAYMENTS_COUNTRIES=GB` |
 | `PRICE_PENCE` | `300` | the price of one month in pence (GBP) |
 | `GRACE_DAYS` | `7` | how long a page stays online after its paid period ends |
@@ -49,6 +49,7 @@ in the environment. Every switch starts at its safest value, and each one can on
 | `GOCARDLESS_ACCESS_TOKEN_FILE`, `GOCARDLESS_WEBHOOK_SECRET_FILE`, `GOCARDLESS_API_BASE` (sandbox), `GOCARDLESS_FIXED_PENCE` (20), `GOCARDLESS_PERCENT_BPS` (100) | required when `gocardless` is on | a billing request and its hosted flow; notifications at `/api/v1/webhooks/gocardless` |
 | `PADDLE_API_KEY_FILE`, `PADDLE_WEBHOOK_SECRET_FILE`, `PADDLE_PRICE_ID`, `PADDLE_API_BASE` (sandbox), `PADDLE_FIXED_PENCE` (40), `PADDLE_PERCENT_BPS` (500) | required when `paddle` is on | a transaction for the one-month catalog price × months, paid on Paddle's default payment link; notifications at `/api/v1/webhooks/paddle` |
 | `BANK_TRANSFER_SCHEME` (`sepa` or `faster-payments`), `BANK_TRANSFER_PAYEE`, `BANK_TRANSFER_IBAN`, `BANK_TRANSFER_BIC`, `BANK_TRANSFER_EUR_CENTS_PER_MONTH`, `BANK_TRANSFER_SORT_CODE`, `BANK_TRANSFER_ACCOUNT_NUMBER` | required when `bank-transfer` is on | payment details with an ISO 11649 reference (and an EPC QR payload for SEPA); paid when the operator imports the bank's camt.053/054 statement in the console |
+| `OPEN_PAYMENTS_WALLET_ADDRESS`, `OPEN_PAYMENTS_KEY_ID`, `OPEN_PAYMENTS_KEY_FILE`, `OPEN_PAYMENTS_ASSET_CODE` (`GBP`), `OPEN_PAYMENTS_ASSET_SCALE` (2), `OPEN_PAYMENTS_MINOR_PER_MONTH` | required when `open-payments` is on (the last only when the asset is not GBP) | the operator's wallet address (the payee, and the client every grant names), the id of the client key registered with that wallet's provider (listed at `<wallet address>/jwks.json`), the ed25519 private key file (PKCS #8 PEM, or the base64 of it), and the wallet's asset; for another asset, its minor units per month |
 | `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, `KETO_READ_URL`, `ADMIN_ORIGIN` | none (the console answers 503) | the operator console's gate |
 
 ## Sign-in
@@ -93,6 +94,17 @@ in the environment. Every switch starts at its safest value, and each one can on
   QR payload for SEPA). The operator imports the receiving bank's ISO 20022 statement
   (`POST /api/v1/admin/bank-statements`). A booked credit with the reference, in the right currency and for at least
   the amount, pays the checkout once. Underpayments and unknown references are reported and never applied.
+- **Open Payments (Interledger).** The checkout is an incoming payment on the operator's wallet address for the amount
+  (a non-interactive incoming-payment grant). The buyer gives their wallet address (a URL, or a `$` payment pointer;
+  `https` to a public host only). The service gets a quote there and an outgoing-payment grant limited to the quote's
+  debit amount and to that incoming payment, with an interactive redirect: the buyer approves on their wallet's own
+  page and comes back to `https://<APP_HOST>/billing?checkout=<id>&openPayments=finish&hash=…&interact_ref=…`. The app
+  posts `hash` and `interact_ref`; the service checks the GNAP interaction hash (RFC 9635 §4.2.3, SHA-256, URL-safe
+  base64 without padding), continues the grant and creates the outgoing payment. The checkout is paid only when the
+  operator's incoming payment reports a received amount at least the expected one (read when the app polls the
+  checkout, and by the worker's reconciliation). Every request to a grant or resource server is signed (RFC 9421,
+  ed25519, `Content-Digest` with SHA-512). The continuation token is kept in `lib.open_payments_grants` only until the
+  grant is continued. There are no notifications.
 - **Chain Payments.** Chain Payments sessions carry `units` (the months) and the account's opaque billing reference
   (never the handle). Its notifications are ed25519-signed (`Chain-Payments-Signature`) and arrive on the internal
   port.
@@ -130,6 +142,7 @@ in the environment. Every switch starts at its safest value, and each one can on
 | Passkey public keys, wallet addresses, recovery code hashes, session hashes | `lib.passkeys`, `lib.wallets`, `lib.recovery_codes`, `lib.sessions` | sign-in |
 | The draft, the published document and the last 20 versions; pictures (re-encoded, metadata stripped) | `lib.pages`, `lib.page_versions`, `lib.assets` | the page |
 | Checkouts and billing events (with the countries seen at purchase) | `lib.checkouts`, `lib.billing_events` | accounting and tax records, kept after an account is deleted |
+| Open Payments grants: the buyer's wallet address, the outgoing payment, and (only until it is continued) the grant's continuation | `lib.open_payments_grants` | the payment's evidence; deleted with the checkout |
 | Reports (an optional contact), appeals, the audit log | `lib.reports`, `lib.appeals`, `lib.audit_log` | trust and safety |
 
 - **Erasure.** Deleting an account (`DELETE /api/v1/me`) removes its sign-in methods, sessions, pictures, domains and

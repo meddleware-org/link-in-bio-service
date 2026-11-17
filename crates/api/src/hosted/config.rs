@@ -56,6 +56,7 @@ pub struct HostedConfig {
     pub gocardless: Option<GoCardlessEnv>,
     pub paddle: Option<PaddleEnv>,
     pub bank_transfer: Option<BankTransferEnv>,
+    pub open_payments: Option<OpenPaymentsEnv>,
     pub access: Option<AccessEnv>,
 }
 
@@ -93,6 +94,18 @@ pub struct PaddleEnv {
 pub struct BankTransferEnv {
     pub payee: String,
     pub scheme: link_in_bio_billing::bank_transfer::Scheme,
+}
+
+/// Open Payments: the operator's wallet address (the payee and the client), the client key's id at the wallet provider
+/// and its file, and the wallet's asset.
+#[derive(Debug, Clone)]
+pub struct OpenPaymentsEnv {
+    pub wallet_address: String,
+    pub key_id: String,
+    pub key_file: String,
+    pub asset_code: String,
+    pub asset_scale: u8,
+    pub minor_per_month: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +189,9 @@ impl HostedConfig {
             .collect();
         billing_providers.insert("manual".into());
         for p in &billing_providers {
-            if !["manual", "chain-payments", "square", "gocardless", "paddle", "bank-transfer"].contains(&p.as_str()) {
+            if !["manual", "chain-payments", "square", "gocardless", "paddle", "bank-transfer", "open-payments"]
+                .contains(&p.as_str())
+            {
                 return Err(HostedConfigError::Invalid("BILLING_PROVIDERS", format!("{p} is not a built-in provider")));
             }
         }
@@ -282,6 +297,26 @@ impl HostedConfig {
         } else {
             None
         };
+        let open_payments = if billing_providers.contains("open-payments") {
+            let wallet_address = need("OPEN_PAYMENTS_WALLET_ADDRESS")?;
+            if !(wallet_address.starts_with("https://") || wallet_address.starts_with("http://127.0.0.1:")) {
+                return Err(HostedConfigError::Invalid("OPEN_PAYMENTS_WALLET_ADDRESS", "must be https".into()));
+            }
+            let minor_per_month = match get("OPEN_PAYMENTS_MINOR_PER_MONTH") {
+                Some(_) => Some(number(&get, "OPEN_PAYMENTS_MINOR_PER_MONTH", 0u64, 1, 1_000_000_000_000)?),
+                None => None,
+            };
+            Some(OpenPaymentsEnv {
+                wallet_address,
+                key_id: need("OPEN_PAYMENTS_KEY_ID")?,
+                key_file: need("OPEN_PAYMENTS_KEY_FILE")?,
+                asset_code: get("OPEN_PAYMENTS_ASSET_CODE").unwrap_or_else(|| "GBP".into()).trim().to_string(),
+                asset_scale: number(&get, "OPEN_PAYMENTS_ASSET_SCALE", 2u8, 0, 18)?,
+                minor_per_month,
+            })
+        } else {
+            None
+        };
         let access = match (get("ACCESS_TEAM_DOMAIN"), get("ACCESS_AUD")) {
             (Some(team), Some(aud)) if !aud.trim().is_empty() => Some(AccessEnv {
                 team_domain: team.trim_end_matches('/').to_string(),
@@ -326,6 +361,7 @@ impl HostedConfig {
             gocardless,
             paddle,
             bank_transfer,
+            open_payments,
             access,
         })
     }
@@ -389,7 +425,7 @@ mod tests {
         assert!(with(("THIRD_PARTY_PAGES", "yes")).is_err());
         assert!(with(("BILLING_PROVIDERS", "stripe")).is_err());
         assert!(with(("BILLING_PROVIDERS", "chain-payments")).is_err(), "needs its settings");
-        for p in ["square", "gocardless", "paddle", "bank-transfer"] {
+        for p in ["square", "gocardless", "paddle", "bank-transfer", "open-payments"] {
             assert!(with(("BILLING_PROVIDERS", p)).is_err(), "{p} needs its settings");
         }
         assert!(with(("CUSTOM_HOSTNAME_CAP", "101")).is_err(), "hard stop at 100");

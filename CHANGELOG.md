@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Open Payments (Interledger), off unless `BILLING_PROVIDERS` lists `open-payments`: an incoming payment on the
+  operator's wallet address per checkout, the buyer's quote and interactive outgoing-payment grant (GNAP, RFC 9635) with
+  the finish hash checked, every request signed with HTTP Message Signatures (RFC 9421, ed25519, `Content-Digest` per
+  RFC 9530); paid only when the incoming payment has received the whole amount. New routes
+  `POST /api/v1/billing/checkouts/{id}/open-payments` and `…/open-payments/finish`; schema 2
+  (`lib.open_payments_grants`). The signing code is checked against the RFC 9421, RFC 9530 and RFC 9635 examples.
+
 ## 0.0.3 — 2026-11-17
 
 Fixes from the first hosted deploy:

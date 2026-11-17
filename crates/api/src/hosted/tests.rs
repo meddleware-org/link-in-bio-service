@@ -756,3 +756,167 @@ async fn an_operator_account_with_a_reserved_handle_is_served() {
     assert_eq!(page.status, StatusCode::OK, "third-party pages are off, but this is the operator's own account");
     assert!(page.text().contains("meddleware"));
 }
+
+/// An account made directly in the store (sign-up is closed), with a session cookie.
+async fn account_with_session(s: &Store, handle: &str) -> (uuid::Uuid, String) {
+    let id = uuid::Uuid::new_v4();
+    let draft = format!(r#"{{"schema":1,"identity":{{"displayName":"{handle}","handle":"{handle}"}},"items":[]}}"#);
+    let billing_ref = format!("ref-{handle}-{}", &id.simple().to_string()[..8]);
+    s.create_account(
+        &link_in_bio_store::NewAccount {
+            id,
+            handle,
+            handle_skeleton: &link_in_bio_core::limits::handle_skeleton(handle),
+            terms_version: "2026-11",
+            country_declared: Some("GB"),
+            billing_ref: &billing_ref,
+            operator: false,
+            draft: &draft,
+            invite_hash: None,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    let (value, hash) = link_in_bio_auth::session::new_token();
+    s.create_session(&hash, id, chrono::Utc::now() + chrono::Duration::days(1)).await.unwrap();
+    (id, format!("{}={value}", link_in_bio_auth::session::COOKIE))
+}
+
+#[path = "../../../billing/tests/support/open_payments.rs"]
+mod op_stand_in;
+
+#[tokio::test]
+async fn open_payments_checkout_paid_from_a_wallet() {
+    let Some(s) = store().await else { return };
+    let public = link_in_bio_billing::keys::ed25519_from_pem(&op_stand_in::test_key_pem())
+        .unwrap()
+        .public_key()
+        .as_ref()
+        .to_vec();
+    let ase = op_stand_in::Ase::start(&public, "test-key-ed25519", ("GBP", 2)).await;
+    let dir = std::env::temp_dir().join(format!("lib-hosted-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("op.pem"), op_stand_in::test_key_pem()).unwrap();
+    let a = app(
+        s.clone(),
+        config(&[
+            ("BILLING_PROVIDERS", "open-payments".into()),
+            ("OPEN_PAYMENTS_WALLET_ADDRESS", ase.operator()),
+            ("OPEN_PAYMENTS_KEY_ID", "test-key-ed25519".into()),
+            ("OPEN_PAYMENTS_KEY_FILE", dir.join("op.pem").display().to_string()),
+        ]),
+    );
+    let app_r = super::app::router(a.clone());
+    let (id, cookie) = account_with_session(&s, "erin").await;
+
+    let b = send(&app_r, call("GET", "/api/v1/billing", None, Some(&cookie))).await.json();
+    assert_eq!(
+        (b["offers"][0]["id"].as_str(), b["offers"][0]["minMonths"].as_u64()),
+        (Some("open-payments:wallet"), Some(1))
+    );
+    let co = send(
+        &app_r,
+        call(
+            "POST",
+            "/api/v1/billing/checkouts",
+            Some(json!({ "method": "open-payments:wallet", "months": 2 })),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(co.status, StatusCode::OK, "{}", co.text());
+    let client = co.json()["client"].clone();
+    assert_eq!(
+        (client["kind"].as_str(), client["step"].as_str(), client["amount"].as_str()),
+        (Some("open-payments"), Some("wallet-address"), Some("6.00"))
+    );
+    let checkout = co.json()["checkout"].as_str().unwrap().to_string();
+    let path = |p: &str| format!("/api/v1/billing/checkouts/{checkout}/open-payments{p}");
+
+    // Finishing before any wallet was given: nothing waits.
+    let early =
+        send(&app_r, call("POST", &path("/finish"), Some(json!({ "hash": "x", "interactRef": "y" })), Some(&cookie)))
+            .await;
+    assert_eq!(early.status, StatusCode::CONFLICT);
+    // A wallet the service will not call.
+    let bad = send(
+        &app_r,
+        call("POST", &path(""), Some(json!({ "walletAddress": "https://10.0.0.1/alice" })), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", bad.text());
+    // The buyer's wallet: a redirect to approve there.
+    let st = send(&app_r, call("POST", &path(""), Some(json!({ "walletAddress": ase.buyer() })), Some(&cookie))).await;
+    assert_eq!(st.status, StatusCode::OK, "{}", st.text());
+    assert_eq!(st.json()["step"], "redirect");
+    assert_eq!(st.json()["redirect"], format!("{}/interact/1", ase.base));
+    let (back, hash, interact_ref) = ase.approve();
+    assert!(back.starts_with(&format!("{APP}/billing?checkout={checkout}&openPayments=finish&hash=")), "{back}");
+
+    // A wrong hash changes nothing; the right one pays, once.
+    let wrong = send(
+        &app_r,
+        call("POST", &path("/finish"), Some(json!({ "hash": "AAAA", "interactRef": interact_ref })), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
+    assert!(s.account(id).await.unwrap().unwrap().paid_until.is_none());
+    let done = send(
+        &app_r,
+        call("POST", &path("/finish"), Some(json!({ "hash": hash, "interactRef": interact_ref })), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text());
+    assert_eq!(done.json()["status"], "paid");
+    let until = s.account(id).await.unwrap().unwrap().paid_until.unwrap();
+    let days = (until - chrono::Utc::now()).num_days();
+    assert!((59..=61).contains(&days), "two months: {days} days");
+    let again = send(
+        &app_r,
+        call("POST", &path("/finish"), Some(json!({ "hash": hash, "interactRef": interact_ref })), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::CONFLICT, "the checkout is paid");
+    let state =
+        send(&app_r, call("GET", &format!("/api/v1/billing/checkouts/{checkout}"), None, Some(&cookie))).await.json();
+    assert_eq!(state["status"], "paid");
+    let events = s.billing_events(id).await.unwrap();
+    assert_eq!((events.len(), events[0].provider.as_str()), (1, "open-payments"));
+
+    // A wallet that sends less than asked: the checkout stays open, polling and reconciliation do not pay it.
+    ase.set_underpay(true);
+    let co = send(
+        &app_r,
+        call(
+            "POST",
+            "/api/v1/billing/checkouts",
+            Some(json!({ "method": "open-payments:wallet", "months": 1 })),
+            Some(&cookie),
+        ),
+    )
+    .await
+    .json();
+    let short = co["checkout"].as_str().unwrap().to_string();
+    let p2 = |p: &str| format!("/api/v1/billing/checkouts/{short}/open-payments{p}");
+    send(&app_r, call("POST", &p2(""), Some(json!({ "walletAddress": ase.buyer() })), Some(&cookie))).await;
+    let (_, hash, interact_ref) = ase.approve();
+    let r = send(
+        &app_r,
+        call("POST", &p2("/finish"), Some(json!({ "hash": hash, "interactRef": interact_ref })), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(r.json()["status"], "open", "{}", r.text());
+    let state =
+        send(&app_r, call("GET", &format!("/api/v1/billing/checkouts/{short}"), None, Some(&cookie))).await.json();
+    assert_eq!(state["status"], "open");
+    assert_eq!(s.account(id).await.unwrap().unwrap().paid_until.unwrap(), until);
+    // Another account cannot touch this checkout.
+    let (_, other) = account_with_session(&s, "fred").await;
+    assert_eq!(
+        send(&app_r, call("POST", &p2(""), Some(json!({ "walletAddress": ase.buyer() })), Some(&other))).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(ase.signatures().0, 0, "every request the service made was signed and verified");
+    std::fs::remove_dir_all(dir).ok();
+}

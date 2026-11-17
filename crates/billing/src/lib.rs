@@ -8,15 +8,20 @@
 //! - [`min_months`]: the fewest months a purchase with a method may buy, so its fixed fee stays at most 3 % of one
 //!   month's price (with a 25 % buffer for exchange rates and fee changes).
 //! - The adapters: [`manual`] (operator grants), [`chain_payments`] (Chain Payments, SUI and native USDC), [`square`]
-//!   (UK cards), [`gocardless`] (UK bank payments, Open Banking), [`paddle`] (merchant of record for other countries)
-//!   and [`bank_transfer`] (SEPA with an EPC QR code, or Faster Payments, matched by an ISO 11649 reference from the
-//!   bank's ISO 20022 statements). The fiat ones send the buyer to the provider's own hosted page (a redirect, never a
-//!   provider script in the app).
+//!   (UK cards), [`gocardless`] (UK bank payments, Open Banking), [`paddle`] (merchant of record for other countries),
+//!   [`bank_transfer`] (SEPA with an EPC QR code, or Faster Payments, matched by an ISO 11649 reference from the
+//!   bank's ISO 20022 statements) and [`open_payments`] (Interledger Open Payments: GNAP grants and RFC 9421 signed
+//!   requests, the buyer approving in their own wallet). The fiat ones send the buyer to the provider's own hosted
+//!   page (a redirect, never a provider script in the app).
+//! - [`keys`] and [`httpsig`]: the key files, signatures and digests the signing adapters share.
 
 pub mod bank_transfer;
 pub mod chain_payments;
 pub mod gocardless;
+pub mod httpsig;
+pub mod keys;
 pub mod manual;
+pub mod open_payments;
 pub mod paddle;
 pub mod square;
 
@@ -155,6 +160,34 @@ pub trait BillingProvider: Send + Sync {
     /// payment seen both by notification and by reconciliation extends the period once.
     fn paid_event_id(&self, provider_ref: &str) -> String {
         format!("paid:{provider_ref}")
+    }
+}
+
+/// A shared adapter is an adapter (the app keeps a typed handle to one whose flow has steps beyond the port).
+#[async_trait::async_trait]
+impl<T: BillingProvider + ?Sized> BillingProvider for std::sync::Arc<T> {
+    fn id(&self) -> &'static str {
+        (**self).id()
+    }
+    fn methods(&self) -> Vec<Method> {
+        (**self).methods()
+    }
+    async fn create_checkout(&self, req: &CheckoutRequest) -> Result<CheckoutStart, BillingError> {
+        (**self).create_checkout(req).await
+    }
+    async fn verify_notification(
+        &self,
+        headers: &BTreeMap<String, String>,
+        body: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ProviderEvent>, BillingError> {
+        (**self).verify_notification(headers, body, now).await
+    }
+    async fn checkout_outcome(&self, provider_ref: &str) -> Result<Outcome, BillingError> {
+        (**self).checkout_outcome(provider_ref).await
+    }
+    fn paid_event_id(&self, provider_ref: &str) -> String {
+        (**self).paid_event_id(provider_ref)
     }
 }
 

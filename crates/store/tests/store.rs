@@ -222,6 +222,41 @@ async fn billing_periods_are_idempotent() {
 }
 
 #[tokio::test]
+async fn open_payments_grants_are_used_once() {
+    let Some(s) = store().await else { return };
+    let now = Utc::now();
+    let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
+    let c = link_in_bio_store::Checkout {
+        id: uuid::Uuid::new_v4(),
+        account_id: a.id,
+        provider: "open-payments".into(),
+        provider_ref: "https://wallet.example/rs/incoming-payments/1".into(),
+        method: "open-payments:wallet".into(),
+        months: 1,
+        amount_pence: 300,
+        status: "open".into(),
+        country_declared: Some("GB".into()),
+        country_request: Some("GB".into()),
+        created_at: now,
+        completed_at: None,
+    };
+    s.create_checkout(&c).await.unwrap();
+    assert!(s.open_payments_grant(c.id).await.unwrap().is_none());
+    assert!(s.put_open_payments_grant(c.id, "https://wallet.example/bob", &json!({"n": 1})).await.unwrap());
+    assert!(s.put_open_payments_grant(c.id, "https://wallet.example/bob", &json!({"n": 2})).await.unwrap(), "replaced");
+    assert_eq!(s.open_payments_grant(c.id).await.unwrap(), Some(("pending".into(), json!({"n": 2}))));
+    assert_eq!(s.take_open_payments_grant(c.id).await.unwrap(), Some(json!({"n": 2})));
+    assert!(s.take_open_payments_grant(c.id).await.unwrap().is_none(), "taken once");
+    s.finish_open_payments_grant(c.id, None, now).await.unwrap();
+    assert_eq!(s.open_payments_grant(c.id).await.unwrap(), Some(("failed".into(), json!({}))), "pending removed");
+    assert!(s.put_open_payments_grant(c.id, "https://wallet.example/bob", &json!({"n": 3})).await.unwrap(), "retry");
+    s.take_open_payments_grant(c.id).await.unwrap();
+    s.finish_open_payments_grant(c.id, Some("https://wallet.example/rs/outgoing-payments/9"), now).await.unwrap();
+    assert_eq!(s.open_payments_grant(c.id).await.unwrap().unwrap().0, "sent");
+    assert!(!s.put_open_payments_grant(c.id, "https://wallet.example/eve", &json!({})).await.unwrap(), "sent is final");
+}
+
+#[tokio::test]
 async fn selections_reports_appeals_and_housekeeping() {
     let Some(s) = store().await else { return };
     let now = Utc::now();
