@@ -207,6 +207,17 @@ pub struct PeriodChange<'a> {
     pub checkout: Option<Uuid>,
 }
 
+/// Where a bank feed left off (`state` holds credentials of the feed's own; never show it).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct BankFeedRow {
+    pub feed: String,
+    pub cursor: Option<String>,
+    pub state: Value,
+    pub polled_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub credits_seen: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Domain {
     pub hostname: String,
@@ -1271,6 +1282,66 @@ impl Store {
         .bind(checkout)
         .bind(outgoing_payment)
         .bind(now)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
+    // ── bank feeds ─────────────────────────────────────────────────────────
+
+    pub async fn bank_feed(&self, feed: &str) -> Result<Option<BankFeedRow>, DbError> {
+        sqlx::query_as(
+            "SELECT feed, cursor, state, polled_at, last_error, credits_seen FROM lib.bank_feeds WHERE feed = $1",
+        )
+        .bind(feed)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn bank_feeds(&self) -> Result<Vec<BankFeedRow>, DbError> {
+        sqlx::query_as(
+            "SELECT feed, cursor, state, polled_at, last_error, credits_seen FROM lib.bank_feeds ORDER BY feed",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// A successful poll: the new cursor and state, and how many credits it found.
+    pub async fn save_bank_feed(
+        &self,
+        feed: &str,
+        cursor: Option<&str>,
+        state: &Value,
+        credits: i64,
+        now: DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO lib.bank_feeds (feed, cursor, state, polled_at, last_error, credits_seen)
+             VALUES ($1, $2, $3, $4, NULL, $5)
+             ON CONFLICT (feed) DO UPDATE SET cursor = EXCLUDED.cursor, state = EXCLUDED.state,
+                 polled_at = EXCLUDED.polled_at, last_error = NULL,
+                 credits_seen = lib.bank_feeds.credits_seen + EXCLUDED.credits_seen",
+        )
+        .bind(feed)
+        .bind(cursor)
+        .bind(state)
+        .bind(now)
+        .bind(credits)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
+    /// A failed poll: the cursor and state stay as they were.
+    pub async fn bank_feed_failed(&self, feed: &str, error: &str, now: DateTime<Utc>) -> Result<(), DbError> {
+        let error: String = error.chars().take(500).collect();
+        sqlx::query(
+            "INSERT INTO lib.bank_feeds (feed, polled_at, last_error) VALUES ($1, $2, $3)
+             ON CONFLICT (feed) DO UPDATE SET polled_at = EXCLUDED.polled_at, last_error = EXCLUDED.last_error",
+        )
+        .bind(feed)
+        .bind(now)
+        .bind(error)
         .execute(&self.pool)
         .await
         .map(|_| ())

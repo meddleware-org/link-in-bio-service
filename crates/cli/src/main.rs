@@ -115,6 +115,11 @@ enum Command {
     },
     /// Hosted: apply the database schema (as the owner role).
     Migrate,
+    /// Hosted: bank feed set-up.
+    BankFeed {
+        #[command(subcommand)]
+        action: BankFeedAction,
+    },
     /// Hosted: operator account administration.
     Account {
         #[command(subcommand)]
@@ -146,6 +151,19 @@ enum AccountAction {
         handle: String,
         #[arg(long)]
         wallet: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BankFeedAction {
+    /// Exchange the code from Revolut Business's consent page for a refresh token, written to a new file (mode 0600)
+    /// for REVOLUT_REFRESH_TOKEN_FILE. Reads REVOLUT_API_BASE, REVOLUT_CLIENT_ID, REVOLUT_ISSUER and REVOLUT_KEY_FILE.
+    /// The token is never printed.
+    RevolutToken {
+        #[arg(long)]
+        code: String,
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -238,11 +256,42 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Worker { listen } => runtime()?.block_on(async move {
             let app = hosted_app(4, false)?;
+            let feeds = hosted::jobs::bank_feeds(&app.config)?;
             let (_, s) = tokio::join!(
-                hosted::jobs::run(app.clone(), shutdown_signal()),
+                hosted::jobs::run(app.clone(), feeds, shutdown_signal()),
                 serve(hosted::internal::worker_router(app), listen)
             );
             s
+        }),
+        Command::BankFeed { action: BankFeedAction::RevolutToken { code, out } } => runtime()?.block_on(async move {
+            use link_in_bio_billing::bank_feed::revolut;
+            let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+            let need = |k: &'static str| env(k).ok_or(format!("{k} is not set"));
+            let base = env("REVOLUT_API_BASE").unwrap_or_else(|| revolut::SANDBOX.into());
+            let key_file = need("REVOLUT_KEY_FILE")?;
+            let key = link_in_bio_billing::keys::RsaKey::from_pem(&String::from_utf8_lossy(&read(Path::new(&key_file))?))
+                .map_err(|e| format!("{key_file}: {e}"))?;
+            let token = revolut::exchange_code(
+                &link_in_bio_billing::http_client(),
+                &base,
+                &need("REVOLUT_CLIENT_ID")?,
+                &need("REVOLUT_ISSUER")?,
+                &key,
+                code.trim(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&out)
+                .map_err(|e| format!("{}: {e}", out.display()))?;
+            f.write_all(token.as_bytes()).map_err(|e| e.to_string())?;
+            println!("refresh token written to {}", out.display());
+            Ok(())
         }),
         Command::Migrate => runtime()?.block_on(async {
             store(1, false)?.migrate().await.map_err(|e| e.to_string())?;
@@ -393,9 +442,13 @@ fn store(pool: u32, read_only: bool) -> Result<link_in_bio_store::Store, String>
 }
 
 /// The hosted settings a process reads. The page server (read-only) never takes payments and holds no provider key,
-/// so for it `BILLING_PROVIDERS` is always `manual`, whatever the shared configuration says.
+/// so for it `BILLING_PROVIDERS` is always `manual` and `BANK_FEEDS` empty, whatever the shared configuration says.
 fn hosted_env(read_only: bool, get: impl Fn(&str) -> Option<String>) -> impl Fn(&str) -> Option<String> {
-    move |k: &str| if read_only && k == "BILLING_PROVIDERS" { Some("manual".into()) } else { get(k) }
+    move |k: &str| match k {
+        "BILLING_PROVIDERS" if read_only => Some("manual".into()),
+        "BANK_FEEDS" if read_only => None,
+        _ => get(k),
+    }
 }
 
 fn hosted_app(pool: u32, read_only: bool) -> Result<hosted::Shared, String> {
@@ -432,6 +485,9 @@ mod hosted_env_tests {
         let shared = |k: &str| (k == "BILLING_PROVIDERS").then(|| "chain-payments,square".to_string());
         assert_eq!(super::hosted_env(true, shared)("BILLING_PROVIDERS").as_deref(), Some("manual"));
         assert_eq!(super::hosted_env(false, shared)("BILLING_PROVIDERS").as_deref(), Some("chain-payments,square"));
+        let feeds = |k: &str| (k == "BANK_FEEDS").then(|| "wise".to_string());
+        assert_eq!(super::hosted_env(true, feeds)("BANK_FEEDS"), None);
+        assert_eq!(super::hosted_env(false, feeds)("BANK_FEEDS").as_deref(), Some("wise"));
         assert_eq!(super::hosted_env(true, shared)("PAGES_DOMAIN"), None);
     }
 }

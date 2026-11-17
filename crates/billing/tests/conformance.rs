@@ -516,3 +516,229 @@ fn open_payments_settings_are_checked() {
     assert!(!bad(open_payments::Config { asset_code: "USD".into(), minor_per_month: Some(400), ..ok.clone() }));
     assert!(bad(open_payments::Config { key_id: " ".into(), ..ok }));
 }
+
+// ── Bank feeds, each against a stand-in for its bank's API ──────────────────────────────────────────────────────
+
+#[path = "support/bank_feeds.rs"]
+mod banks;
+
+use link_in_bio_billing::bank_feed::{self, BankFeed, FeedState, bunq, revolut, wise};
+
+/// A valid creditor reference for a body.
+fn rf(body: &str) -> String {
+    bank_transfer::creditor_reference(body).unwrap()
+}
+
+#[tokio::test]
+async fn wise_feed_conforms() {
+    let bank = banks::WiseBank::start().await;
+    bank.credit("W1", "EUR", "3.50", &format!("Link in Bio {}", rf("ABC1")));
+    bank.credit("W2", "GBP", "6.00", &rf("ABC2"));
+    bank.credit("W3", "GBP", "9.00", "no reference here");
+    let feed = |sca: bool| {
+        wise::Wise::new(
+            wise::Config {
+                api_base: bank.base.clone(),
+                api_version: wise::VERSION.into(),
+                token: banks::WISE_TOKEN.into(),
+                profile_id: banks::WISE_PROFILE,
+                sca_key: sca.then(banks::operator_key),
+            },
+            link_in_bio_billing::http_client(),
+        )
+    };
+    let now = Utc::now();
+    let batch = feed(true).fetch(&FeedState::default(), now).await.unwrap();
+    let mut got: Vec<_> =
+        batch.credits.iter().map(|c| (c.reference.clone(), c.amount_minor, c.currency.clone())).collect();
+    got.sort();
+    let mut want = vec![(rf("ABC1"), 350, "EUR".to_string()), (rf("ABC2"), 600, "GBP".to_string())];
+    want.sort();
+    assert_eq!(got, want, "debits and unreferenced credits are left out");
+    assert!(batch.credits.iter().all(|c| c.entry.starts_with("wise-")));
+    {
+        let s = bank.state.lock().unwrap();
+        assert_eq!(
+            (s.sca_challenges, s.sca_passed),
+            (2, 2),
+            "each statement: challenged, then the signed token passes"
+        );
+        assert_eq!(s.intervals[0].0, bank_feed::rfc3339(now - bank_feed::FIRST_LOOK_BACK));
+    }
+    // The next poll starts from the cursor, less the overlap.
+    let next = FeedState { cursor: batch.cursor.clone(), state: batch.state.clone() };
+    feed(true).fetch(&next, now + chrono::Duration::hours(1)).await.unwrap();
+    assert_eq!(bank.state.lock().unwrap().intervals[2].0, bank_feed::rfc3339(now - bank_feed::OVERLAP));
+    // Without the SCA key the challenge cannot be met.
+    assert!(matches!(feed(false).fetch(&FeedState::default(), now).await, Err(BillingError::Refused(_))));
+    // Another key's signature is not accepted.
+    let wrong = wise::Wise::new(
+        wise::Config {
+            api_base: bank.base.clone(),
+            api_version: wise::VERSION.into(),
+            token: banks::WISE_TOKEN.into(),
+            profile_id: banks::WISE_PROFILE,
+            sca_key: Some(
+                link_in_bio_billing::keys::RsaKey::from_pem(&link_in_bio_billing::keys::pem_encode(
+                    "RSA PRIVATE KEY",
+                    &STANDARD.decode(include_str!("fixtures/test-rsa-b.pkcs1.b64").trim()).unwrap(),
+                ))
+                .unwrap(),
+            ),
+        },
+        link_in_bio_billing::http_client(),
+    );
+    assert!(wrong.fetch(&FeedState::default(), now).await.is_err());
+}
+
+#[tokio::test]
+async fn bunq_feed_conforms() {
+    let bank = banks::BunqBank::start().await;
+    bank.pay(101, "3.50", "EUR", &format!("Payment {}", rf("BQ1")));
+    bank.pay(102, "-2.00", "EUR", &rf("BQ2"));
+    bank.pay(103, "9.00", "EUR", "unrelated");
+    let feed = bunq::Bunq::new(
+        bunq::Config {
+            api_base: bank.base.clone(),
+            api_key: banks::BUNQ_API_KEY.into(),
+            key: banks::operator_key(),
+            permitted_ips: vec![],
+            description: "link-in-bio test".into(),
+        },
+        link_in_bio_billing::http_client(),
+    );
+    let now = Utc::now();
+    let first = feed.fetch(&FeedState::default(), now).await.unwrap();
+    assert_eq!(first.credits.len(), 1, "outgoing and unreferenced payments are left out");
+    assert_eq!((first.credits[0].reference.clone(), first.credits[0].amount_minor), (rf("BQ1"), 350));
+    assert_eq!(first.credits[0].entry, "bunq-7-101");
+    assert_eq!(first.cursor.as_deref(), Some(r#"{"7":103}"#));
+    assert!(first.state["installationToken"].is_string() && first.state["device"] == true);
+    // The next poll reuses the installation and the session, and reads only newer payments.
+    bank.pay(104, "6.00", "EUR", &rf("BQ3"));
+    let next = feed.fetch(&FeedState { cursor: first.cursor.clone(), state: first.state.clone() }, now).await.unwrap();
+    assert_eq!(next.credits.iter().map(|c| c.reference.clone()).collect::<Vec<_>>(), vec![rf("BQ3")]);
+    {
+        let s = bank.state.lock().unwrap();
+        assert_eq!((s.installations, s.devices, s.sessions, s.bad_signatures), (1, 1, 1, 0));
+    }
+    // A worker restart (no session in memory) makes a session only.
+    let restarted = bunq::Bunq::new(
+        bunq::Config {
+            api_base: bank.base.clone(),
+            api_key: banks::BUNQ_API_KEY.into(),
+            key: banks::operator_key(),
+            permitted_ips: vec![],
+            description: "link-in-bio test".into(),
+        },
+        link_in_bio_billing::http_client(),
+    );
+    restarted.fetch(&FeedState { cursor: next.cursor.clone(), state: next.state.clone() }, now).await.unwrap();
+    assert_eq!(bank.state.lock().unwrap().installations, 1);
+    assert_eq!(bank.state.lock().unwrap().sessions, 2);
+    // An answer not signed by bunq's server key is refused.
+    bank.forge(true);
+    assert!(matches!(
+        feed.fetch(&FeedState { cursor: next.cursor.clone(), state: next.state.clone() }, now).await,
+        Err(BillingError::Unauthentic)
+    ));
+}
+
+#[tokio::test]
+async fn bunq_reads_on_while_pages_are_full() {
+    let bank = banks::BunqBank::start().await;
+    for id in 1..=450u64 {
+        bank.pay(id, "1.00", "EUR", &rf(&format!("P{id}")));
+    }
+    let feed = bunq::Bunq::new(
+        bunq::Config {
+            api_base: bank.base.clone(),
+            api_key: banks::BUNQ_API_KEY.into(),
+            key: banks::operator_key(),
+            permitted_ips: vec!["192.0.2.1".into()],
+            description: "t".into(),
+        },
+        link_in_bio_billing::http_client(),
+    );
+    let first =
+        feed.fetch(&FeedState { cursor: Some(r#"{"7":0}"#.into()), state: json!({}) }, Utc::now()).await.unwrap();
+    assert_eq!(first.credits.len(), 450);
+    assert_eq!(first.cursor.as_deref(), Some(r#"{"7":450}"#));
+}
+
+#[tokio::test]
+async fn revolut_feed_conforms() {
+    let bank = banks::RevolutBank::start("unused").await;
+    // The one-time code exchange (the CLI) gives the refresh token.
+    let refresh = revolut::exchange_code(
+        &link_in_bio_billing::http_client(),
+        &bank.base,
+        banks::REVOLUT_CLIENT,
+        banks::REVOLUT_ISSUER,
+        &banks::operator_key(),
+        banks::REVOLUT_CODE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refresh, "oa_sand_refresh_1");
+    bank.incoming("t1", 3.5, "GBP", &rf("RV1"));
+    bank.incoming("t2", 6.0, "EUR", &format!("inv {}", rf("RV2")));
+    bank.push(json!({ "id": "t3", "type": "transfer", "state": "pending", "created_at": "2026-11-17T09:00:00Z", "reference": rf("RV3"),
+                      "legs": [{ "leg_id": "l3", "amount": 3.0, "currency": "GBP" }] }));
+    bank.push(json!({ "id": "t4", "type": "card_payment", "state": "completed", "created_at": "2026-11-17T09:00:00Z", "reference": rf("RV4"),
+                      "legs": [{ "leg_id": "l4", "amount": -3.0, "currency": "GBP" }] }));
+    let feed = |refresh: &str| {
+        revolut::Revolut::new(
+            revolut::Config {
+                api_base: bank.base.clone(),
+                client_id: banks::REVOLUT_CLIENT.into(),
+                issuer: banks::REVOLUT_ISSUER.into(),
+                key: banks::operator_key(),
+                refresh_token: refresh.into(),
+            },
+            link_in_bio_billing::http_client(),
+        )
+    };
+    let f = feed(&refresh);
+    let now = Utc::now();
+    let b = f.fetch(&FeedState::default(), now).await.unwrap();
+    let mut got: Vec<_> = b.credits.iter().map(|c| (c.reference.clone(), c.amount_minor, c.currency.clone())).collect();
+    got.sort();
+    let mut want = vec![(rf("RV1"), 350, "GBP".to_string()), (rf("RV2"), 600, "EUR".to_string())];
+    want.sort();
+    assert_eq!(got, want, "pending and outgoing are left out");
+    assert_eq!(b.credits.iter().find(|c| c.reference == rf("RV1")).unwrap().entry, "revolut-t1-t1-leg");
+    // The access token is reused within its lifetime.
+    f.fetch(&FeedState { cursor: b.cursor.clone(), state: b.state.clone() }, now).await.unwrap();
+    assert_eq!(bank.state.lock().unwrap().access.len(), 1);
+    assert_eq!(bank.state.lock().unwrap().froms[0], bank_feed::rfc3339(now - bank_feed::FIRST_LOOK_BACK));
+    // A rotated refresh token is kept in the state and used from then on.
+    bank.state.lock().unwrap().rotate = true;
+    let g = feed(&refresh);
+    let rotated = g.fetch(&FeedState::default(), now).await.unwrap();
+    let kept = rotated.state["refreshToken"].as_str().unwrap().to_string();
+    assert_eq!(kept, bank.state.lock().unwrap().refresh_token);
+    bank.state.lock().unwrap().rotate = false;
+    assert!(feed(&refresh).fetch(&FeedState { cursor: None, state: rotated.state.clone() }, now).await.is_ok());
+    assert!(
+        matches!(feed(&refresh).fetch(&FeedState::default(), now).await, Err(BillingError::Refused(_))),
+        "the old one is dead"
+    );
+    // An assertion signed by another key is refused.
+    let impostor = revolut::Revolut::new(
+        revolut::Config {
+            api_base: bank.base.clone(),
+            client_id: banks::REVOLUT_CLIENT.into(),
+            issuer: banks::REVOLUT_ISSUER.into(),
+            key: link_in_bio_billing::keys::RsaKey::from_pem(&link_in_bio_billing::keys::pem_encode(
+                "RSA PRIVATE KEY",
+                &STANDARD.decode(include_str!("fixtures/test-rsa-b.pkcs1.b64").trim()).unwrap(),
+            ))
+            .unwrap(),
+            refresh_token: kept,
+        },
+        link_in_bio_billing::http_client(),
+    );
+    assert!(impostor.fetch(&FeedState::default(), now).await.is_err());
+    assert!(bank.state.lock().unwrap().bad_assertions >= 1);
+}

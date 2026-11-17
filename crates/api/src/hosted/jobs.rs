@@ -3,6 +3,8 @@
 //! - lifts suspensions whose time is up;
 //! - screens again the links that are due (unknown within the hour, clean daily, flagged weekly);
 //! - asks payment providers how checkouts no notification closed have ended (and applies a payment once);
+//! - polls the bank feeds (Wise, bunq, Revolut Business; when configured) and pays bank-transfer checkouts from their
+//!   credits by the same rules as an imported statement;
 //! - checks custom domains' TXT records (when custom domains are on);
 //! - syncs ThreatFox indicators (when its key is configured);
 //! - prunes: page versions beyond 20, unused pictures and screens, expired sessions, challenges and invites, audit
@@ -13,10 +15,13 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::Duration;
 use serde_json::Value;
 
+use link_in_bio_billing::bank_feed::{BankFeed, FeedState, bunq, revolut, wise};
+use link_in_bio_billing::keys::RsaKey;
 use link_in_bio_billing::{Outcome, ProviderEvent};
 
 use super::app::DOMAIN_TXT_LABEL;
-use super::internal::apply_event;
+use super::config::{BankFeedEnv, HostedConfig};
+use super::internal::{Matched, apply_event, match_credits};
 use super::metrics::Metrics;
 use super::{Shared, now};
 
@@ -31,6 +36,7 @@ pub const CHECKOUT_LIFETIME: Duration = Duration::days(2);
 /// When each slower duty last ran (in this process).
 #[derive(Default)]
 pub struct Schedule {
+    feeds: Option<Instant>,
     hourly: Option<Instant>,
     six_hourly: Option<Instant>,
     daily: Option<Instant>,
@@ -110,6 +116,97 @@ pub async fn reconcile(app: &Shared) {
     }
 }
 
+/// The bank feeds the configuration names, with their keys and tokens read from their files. Only the worker builds
+/// them, so the other roles need none of these secrets.
+pub fn bank_feeds(config: &HostedConfig) -> Result<Vec<Box<dyn BankFeed>>, String> {
+    let read = |f: &str| std::fs::read_to_string(f).map(|s| s.trim().to_string()).map_err(|e| format!("{f}: {e}"));
+    let key = |f: &str| RsaKey::from_pem(&read(f)?).map_err(|e| format!("{f}: {e}"));
+    let mut out: Vec<Box<dyn BankFeed>> = Vec::new();
+    for f in &config.bank_feeds {
+        let http = link_in_bio_billing::http_client();
+        out.push(match f {
+            BankFeedEnv::Wise { api_base, api_version, token_file, profile_id, sca_key_file } => {
+                Box::new(wise::Wise::new(
+                    wise::Config {
+                        api_base: api_base.clone(),
+                        api_version: api_version.clone(),
+                        token: read(token_file)?,
+                        profile_id: *profile_id,
+                        sca_key: sca_key_file.as_deref().map(key).transpose()?,
+                    },
+                    http,
+                ))
+            }
+            BankFeedEnv::Bunq { api_base, api_key_file, key_file, permitted_ips } => Box::new(bunq::Bunq::new(
+                bunq::Config {
+                    api_base: api_base.clone(),
+                    api_key: read(api_key_file)?,
+                    key: key(key_file)?,
+                    permitted_ips: permitted_ips.clone(),
+                    description: format!("{} worker", config.product_name),
+                },
+                http,
+            )),
+            BankFeedEnv::Revolut { api_base, client_id, issuer, key_file, refresh_token_file } => {
+                Box::new(revolut::Revolut::new(
+                    revolut::Config {
+                        api_base: api_base.clone(),
+                        client_id: client_id.clone(),
+                        issuer: issuer.clone(),
+                        key: key(key_file)?,
+                        refresh_token: read(refresh_token_file)?,
+                    },
+                    http,
+                ))
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// One poll of every bank feed: credits matched against bank-transfer checkouts, the cursor kept per feed. A feed
+/// that fails keeps its cursor (and says why in the console's overview).
+pub async fn poll_bank_feeds(app: &Shared, feeds: &[Box<dyn BankFeed>]) {
+    for f in feeds {
+        let n = now();
+        let from = match app.store.bank_feed(f.id()).await {
+            Ok(r) => r.map(|r| FeedState { cursor: r.cursor, state: r.state }).unwrap_or_default(),
+            Err(e) => return failed(app, "bank-feeds", e),
+        };
+        let batch = match f.fetch(&from, n).await {
+            Ok(b) => b,
+            Err(e) => {
+                failed(app, "bank-feeds", format!("{}: {e}", f.id()));
+                let _ = app.store.bank_feed_failed(f.id(), &e.to_string(), n).await;
+                continue;
+            }
+        };
+        let Matched { paid, short, unknown } = match match_credits(app, &batch.credits).await {
+            Ok(m) => m,
+            Err(e) => {
+                failed(app, "bank-feeds", e);
+                continue;
+            }
+        };
+        if !paid.is_empty() || !short.is_empty() {
+            let _ = app
+                .store
+                .audit(
+                    &format!("worker:bank-feed:{}", f.id()),
+                    "bank-feed-credits",
+                    "bank-transfer",
+                    &serde_json::json!({ "credits": batch.credits.len(), "paid": paid, "short": short, "unknown": unknown.len() }),
+                )
+                .await;
+        }
+        if let Err(e) =
+            app.store.save_bank_feed(f.id(), batch.cursor.as_deref(), &batch.state, batch.credits.len() as i64, n).await
+        {
+            failed(app, "bank-feeds", e);
+        }
+    }
+}
+
 /// Whether a DNS-over-HTTPS answer (`application/dns-json`) holds the TXT value.
 pub fn txt_holds(answer: &Value, token: &str) -> bool {
     answer["Answer"].as_array().is_some_and(|a| {
@@ -182,10 +279,13 @@ pub async fn prune(app: &Shared) {
 }
 
 /// One pass of every duty that is due.
-pub async fn tick(app: &Shared, http: &reqwest::Client, s: &mut Schedule) {
+pub async fn tick(app: &Shared, http: &reqwest::Client, s: &mut Schedule, feeds: &[Box<dyn BankFeed>]) {
     lift_suspensions(app).await;
     rescreen(app, 100).await;
     reconcile(app).await;
+    if !feeds.is_empty() && due(&mut s.feeds, StdDuration::from_secs(app.config.bank_feed_poll_secs)) {
+        poll_bank_feeds(app, feeds).await;
+    }
     if due(&mut s.hourly, StdDuration::from_secs(3600)) {
         check_domains(app, http).await;
     }
@@ -197,8 +297,8 @@ pub async fn tick(app: &Shared, http: &reqwest::Client, s: &mut Schedule) {
     }
 }
 
-/// Runs until `stop` resolves, holding the single-writer lock.
-pub async fn run(app: Shared, stop: impl std::future::Future<Output = ()>) {
+/// Runs until `stop` resolves, holding the single-writer lock. `feeds` are the bank feeds ([`bank_feeds`]).
+pub async fn run(app: Shared, feeds: Vec<Box<dyn BankFeed>>, stop: impl std::future::Future<Output = ()>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let http = reqwest::Client::builder()
         .user_agent(concat!("link-in-bio/", env!("CARGO_PKG_VERSION")))
@@ -221,7 +321,7 @@ pub async fn run(app: Shared, stop: impl std::future::Future<Output = ()>) {
     tracing::info!("worker running");
     let mut schedule = Schedule::default();
     loop {
-        tick(&app, &http, &mut schedule).await;
+        tick(&app, &http, &mut schedule, &feeds).await;
         tokio::select! {
             _ = &mut stop => return,
             _ = tokio::time::sleep(StdDuration::from_secs(60)) => {}

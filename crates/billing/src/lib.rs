@@ -13,8 +13,11 @@
 //!   bank's ISO 20022 statements) and [`open_payments`] (Interledger Open Payments: GNAP grants and RFC 9421 signed
 //!   requests, the buyer approving in their own wallet). The fiat ones send the buyer to the provider's own hosted
 //!   page (a redirect, never a provider script in the app).
+//! - [`bank_feed`]: the receiving banks' APIs (Wise, bunq, Revolut Business) as sources of the same credits a camt
+//!   statement gives.
 //! - [`keys`] and [`httpsig`]: the key files, signatures and digests the signing adapters share.
 
+pub mod bank_feed;
 pub mod bank_transfer;
 pub mod chain_payments;
 pub mod gocardless;

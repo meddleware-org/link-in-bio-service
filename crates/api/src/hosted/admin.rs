@@ -51,9 +51,18 @@ async fn overview(State(app): State<Shared>) -> ApiResult<Json<Value>> {
         "links": { "flagged": s.links_flagged, "unknown": s.links_unknown },
         "storageBytes": s.storage_bytes,
         "checkoutsOpen": s.checkouts_open,
+        // Where each bank feed left off (never its stored state, which holds the feed's own credentials).
+        "bankFeeds": app.store.bank_feeds().await?.into_iter().map(|f| json!({
+            "feed": f.feed, "polledAt": f.polled_at, "lastError": f.last_error, "creditsSeen": f.credits_seen,
+        })).collect::<Vec<_>>(),
         "switches": {
             "signup": c.signup, "thirdPartyPages": c.third_party_pages, "billingProviders": c.billing_providers,
             "customHostnameCap": c.custom_hostname_cap, "webRisk": app.screener.web_risk.is_some(), "federation": c.federation,
+            "bankFeeds": c.bank_feeds.iter().map(|f| match f {
+                super::config::BankFeedEnv::Wise { .. } => "wise",
+                super::config::BankFeedEnv::Bunq { .. } => "bunq",
+                super::config::BankFeedEnv::Revolut { .. } => "revolut",
+            }).collect::<Vec<_>>(),
         },
     })))
 }
@@ -610,30 +619,14 @@ async fn bank_statement(
     Extension(op): Extension<Operator>,
     body: axum::body::Bytes,
 ) -> ApiResult<Json<Value>> {
-    use link_in_bio_billing::bank_transfer::{self, Scheme};
-    let Some(bt) = &app.config.bank_transfer else {
+    if app.config.bank_transfer.is_none() {
         return Err(ApiError::Unavailable("bank transfer is not switched on"));
-    };
+    }
     let xml =
         std::str::from_utf8(&body).map_err(|_| ApiError::Unprocessable("the statement is not UTF-8 text".into()))?;
-    let credits = bank_transfer::credits_from_camt(xml).map_err(|e| ApiError::Unprocessable(e.to_string()))?;
-    let (mut paid, mut short, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
-    for c in &credits {
-        let Some(co) = app.store.checkout_by_ref(bank_transfer::ID, &c.reference).await? else {
-            unknown.push(json!({ "reference": c.reference, "amountMinor": c.amount_minor, "currency": c.currency }));
-            continue;
-        };
-        let want = match &bt.scheme {
-            Scheme::Sepa { eur_cents_per_month, .. } => (eur_cents_per_month * co.months as u64, "EUR"),
-            Scheme::FasterPayments { .. } => (co.amount_pence as u64, "GBP"),
-        };
-        if c.currency != want.1 || c.amount_minor < want.0 {
-            short.push(json!({ "reference": c.reference, "checkout": co.id, "got": c.amount_minor, "currency": c.currency, "want": want.0, "wantCurrency": want.1 }));
-            continue;
-        }
-        super::internal::apply_event(&app, bank_transfer::ID, &bank_transfer::paid_event(c)).await?;
-        paid.push(json!({ "reference": c.reference, "checkout": co.id }));
-    }
+    let credits = link_in_bio_billing::bank_transfer::credits_from_camt(xml)
+        .map_err(|e| ApiError::Unprocessable(e.to_string()))?;
+    let super::internal::Matched { paid, short, unknown } = super::internal::match_credits(&app, &credits).await?;
     app.store
         .audit(
             &actor(&op),

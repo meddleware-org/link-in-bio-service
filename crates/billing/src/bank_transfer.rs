@@ -5,9 +5,10 @@
 //! - **Faster Payments** (GBP): sort code, account number and the same `RF…` reference.
 //!
 //! The checkout is the reference. Payments are matched from the receiving bank's ISO 20022 statements:
-//! camt.054 (debit/credit notification) or camt.053 (statement). The operator imports them in the console (a bank
-//! feed adapter can post the same files); every credit whose reference names an open checkout, for at least its
-//! amount and in its currency, pays it. There are no notifications to verify.
+//! camt.054 (debit/credit notification) or camt.053 (statement), which the operator imports in the console, or the
+//! receiving bank's own API ([`crate::bank_feed`]: Wise, bunq, Revolut Business), which the worker polls. Every
+//! credit whose reference names an open checkout, for at least its amount and in its currency, pays it. There are
+//! no notifications to verify.
 //!
 //! The operator is the seller. The receiving bank's fees are not known in advance; there is no fixed fee per payment
 //! here, so one month is the minimum.
@@ -205,7 +206,8 @@ pub struct Credit {
     pub entry: String,
 }
 
-fn amount_minor(s: &str) -> Option<u64> {
+/// A decimal amount (`12.5`, `9`, `3.00`; at most two decimals, never negative) in minor units.
+pub fn amount_minor(s: &str) -> Option<u64> {
     let s = s.trim();
     let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
     if whole.is_empty()
@@ -217,6 +219,14 @@ fn amount_minor(s: &str) -> Option<u64> {
     }
     let f = format!("{frac:0<2}");
     whole.parse::<u64>().ok()?.checked_mul(100)?.checked_add(f.parse::<u64>().ok()?)
+}
+
+/// The first whole, valid creditor reference (`RF…`) in free text (a payment's description or remittance line). A
+/// reference split by spaces is not trusted.
+pub fn reference_in_text(text: &str) -> Option<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_ascii_uppercase)
+        .find(|w| w.starts_with("RF") && reference_valid(w))
 }
 
 fn child<'a, 'i>(n: roxmltree::Node<'a, 'i>, local: &str) -> Option<roxmltree::Node<'a, 'i>> {
@@ -261,12 +271,7 @@ pub fn credits_from_camt(xml: &str) -> Result<Vec<Credit>, BillingError> {
                 part.descendants().find(|n| name(n, "CdtrRefInf")).and_then(|r| child(r, "Ref")).and_then(|n| n.text());
             let unstructured =
                 part.descendants().filter(|n| name(n, "Ustrd")).filter_map(|n| n.text()).collect::<Vec<_>>().join(" ");
-            let candidate = structured.map(String::from).or_else(|| {
-                unstructured
-                    .split(|c: char| !c.is_ascii_alphanumeric())
-                    .map(str::to_ascii_uppercase)
-                    .find(|w| w.starts_with("RF") && reference_valid(w))
-            });
+            let candidate = structured.map(String::from).or_else(|| reference_in_text(&unstructured));
             let Some(reference) =
                 candidate.map(|r| r.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_uppercase())
             else {

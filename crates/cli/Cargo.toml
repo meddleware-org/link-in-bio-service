@@ -18,6 +18,7 @@ link-in-bio-assets.workspace = true
 link-in-bio-api.workspace = true
 link-in-bio-store.workspace = true
 link-in-bio-auth.workspace = true
+link-in-bio-billing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 axum.workspace = true

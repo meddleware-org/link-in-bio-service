@@ -14,6 +14,7 @@ part trusts.
 | `link-in-bio serve --mode admin` | the operator console's API (`/api/v1/admin/…`) behind Cloudflare Access and the `LinkInBio:admin#member` Keto role | writer | 8080 |
 | `link-in-bio worker` | its own `/metrics` and `/healthz`; one process at a time holds an advisory lock and does the scheduled duties | writer | `WORKER_LISTEN_ADDR` (8081) |
 | `link-in-bio account create --handle h --wallet 0x… --terms-version v` | creates one of the operator's own accounts while sign-up is closed (free, served while third-party pages are off; signs in with that Sui wallet) | writer | none |
+| `link-in-bio bank-feed revolut-token --code c --out f` | exchanges the code from Revolut Business's consent page for a refresh token and writes it to a new file (mode 0600) for `REVOLUT_REFRESH_TOKEN_FILE`; the token is never printed | none | none |
 
 The app's user interface (`link-in-bio-ui`) is a separate image. The ingress sends `/api/` and `/_/` on the app host to
 `serve --mode app` and everything else to the UI.
@@ -50,6 +51,11 @@ in the environment. Every switch starts at its safest value, and each one can on
 | `PADDLE_API_KEY_FILE`, `PADDLE_WEBHOOK_SECRET_FILE`, `PADDLE_PRICE_ID`, `PADDLE_API_BASE` (sandbox), `PADDLE_FIXED_PENCE` (40), `PADDLE_PERCENT_BPS` (500) | required when `paddle` is on | a transaction for the one-month catalog price × months, paid on Paddle's default payment link; notifications at `/api/v1/webhooks/paddle` |
 | `BANK_TRANSFER_SCHEME` (`sepa` or `faster-payments`), `BANK_TRANSFER_PAYEE`, `BANK_TRANSFER_IBAN`, `BANK_TRANSFER_BIC`, `BANK_TRANSFER_EUR_CENTS_PER_MONTH`, `BANK_TRANSFER_SORT_CODE`, `BANK_TRANSFER_ACCOUNT_NUMBER` | required when `bank-transfer` is on | payment details with an ISO 11649 reference (and an EPC QR payload for SEPA); paid when the operator imports the bank's camt.053/054 statement in the console |
 | `OPEN_PAYMENTS_WALLET_ADDRESS`, `OPEN_PAYMENTS_KEY_ID`, `OPEN_PAYMENTS_KEY_FILE`, `OPEN_PAYMENTS_ASSET_CODE` (`GBP`), `OPEN_PAYMENTS_ASSET_SCALE` (2), `OPEN_PAYMENTS_MINOR_PER_MONTH` | required when `open-payments` is on (the last only when the asset is not GBP) | the operator's wallet address (the payee, and the client every grant names), the id of the client key registered with that wallet's provider (listed at `<wallet address>/jwks.json`), the ed25519 private key file (PKCS #8 PEM, or the base64 of it), and the wallet's asset; for another asset, its minor units per month |
+| `BANK_FEEDS` | none | comma list of `wise`, `bunq`, `revolut`: the receiving banks' APIs the worker polls for bank-transfer credits (needs `bank-transfer` on). Only the worker reads the feeds' secrets |
+| `BANK_FEED_POLL_SECS` | `900` | how often the worker polls the feeds (300 to 86 400) |
+| `WISE_TOKEN_FILE`, `WISE_PROFILE_ID`, `WISE_SCA_KEY_FILE`, `WISE_API_BASE` (`https://api.wise-sandbox.com`), `WISE_API_VERSION` (`2026Q4`) | required when `wise` is a feed (the SCA key whenever Wise asks for SCA: UK and EEA profiles) | an API token, the business profile, and the RSA private key (PEM) whose public key is uploaded to Wise, which signs Wise's one-time token; statements are read as camt.053 for every standard balance |
+| `BUNQ_API_KEY_FILE`, `BUNQ_KEY_FILE`, `BUNQ_PERMITTED_IPS`, `BUNQ_API_BASE` (`https://public-api.sandbox.bunq.com/v1`) | required when `bunq` is a feed (the IPs optional) | the API key, the RSA private key (PEM) the installation registers and every request is signed with, and the IPs the device may call from (unset: bunq binds the address it is registered from) |
+| `REVOLUT_CLIENT_ID`, `REVOLUT_ISSUER`, `REVOLUT_KEY_FILE`, `REVOLUT_REFRESH_TOKEN_FILE`, `REVOLUT_API_BASE` (`https://sandbox-b2b.revolut.com/api/1.0`) | required when `revolut` is a feed | the client id, the redirect URI's host (the assertion's `iss`), the RSA private key (PEM) whose certificate is uploaded in Revolut Business, and the refresh token (`link-in-bio bank-feed revolut-token`) |
 | `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, `KETO_READ_URL`, `ADMIN_ORIGIN` | none (the console answers 503) | the operator console's gate |
 
 ## Sign-in
@@ -94,6 +100,13 @@ in the environment. Every switch starts at its safest value, and each one can on
   QR payload for SEPA). The operator imports the receiving bank's ISO 20022 statement
   (`POST /api/v1/admin/bank-statements`). A booked credit with the reference, in the right currency and for at least
   the amount, pays the checkout once. Underpayments and unknown references are reported and never applied.
+- **Bank feeds.** The worker can read the credits itself from the receiving bank's API instead of the operator
+  importing a statement: Wise (balance statements as camt.053, with Wise's SCA signature of the one-time token), bunq
+  (installation, device and session; every request body signed and every answer's server signature checked) and
+  Revolut Business (an RS256 client-assertion JWT and a refresh token). Each poll looks back two days past where it
+  left off (seven on the first), and the credits are matched by the same rules as an imported statement. A feed's
+  cursor and its own state (bunq's installation, a rotated Revolut refresh token) are in `lib.bank_feeds`; the
+  console's overview shows when each feed last ran and its last error.
 - **Open Payments (Interledger).** The checkout is an incoming payment on the operator's wallet address for the amount
   (a non-interactive incoming-payment grant). The buyer gives their wallet address (a URL, or a `$` payment pointer;
   `https` to a public host only). The service gets a quote there and an outgoing-payment grant limited to the quote's
@@ -143,6 +156,7 @@ in the environment. Every switch starts at its safest value, and each one can on
 | The draft, the published document and the last 20 versions; pictures (re-encoded, metadata stripped) | `lib.pages`, `lib.page_versions`, `lib.assets` | the page |
 | Checkouts and billing events (with the countries seen at purchase) | `lib.checkouts`, `lib.billing_events` | accounting and tax records, kept after an account is deleted |
 | Open Payments grants: the buyer's wallet address, the outgoing payment, and (only until it is continued) the grant's continuation | `lib.open_payments_grants` | the payment's evidence; deleted with the checkout |
+| Where each bank feed left off, and its own state (bunq's installation token and server key, a rotated Revolut refresh token) | `lib.bank_feeds` | reconciliation; never shown |
 | Reports (an optional contact), appeals, the audit log | `lib.reports`, `lib.appeals`, `lib.audit_log` | trust and safety |
 
 - **Erasure.** Deleting an account (`DELETE /api/v1/me`) removes its sign-in methods, sessions, pictures, domains and

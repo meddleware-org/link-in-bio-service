@@ -1926,6 +1926,7 @@ dependencies = [
  "link-in-bio-api",
  "link-in-bio-assets",
  "link-in-bio-auth",
+ "link-in-bio-billing",
  "link-in-bio-core",
  "link-in-bio-store",
  "serde_json",

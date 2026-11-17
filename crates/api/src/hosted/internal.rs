@@ -8,8 +8,9 @@ use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde_json::json;
+use serde_json::{Value, json};
 
+use link_in_bio_billing::bank_transfer::{self, Credit, Scheme};
 use link_in_bio_billing::{Outcome, ProviderEvent};
 use link_in_bio_store::PeriodChange;
 
@@ -123,6 +124,41 @@ pub async fn apply_event(app: &Shared, provider: &str, e: &ProviderEvent) -> Api
         Outcome::Open => {}
     }
     Ok(())
+}
+
+/// What matching bank credits against bank-transfer checkouts found.
+#[derive(Debug, Default)]
+pub struct Matched {
+    pub paid: Vec<Value>,
+    pub short: Vec<Value>,
+    pub unknown: Vec<Value>,
+}
+
+/// Bank credits (from an imported statement or a bank feed) against bank-transfer checkouts: a credit whose creditor
+/// reference names a checkout, in its currency and for at least its amount, pays it (once: the ledger key is the
+/// reference). Underpayments, other currencies and unknown references are reported, never applied.
+pub async fn match_credits(app: &Shared, credits: &[Credit]) -> ApiResult<Matched> {
+    let Some(bt) = &app.config.bank_transfer else {
+        return Err(ApiError::Unavailable("bank transfer is not switched on"));
+    };
+    let mut m = Matched::default();
+    for c in credits {
+        let Some(co) = app.store.checkout_by_ref(bank_transfer::ID, &c.reference).await? else {
+            m.unknown.push(json!({ "reference": c.reference, "amountMinor": c.amount_minor, "currency": c.currency }));
+            continue;
+        };
+        let want = match &bt.scheme {
+            Scheme::Sepa { eur_cents_per_month, .. } => (eur_cents_per_month * co.months as u64, "EUR"),
+            Scheme::FasterPayments { .. } => (co.amount_pence as u64, "GBP"),
+        };
+        if c.currency != want.1 || c.amount_minor < want.0 {
+            m.short.push(json!({ "reference": c.reference, "checkout": co.id, "got": c.amount_minor, "currency": c.currency, "want": want.0, "wantCurrency": want.1 }));
+            continue;
+        }
+        apply_event(app, bank_transfer::ID, &bank_transfer::paid_event(c)).await?;
+        m.paid.push(json!({ "reference": c.reference, "checkout": co.id }));
+    }
+    Ok(m)
 }
 
 /// A provider's notification: verified by its adapter, then applied. 2xx tells the provider to stop retrying.

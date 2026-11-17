@@ -257,6 +257,24 @@ async fn open_payments_grants_are_used_once() {
 }
 
 #[tokio::test]
+async fn bank_feed_cursors() {
+    let Some(s) = store().await else { return };
+    let now = Utc::now();
+    assert!(s.bank_feed("bunq").await.unwrap().is_none());
+    s.bank_feed_failed("bunq", "bunq answered HTTP 503", now).await.unwrap();
+    let r = s.bank_feed("bunq").await.unwrap().unwrap();
+    assert_eq!((r.cursor, r.last_error.as_deref(), r.credits_seen), (None, Some("bunq answered HTTP 503"), 0));
+    s.save_bank_feed("bunq", Some(r#"{"7":103}"#), &json!({"device": true}), 2, now).await.unwrap();
+    s.save_bank_feed("bunq", Some(r#"{"7":104}"#), &json!({"device": true}), 1, now).await.unwrap();
+    s.bank_feed_failed("bunq", &"x".repeat(900), now).await.unwrap();
+    let r = s.bank_feed("bunq").await.unwrap().unwrap();
+    assert_eq!(r.cursor.as_deref(), Some(r#"{"7":104}"#), "a failure keeps the cursor");
+    assert_eq!((r.credits_seen, r.state, r.last_error.map(|e| e.len())), (3, json!({"device": true}), Some(500)));
+    s.save_bank_feed("wise", Some("2026-11-17T00:00:00.000Z"), &json!({}), 0, now).await.unwrap();
+    assert_eq!(s.bank_feeds().await.unwrap().iter().map(|r| r.feed.as_str()).collect::<Vec<_>>(), vec!["bunq", "wise"]);
+}
+
+#[tokio::test]
 async fn selections_reports_appeals_and_housekeeping() {
     let Some(s) = store().await else { return };
     let now = Utc::now();

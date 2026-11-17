@@ -57,6 +57,9 @@ pub struct HostedConfig {
     pub paddle: Option<PaddleEnv>,
     pub bank_transfer: Option<BankTransferEnv>,
     pub open_payments: Option<OpenPaymentsEnv>,
+    /// The receiving banks' APIs the worker polls for bank-transfer credits (`BANK_FEEDS`); none by default.
+    pub bank_feeds: Vec<BankFeedEnv>,
+    pub bank_feed_poll_secs: u64,
     pub access: Option<AccessEnv>,
 }
 
@@ -94,6 +97,14 @@ pub struct PaddleEnv {
 pub struct BankTransferEnv {
     pub payee: String,
     pub scheme: link_in_bio_billing::bank_transfer::Scheme,
+}
+
+/// One bank feed's settings (keys and tokens are files; the API bases default to each bank's sandbox).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BankFeedEnv {
+    Wise { api_base: String, api_version: String, token_file: String, profile_id: u64, sca_key_file: Option<String> },
+    Bunq { api_base: String, api_key_file: String, key_file: String, permitted_ips: Vec<String> },
+    Revolut { api_base: String, client_id: String, issuer: String, key_file: String, refresh_token_file: String },
 }
 
 /// Open Payments: the operator's wallet address (the payee and the client), the client key's id at the wallet provider
@@ -317,6 +328,55 @@ impl HostedConfig {
         } else {
             None
         };
+        let mut bank_feeds = Vec::new();
+        let feeds: BTreeSet<String> = get("BANK_FEEDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty())
+            .collect();
+        if !feeds.is_empty() && bank_transfer.is_none() {
+            return Err(HostedConfigError::Invalid(
+                "BANK_FEEDS",
+                "bank feeds reconcile bank transfers: add bank-transfer to BILLING_PROVIDERS".into(),
+            ));
+        }
+        for f in &feeds {
+            bank_feeds.push(match f.as_str() {
+                "wise" => BankFeedEnv::Wise {
+                    api_base: base("WISE_API_BASE", link_in_bio_billing::bank_feed::wise::SANDBOX)?,
+                    api_version: get("WISE_API_VERSION")
+                        .filter(|v| !v.trim().is_empty())
+                        .unwrap_or_else(|| link_in_bio_billing::bank_feed::wise::VERSION.into()),
+                    token_file: need("WISE_TOKEN_FILE")?,
+                    profile_id: number(&get, "WISE_PROFILE_ID", 0u64, 1, u64::MAX)?,
+                    sca_key_file: get("WISE_SCA_KEY_FILE").filter(|v| !v.trim().is_empty()),
+                },
+                "bunq" => BankFeedEnv::Bunq {
+                    api_base: base("BUNQ_API_BASE", link_in_bio_billing::bank_feed::bunq::SANDBOX)?,
+                    api_key_file: need("BUNQ_API_KEY_FILE")?,
+                    key_file: need("BUNQ_KEY_FILE")?,
+                    permitted_ips: get("BUNQ_PERMITTED_IPS")
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(|i| i.trim().to_string())
+                        .filter(|i| !i.is_empty())
+                        .collect(),
+                },
+                "revolut" => BankFeedEnv::Revolut {
+                    api_base: base("REVOLUT_API_BASE", link_in_bio_billing::bank_feed::revolut::SANDBOX)?,
+                    client_id: need("REVOLUT_CLIENT_ID")?,
+                    issuer: need("REVOLUT_ISSUER")?,
+                    key_file: need("REVOLUT_KEY_FILE")?,
+                    refresh_token_file: need("REVOLUT_REFRESH_TOKEN_FILE")?,
+                },
+                o => return Err(HostedConfigError::Invalid("BANK_FEEDS", format!("{o} is not wise, bunq or revolut"))),
+            });
+        }
+        if bank_feeds.iter().any(|f| matches!(f, BankFeedEnv::Wise { profile_id: 0, .. })) {
+            return Err(HostedConfigError::Missing("WISE_PROFILE_ID"));
+        }
+        let bank_feed_poll_secs = number(&get, "BANK_FEED_POLL_SECS", 900u64, 300, 86_400)?;
         let access = match (get("ACCESS_TEAM_DOMAIN"), get("ACCESS_AUD")) {
             (Some(team), Some(aud)) if !aud.trim().is_empty() => Some(AccessEnv {
                 team_domain: team.trim_end_matches('/').to_string(),
@@ -362,6 +422,8 @@ impl HostedConfig {
             paddle,
             bank_transfer,
             open_payments,
+            bank_feeds,
+            bank_feed_poll_secs,
             access,
         })
     }
@@ -403,6 +465,7 @@ mod tests {
         assert!(!c.third_party_pages);
         assert_eq!(c.billing_providers, BTreeSet::from(["manual".to_string()]));
         assert_eq!(c.custom_hostname_cap, 0);
+        assert!(c.bank_feeds.is_empty() && c.open_payments.is_none());
         assert!(!c.signup_open_to_public());
         assert_eq!(c.handle_of_host("alice.example.link"), Some("alice"));
         assert_eq!(c.handle_of_host("a.b.example.link"), None);
@@ -411,6 +474,47 @@ mod tests {
         let s = c.site_for("alice", "alice.example.link").unwrap();
         assert_eq!(s.base_url, "https://alice.example.link/");
         assert_eq!(s.footer.report_url.as_deref(), Some("https://app.example.link/report?page=alice"));
+    }
+
+    #[test]
+    fn bank_feeds_default_to_the_sandboxes() {
+        let c = HostedConfig::from_env(env(&[
+            ("PAGES_DOMAIN", "example.link"),
+            ("APP_HOST", "app.example.link"),
+            ("BILLING_PROVIDERS", "bank-transfer"),
+            ("BANK_TRANSFER_SCHEME", "faster-payments"),
+            ("BANK_TRANSFER_PAYEE", "Example Ltd"),
+            ("BANK_TRANSFER_SORT_CODE", "12-34-56"),
+            ("BANK_TRANSFER_ACCOUNT_NUMBER", "12345678"),
+            ("BANK_FEEDS", "wise, bunq,revolut"),
+            ("WISE_TOKEN_FILE", "/s/wise"),
+            ("WISE_PROFILE_ID", "12345"),
+            ("BUNQ_API_KEY_FILE", "/s/bunq"),
+            ("BUNQ_KEY_FILE", "/s/bunq.pem"),
+            ("REVOLUT_CLIENT_ID", "c"),
+            ("REVOLUT_ISSUER", "example.org"),
+            ("REVOLUT_KEY_FILE", "/s/rev.pem"),
+            ("REVOLUT_REFRESH_TOKEN_FILE", "/s/rev.token"),
+        ]))
+        .unwrap();
+        let bases: Vec<String> = c
+            .bank_feeds
+            .iter()
+            .map(|f| match f {
+                BankFeedEnv::Wise { api_base, .. }
+                | BankFeedEnv::Bunq { api_base, .. }
+                | BankFeedEnv::Revolut { api_base, .. } => api_base.clone(),
+            })
+            .collect();
+        assert_eq!(
+            bases,
+            vec![
+                "https://public-api.sandbox.bunq.com/v1",
+                "https://sandbox-b2b.revolut.com/api/1.0",
+                "https://api.wise-sandbox.com"
+            ]
+        );
+        assert_eq!(c.bank_feed_poll_secs, 900);
     }
 
     #[test]
@@ -428,6 +532,7 @@ mod tests {
         for p in ["square", "gocardless", "paddle", "bank-transfer", "open-payments"] {
             assert!(with(("BILLING_PROVIDERS", p)).is_err(), "{p} needs its settings");
         }
+        assert!(with(("BANK_FEEDS", "wise")).is_err(), "bank feeds need bank transfer");
         assert!(with(("CUSTOM_HOSTNAME_CAP", "101")).is_err(), "hard stop at 100");
         assert!(with(("WEB_RISK_MONTHLY_CAP", "100001")).is_err(), "never past the free tier");
         assert!(HostedConfig::from_env(env(&[("PAGES_DOMAIN", "x"), ("APP_HOST", "app.example.link")])).is_err());

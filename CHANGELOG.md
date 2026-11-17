@@ -8,6 +8,12 @@
   RFC 9530); paid only when the incoming payment has received the whole amount. New routes
   `POST /api/v1/billing/checkouts/{id}/open-payments` and `…/open-payments/finish`; schema 2
   (`lib.open_payments_grants`). The signing code is checked against the RFC 9421, RFC 9530 and RFC 9635 examples.
+- Bank feeds for bank transfer, off unless `BANK_FEEDS` names them: Wise (camt.053 balance statements, SCA one-time
+  token signed with the operator's RSA key), bunq (installation, device and session; signed requests, verified
+  answers; the payments list) and Revolut Business (RS256 client assertion, refresh token; the transactions list). The
+  worker polls them every `BANK_FEED_POLL_SECS` and pays checkouts by the same rules as an imported statement; schema 3
+  (`lib.bank_feeds`, a cursor per feed); `link-in-bio bank-feed revolut-token` for Revolut's one-time code exchange;
+  the console's overview lists each feed's last poll and error.
 
 ## 0.0.3 — 2026-11-17
 

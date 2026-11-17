@@ -920,3 +920,105 @@ async fn open_payments_checkout_paid_from_a_wallet() {
     assert_eq!(ase.signatures().0, 0, "every request the service made was signed and verified");
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[path = "../../../billing/tests/support/bank_feeds.rs"]
+mod banks;
+
+#[tokio::test]
+async fn bank_feeds_pay_bank_transfer_checkouts() {
+    let Some(s) = store().await else { return };
+    let (wise, bunq, revolut) = (
+        banks::WiseBank::start().await,
+        banks::BunqBank::start().await,
+        banks::RevolutBank::start("oa_sand_refresh_9").await,
+    );
+    let dir = std::env::temp_dir().join(format!("lib-hosted-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = |name: &str, content: &str| {
+        std::fs::write(dir.join(name), content).unwrap();
+        dir.join(name).display().to_string()
+    };
+    let key = file("operator.pem", &banks::operator_key_pem());
+    let c = config(&[
+        ("BILLING_PROVIDERS", "bank-transfer".into()),
+        ("BANK_TRANSFER_SCHEME", "sepa".into()),
+        ("BANK_TRANSFER_PAYEE", "Example Ltd".into()),
+        ("BANK_TRANSFER_IBAN", "DE89370400440532013000".into()),
+        ("BANK_TRANSFER_EUR_CENTS_PER_MONTH", "350".into()),
+        ("BANK_FEEDS", "wise,bunq,revolut".into()),
+        ("WISE_API_BASE", wise.base.clone()),
+        ("WISE_TOKEN_FILE", file("wise.token", banks::WISE_TOKEN)),
+        ("WISE_PROFILE_ID", banks::WISE_PROFILE.to_string()),
+        ("WISE_SCA_KEY_FILE", key.clone()),
+        ("BUNQ_API_BASE", bunq.base.clone()),
+        ("BUNQ_API_KEY_FILE", file("bunq.key", banks::BUNQ_API_KEY)),
+        ("BUNQ_KEY_FILE", key.clone()),
+        ("REVOLUT_API_BASE", revolut.base.clone()),
+        ("REVOLUT_CLIENT_ID", banks::REVOLUT_CLIENT.into()),
+        ("REVOLUT_ISSUER", banks::REVOLUT_ISSUER.into()),
+        ("REVOLUT_KEY_FILE", key),
+        ("REVOLUT_REFRESH_TOKEN_FILE", file("revolut.token", "oa_sand_refresh_9")),
+    ]);
+    let feeds = super::jobs::bank_feeds(&c).unwrap();
+    assert_eq!(feeds.iter().map(|f| f.id()).collect::<Vec<_>>(), vec!["bunq", "revolut", "wise"]);
+    let a = app(s.clone(), c);
+    let app_r = super::app::router(a.clone());
+
+    // Four accounts, each with a one-month SEPA checkout (EUR 3.50).
+    let mut checkouts = Vec::new();
+    for h in ["gwen", "hugo", "ines", "jack"] {
+        let (id, cookie) = account_with_session(&s, h).await;
+        let co = send(
+            &app_r,
+            call(
+                "POST",
+                "/api/v1/billing/checkouts",
+                Some(json!({ "method": "bank-transfer:sepa", "months": 1 })),
+                Some(&cookie),
+            ),
+        )
+        .await
+        .json();
+        checkouts.push((id, co["client"]["reference"].as_str().unwrap().to_string()));
+    }
+    // Paid through Wise, bunq and Revolut; the fourth underpaid.
+    wise.credit("WS1", "EUR", "3.50", &format!("Link in Bio {}", checkouts[0].1));
+    bunq.pay(501, "3.50", "EUR", &checkouts[1].1);
+    revolut.incoming("rv-1", 3.5, "EUR", &checkouts[2].1);
+    revolut.incoming("rv-2", 2.0, "EUR", &checkouts[3].1);
+
+    super::jobs::poll_bank_feeds(&a, &feeds).await;
+    for (id, _) in &checkouts[..3] {
+        assert!(s.account(*id).await.unwrap().unwrap().paid_until.is_some(), "paid from a feed");
+    }
+    assert!(s.account(checkouts[3].0).await.unwrap().unwrap().paid_until.is_none(), "an underpayment is not applied");
+    let paid = s.account(checkouts[0].0).await.unwrap().unwrap().paid_until;
+    // A second poll sees the same credits again (overlapping windows) and changes nothing.
+    super::jobs::poll_bank_feeds(&a, &feeds).await;
+    assert_eq!(s.account(checkouts[0].0).await.unwrap().unwrap().paid_until, paid, "applied once");
+    for (id, _) in &checkouts[..3] {
+        assert_eq!(s.billing_events(*id).await.unwrap().len(), 1);
+    }
+    for f in ["wise", "bunq", "revolut"] {
+        let row = s.bank_feed(f).await.unwrap().unwrap();
+        assert!(row.cursor.is_some() && row.last_error.is_none(), "{f}");
+    }
+    assert!(s.bank_feed("bunq").await.unwrap().unwrap().state["installationToken"].is_string());
+    let audit = s.audit_log(Some("bank-transfer"), 50).await.unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|e| e.actor == "worker:bank-feed:revolut" && e.details["short"].as_array().unwrap().len() == 1)
+    );
+    // A failing feed keeps its cursor and reports why; the console shows that, never the feed's stored state.
+    bunq.forge(true);
+    super::jobs::poll_bank_feeds(&a, &feeds).await;
+    assert!(s.bank_feed("bunq").await.unwrap().unwrap().last_error.is_some());
+    let admin = super::admin::router(a.clone());
+    let o = send(&admin, admin_call("GET", "/api/v1/admin/overview", None)).await.json();
+    let rows = o["bankFeeds"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.get("state").is_none() && r.get("cursor").is_none()));
+    assert_eq!(o["switches"]["bankFeeds"], json!(["bunq", "revolut", "wise"]));
+    std::fs::remove_dir_all(dir).ok();
+}
