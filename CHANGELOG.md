@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.2 — unreleased
+## 0.0.2 — 2026-11-17
 
 - The hosted service: `serve --mode pages` (tenant pages by host, read-only database role), `serve --mode app` (the
   account API and the internal port), `serve --mode admin` (the operator console's API behind Cloudflare Access and a

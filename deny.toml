@@ -9,6 +9,10 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 yanked = "deny"
 unmaintained = "all"
 ignore = [
+    # Reviewed 2026-11-17. RUSTSEC-2026-0543 says chrono is unmaintained; it reports no vulnerability. chrono comes in
+    # through sqlx as well as this code, so leaving it means moving the service and sqlx's column types to another date
+    # library together (FU-0134). Drop this entry when that is done.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no known vulnerability; also required by sqlx; migration tracked (FU-0134)" },
     # Reviewed 2026-11-16. The Marvin attack is a timing side channel in RSA *private-key* operations (decryption,
     # signing). `rsa` is here only through webauthn-rs-core, which uses it to verify passkey and attestation signatures
     # with *public* keys; this service never holds an RSA private key. No fixed `rsa` release exists yet; drop this
