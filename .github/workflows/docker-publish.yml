@@ -190,7 +190,7 @@ jobs:
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             VENDOR=${{ vars.VENDOR || 'Meddleware' }}
-            DESCRIPTION=${{ vars.DESCRIPTION || 'Content hub: canonical posts, roadmap and publishing queue (admin, public, worker).' }}
+            DESCRIPTION=${{ vars.DESCRIPTION || 'Link in Bio: profile-link pages, the hosted app's API, the operator console's API and its worker.' }}
             SOURCE_URL=${{ vars.SOURCE_URL || 'https://github.com/meddleware-org/link-in-bio-service' }}
             DOCUMENTATION_URL=${{ vars.DOCUMENTATION_URL || 'https://github.com/meddleware-org/link-in-bio-service#readme' }}
             IMAGE_URL=${{ vars.IMAGE_URL || 'https://quay.io/meddleware-org/link-in-bio-service' }}
