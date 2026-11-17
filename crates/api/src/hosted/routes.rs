@@ -90,6 +90,12 @@ pub const APP_ROUTES: &[Route] = &[
     r(Get, "/api/v1/billing/checkouts/{id}", Session, "How a checkout stands"),
     r(
         Post,
+        "/api/v1/billing/events/{id}/refund-request",
+        Session,
+        "Ask for a refund of an unapplied Chain Payments payment instead of its months (within 30 days, once)",
+    ),
+    r(
+        Post,
         "/api/v1/billing/checkouts/{id}/open-payments",
         Session,
         "Open Payments: the buyer's wallet address; returns the wallet's approval page to redirect to",
@@ -144,6 +150,13 @@ pub const ADMIN_ROUTES: &[Route] = &[
     r(Delete, "/api/v1/admin/blocklist", Operator, "Unblock (?pattern=)"),
     r(Put, "/api/v1/admin/links", Operator, "An operator verdict on a link (clean, flagged, or automatic)"),
     r(Get, "/api/v1/admin/audit", Operator, "The audit log (?subject=)"),
+    r(Get, "/api/v1/admin/refund-requests", Operator, "Refund requests for unapplied payments (?status=open|refunded)"),
+    r(
+        Post,
+        "/api/v1/admin/refund-requests/{id}/refunded",
+        Operator,
+        "Record a refund sent by hand (its transaction reference); takes the months back once",
+    ),
     r(
         Post,
         "/api/v1/admin/bank-statements",

@@ -121,6 +121,13 @@ in the environment. Every switch starts at its safest value, and each one can on
 - **Chain Payments.** Chain Payments sessions carry `units` (the months) and the account's opaque billing reference
   (never the handle). Its notifications are ed25519-signed (`Chain-Payments-Signature`) and arrive on the internal
   port.
+- **Refunds of unapplied payments.** A Chain Payments payment that arrives after its checkout was paid or closed is
+  credited as the months its quote was for. Within 30 days its account holder may ask for the money back instead,
+  once per payment (`POST /api/v1/billing/events/{id}/refund-request`). Nothing is sent automatically: the operator
+  sends the refund by hand from the recipient (the same coin and amount, to the paying address, both shown in the
+  console's queue, `GET /api/v1/admin/refund-requests`) and records it with the refund transaction's reference
+  (`POST /api/v1/admin/refund-requests/{id}/refunded`). That takes the months back as a `refund` billing event, once.
+  Each step is in the audit log.
 
 ## Pages, screening and safety
 
@@ -157,6 +164,7 @@ in the environment. Every switch starts at its safest value, and each one can on
 | Checkouts and billing events (with the countries seen at purchase) | `lib.checkouts`, `lib.billing_events` | accounting and tax records, kept after an account is deleted |
 | Open Payments grants: the buyer's wallet address, the outgoing payment, and (only until it is continued) the grant's continuation | `lib.open_payments_grants` | the payment's evidence; deleted with the checkout |
 | Where each bank feed left off, and its own state (bunq's installation token and server key, a rotated Revolut refresh token) | `lib.bank_feeds` | reconciliation; never shown |
+| Refund requests: the reason given, the refund's transaction reference, who recorded it and when | `lib.refund_requests` | accounting records, kept with the billing events |
 | Reports (an optional contact), appeals, the audit log | `lib.reports`, `lib.appeals`, `lib.audit_log` | trust and safety |
 
 - **Erasure.** Deleting an account (`DELETE /api/v1/me`) removes its sign-in methods, sessions, pictures, domains and

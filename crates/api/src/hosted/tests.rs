@@ -1022,3 +1022,115 @@ async fn bank_feeds_pay_bank_transfer_checkouts() {
     assert_eq!(o["switches"]["bankFeeds"], json!(["bunq", "revolut", "wise"]));
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test]
+async fn refund_requests_for_unapplied_payments() {
+    let Some(s) = store().await else { return };
+    let a = app(s.clone(), config(&[]));
+    let app_r = super::app::router(a.clone());
+    let admin = super::admin::router(a.clone());
+    let (id, cookie) = account_with_session(&s, "kate").await;
+    let now = chrono::Utc::now();
+    let credit = |event: &'static str, unapplied: bool| link_in_bio_store::PeriodChange {
+        account_id: id,
+        provider: "chain-payments",
+        provider_event: event,
+        kind: "purchase",
+        months: 3,
+        amount_pence: 900,
+        evidence: json!({ "unapplied": unapplied, "digest": format!("D-{event}"), "payer": "0x2", "coinType": "0x2::sui::SUI", "amount": "5500000000" }),
+        checkout: None,
+    };
+    s.change_period(&credit("paid:s1", false), now).await.unwrap();
+    s.change_period(&credit("unapplied:w1", true), now).await.unwrap().unwrap();
+    let credited = s.change_period(&credit("unapplied:w-old", true), now).await.unwrap().unwrap();
+    let events = s.billing_events(id).await.unwrap();
+    let find = |key: &str| events.iter().find(|e| e.provider_event == key).unwrap().id;
+    let (paid, late, old) = (find("paid:s1"), find("unapplied:w1"), find("unapplied:w-old"));
+    sqlx::query("UPDATE lib.billing_events SET created_at = now() - interval '31 days' WHERE id = $1")
+        .bind(old)
+        .execute(s.pool())
+        .await
+        .unwrap();
+
+    let b = send(&app_r, call("GET", "/api/v1/billing", None, Some(&cookie))).await.json();
+    let ev = |b: &Value, e: uuid::Uuid| {
+        b["events"].as_array().unwrap().iter().find(|x| x["id"] == json!(e)).unwrap().clone()
+    };
+    assert_eq!(ev(&b, late)["unapplied"], true);
+    assert!(ev(&b, late)["refundableUntil"].is_string());
+    assert!(ev(&b, paid)["refundableUntil"].is_null(), "a payment that bought its checkout is not refundable here");
+    assert!(ev(&b, old)["refundableUntil"].is_null(), "past 30 days");
+
+    let ask = |e: uuid::Uuid, body: Option<Value>, cookie: &str| {
+        call("POST", &format!("/api/v1/billing/events/{e}/refund-request"), body, Some(cookie)).into_parts()
+    };
+    let req = |e: uuid::Uuid, body: Option<Value>, cookie: &str| {
+        let (p, b) = ask(e, body, cookie);
+        Request::from_parts(p, b)
+    };
+    assert_eq!(send(&app_r, req(paid, None, &cookie)).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(send(&app_r, req(old, None, &cookie)).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (_, other) = account_with_session(&s, "liam").await;
+    assert_eq!(send(&app_r, req(late, None, &other)).await.status, StatusCode::NOT_FOUND, "only the account's own");
+    let made = send(&app_r, req(late, Some(json!({ "reason": "I paid twice in two tabs" })), &cookie)).await;
+    assert_eq!(made.status, StatusCode::CREATED, "{}", made.text());
+    let request = made.json()["refundRequest"].as_str().unwrap().to_string();
+    assert_eq!(send(&app_r, req(late, None, &cookie)).await.status, StatusCode::CONFLICT, "one request per payment");
+    let b = send(&app_r, call("GET", "/api/v1/billing", None, Some(&cookie))).await.json();
+    assert_eq!(ev(&b, late)["refundRequest"]["status"], "open");
+    assert!(ev(&b, late)["refundableUntil"].is_null());
+
+    // The console's queue shows what the refund must match; recording it takes the months back once.
+    let q = send(&admin, admin_call("GET", "/api/v1/admin/refund-requests", None)).await.json();
+    let rows = q["requests"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0]["handle"].as_str(), rows[0]["months"].as_i64()), (Some("kate"), Some(3)));
+    assert_eq!(
+        (rows[0]["payment"]["digest"].as_str(), rows[0]["payment"]["payer"].as_str()),
+        (Some("D-unapplied:w1"), Some("0x2"))
+    );
+    let path = format!("/api/v1/admin/refund-requests/{request}/refunded");
+    assert_eq!(
+        send(&admin, admin_call("POST", &path, Some(json!({ "reference": " " })))).await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let done = send(
+        &admin,
+        admin_call("POST", &path, Some(json!({ "reference": "9xRefundDigest", "note": "sent from the recipient" }))),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text());
+    assert_eq!(done.json()["request"]["status"], "refunded");
+    let until = s.account(id).await.unwrap().unwrap().paid_until.unwrap();
+    assert_eq!(until, credited - link_in_bio_store::MONTH * 3, "three months taken back");
+    assert_eq!(
+        send(&admin, admin_call("POST", &path, Some(json!({ "reference": "again" })))).await.status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(s.account(id).await.unwrap().unwrap().paid_until.unwrap(), until, "once");
+    let refunds: Vec<_> = s.billing_events(id).await.unwrap().into_iter().filter(|e| e.kind == "refund").collect();
+    assert_eq!((refunds.len(), refunds[0].months, refunds[0].amount_pence), (1, -3, -900));
+    let b = send(&app_r, call("GET", "/api/v1/billing", None, Some(&cookie))).await.json();
+    assert_eq!(ev(&b, late)["refundRequest"]["refundReference"], "9xRefundDigest");
+    assert!(
+        send(&admin, admin_call("GET", "/api/v1/admin/refund-requests", None)).await.json()["requests"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        send(&admin, admin_call("GET", "/api/v1/admin/refund-requests?status=refunded", None)).await.json()["requests"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // Every step is in the audit log.
+    let audit: Vec<String> =
+        s.audit_log(Some(&id.to_string()), 50).await.unwrap().into_iter().map(|e| e.action).collect();
+    assert!(
+        audit.contains(&"refund-requested".to_string()) && audit.contains(&"refund-recorded".to_string()),
+        "{audit:?}"
+    );
+}

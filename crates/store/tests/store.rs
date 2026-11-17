@@ -275,6 +275,50 @@ async fn bank_feed_cursors() {
 }
 
 #[tokio::test]
+async fn refund_requests_take_months_back_once() {
+    let Some(s) = store().await else { return };
+    let now = Utc::now();
+    let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
+    let change = |event: &'static str, unapplied: bool| PeriodChange {
+        account_id: a.id,
+        provider: "chain-payments",
+        provider_event: event,
+        kind: "purchase",
+        months: 3,
+        amount_pence: 900,
+        evidence: json!({ "unapplied": unapplied, "digest": "D2", "payer": "0x2" }),
+        checkout: None,
+    };
+    s.change_period(&change("paid:s1", false), now).await.unwrap().unwrap();
+    let credited = s.change_period(&change("unapplied:w1", true), now).await.unwrap().unwrap();
+    let events = s.billing_events(a.id).await.unwrap();
+    let late = events.iter().find(|e| e.unapplied).unwrap().clone();
+    assert_eq!(events.iter().filter(|e| e.unapplied).count(), 1);
+    let detail = s.billing_event(late.id).await.unwrap().unwrap();
+    assert_eq!((detail.account_id, detail.months, detail.evidence["digest"].as_str()), (a.id, 3, Some("D2")));
+
+    let r = s.create_refund_request(late.id, a.id, "two tabs").await.unwrap().unwrap();
+    assert!(s.create_refund_request(late.id, a.id, "again").await.unwrap().is_none(), "one request per event");
+    let queue = s.refund_requests("open", 10).await.unwrap();
+    assert_eq!((queue.len(), queue[0].handle.as_str(), queue[0].months), (1, "alice", 3));
+    assert_eq!(s.refund_requests_of(a.id).await.unwrap()[0].id, r);
+
+    let done = s.record_refund(r, "9xRefundDigest", "operator:op-1", "", now).await.unwrap().unwrap();
+    assert_eq!((done.account_id, done.months), (a.id, 3));
+    assert_eq!(done.paid_until, credited - link_in_bio_store::MONTH * 3, "the three months taken back");
+    assert!(s.record_refund(r, "other", "operator:op-1", "", now).await.unwrap().is_none(), "recorded once");
+    let rr = s.refund_request(r).await.unwrap().unwrap();
+    assert_eq!(
+        (rr.status.as_str(), rr.refund_reference.as_deref(), rr.refund_event),
+        ("refunded", Some("9xRefundDigest"), Some(done.event_id))
+    );
+    assert!(s.refund_requests("open", 10).await.unwrap().is_empty());
+    let refund = s.billing_event(done.event_id).await.unwrap().unwrap();
+    assert_eq!((refund.kind.as_str(), refund.months, refund.amount_pence), ("refund", -3, -900));
+    assert_eq!(s.account(a.id).await.unwrap().unwrap().paid_until, Some(done.paid_until));
+}
+
+#[tokio::test]
 async fn selections_reports_appeals_and_housekeeping() {
     let Some(s) = store().await else { return };
     let now = Utc::now();

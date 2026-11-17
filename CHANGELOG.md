@@ -14,6 +14,12 @@
   worker polls them every `BANK_FEED_POLL_SECS` and pays checkouts by the same rules as an imported statement; schema 3
   (`lib.bank_feeds`, a cursor per feed); `link-in-bio bank-feed revolut-token` for Revolut's one-time code exchange;
   the console's overview lists each feed's last poll and error.
+- Refund requests for unapplied Chain Payments payments (FU-0132): the account holder asks within 30 days, once per
+  payment (`POST /api/v1/billing/events/{id}/refund-request`); the console lists them
+  (`GET /api/v1/admin/refund-requests`) and records the refund sent by hand with its transaction reference
+  (`POST /api/v1/admin/refund-requests/{id}/refunded`), which takes the months back as a `refund` event, once. Every
+  step is audited. `GET /api/v1/billing` events now carry `id`, `unapplied`, `refundableUntil` and `refundRequest`.
+  Schema 4 (`lib.refund_requests`).
 
 ## 0.0.3 — 2026-11-17
 

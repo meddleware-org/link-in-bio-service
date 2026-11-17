@@ -612,6 +612,75 @@ async fn audit(State(app): State<Shared>, Query(q): Query<AuditQuery>) -> ApiRes
     })).collect::<Vec<_>>() })))
 }
 
+// ── refunds ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn refund_row(r: &link_in_bio_store::RefundRequest) -> Value {
+    let e = &r.evidence;
+    json!({
+        "id": r.id, "account": r.account_id, "handle": r.handle, "event": r.event_id, "provider": r.provider,
+        "months": r.months, "amountPence": r.amount_pence, "paidAt": r.paid_at, "reason": r.reason, "status": r.status,
+        "createdAt": r.created_at, "refundReference": r.refund_reference, "refundEvent": r.refund_event,
+        "decidedBy": r.decided_by, "decidedAt": r.decided_at,
+        // What the refund must match: the same coin and amount, back to the paying address.
+        "payment": { "digest": e["digest"], "payer": e["payer"], "coinType": e["coinType"], "amount": e["amount"],
+                     "method": e["method"], "checkout": e["checkout"] },
+    })
+}
+
+/// The refund requests (`?status=open`, the default, or `refunded`), oldest first.
+async fn refund_requests(State(app): State<Shared>, Query(q): Query<StatusQuery>) -> ApiResult<Json<Value>> {
+    let st = q.status.unwrap_or_else(|| "open".into());
+    if !["open", "refunded"].contains(&st.as_str()) {
+        return Err(ApiError::BadRequest("status is open or refunded".into()));
+    }
+    let rows = app.store.refund_requests(&st, 200).await?;
+    Ok(Json(json!({ "requests": rows.iter().map(refund_row).collect::<Vec<_>>() })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Refunded {
+    /// The refund transaction's reference (for Chain Payments, its digest).
+    reference: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// The operator sent the refund: records its reference and takes the months back (a `refund` billing event), once.
+async fn refunded(
+    State(app): State<Shared>,
+    Extension(op): Extension<Operator>,
+    Path(id): Path<Uuid>,
+    Json(b): Json<Refunded>,
+) -> ApiResult<Json<Value>> {
+    let reference = b.reference.trim();
+    if reference.is_empty() || reference.len() > 200 || !reference.bytes().all(|c| c.is_ascii_graphic()) {
+        return Err(ApiError::Unprocessable(
+            "The refund's transaction reference is 1 to 200 visible characters.".into(),
+        ));
+    }
+    let note = b.note.trim();
+    if note.chars().count() > 1000 {
+        return Err(ApiError::Unprocessable("The note is at most 1000 characters.".into()));
+    }
+    let existing = app.store.refund_request(id).await?.ok_or(ApiError::NotFound)?;
+    let Some(done) = app.store.record_refund(id, reference, &actor(&op), note, now()).await? else {
+        return Err(ApiError::Conflict(format!("This request is already {}.", existing.status)));
+    };
+    app.store
+        .audit(
+            &actor(&op),
+            "refund-recorded",
+            &done.account_id.to_string(),
+            &json!({ "request": id, "event": existing.event_id, "refundEvent": done.event_id, "months": -done.months,
+                     "reference": reference, "note": note, "paidUntil": done.paid_until }),
+        )
+        .await?;
+    forget_account(&app, done.account_id).await;
+    let after = app.store.refund_request(id).await?.ok_or(ApiError::NotFound)?;
+    Ok(Json(json!({ "request": refund_row(&after), "paidUntil": done.paid_until })))
+}
+
 /// An ISO 20022 statement from the receiving bank: each booked credit whose creditor reference names a bank-transfer
 /// checkout, in its currency and for at least its amount, pays it (once). The rest is reported, never applied.
 async fn bank_statement(
@@ -661,6 +730,8 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v1/admin/blocklist", get(blocklist).post(block_add).delete(block_remove))
         .route("/api/v1/admin/links", put(link_verdict))
         .route("/api/v1/admin/audit", get(audit))
+        .route("/api/v1/admin/refund-requests", get(refund_requests))
+        .route("/api/v1/admin/refund-requests/{id}/refunded", post(refunded))
         .route(
             "/api/v1/admin/bank-statements",
             post(bank_statement).layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),

@@ -930,17 +930,92 @@ async fn billing(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Jso
     let a = account(&app, &headers).await?;
     let n = now();
     let offers = app.billing.offers(&evidence(&a, &headers), months_ahead(a.paid_until, n));
+    let requests: BTreeMap<Uuid, link_in_bio_store::RefundRequest> =
+        app.store.refund_requests_of(a.id).await?.into_iter().map(|r| (r.event_id, r)).collect();
     let events: Vec<Value> = app
         .store
         .billing_events(a.id)
         .await?
         .into_iter()
-        .map(|e| json!({ "provider": e.provider, "kind": e.kind, "months": e.months, "amountPence": e.amount_pence, "at": e.created_at, "paidUntil": e.paid_until_after }))
+        .map(|e| {
+            let request = requests.get(&e.id).map(|r| {
+                json!({ "id": r.id, "status": r.status, "refundReference": r.refund_reference, "at": r.created_at, "decidedAt": r.decided_at })
+            });
+            let refundable_until = (request.is_none() && refundable(&e, n)).then(|| e.created_at + REFUND_WINDOW);
+            json!({
+                "id": e.id, "provider": e.provider, "kind": e.kind, "months": e.months, "amountPence": e.amount_pence,
+                "at": e.created_at, "paidUntil": e.paid_until_after, "unapplied": e.unapplied,
+                "refundableUntil": refundable_until, "refundRequest": request,
+            })
+        })
         .collect();
     Ok(Json(json!({
         "free": a.free, "paidUntil": a.paid_until, "entitled": a.entitled(n, Duration::days(app.config.grace_days)),
         "pricePence": offers.price_pence, "currency": "GBP", "offers": offers.offers, "notes": offers.notes, "events": events,
     })))
+}
+
+/// How long after an unapplied payment its account holder may ask for a refund instead of the months.
+pub const REFUND_WINDOW: Duration = Duration::days(30);
+
+/// An unapplied Chain Payments payment, credited as months, within the refund window.
+fn refundable(e: &link_in_bio_store::BillingEvent, n: chrono::DateTime<chrono::Utc>) -> bool {
+    e.unapplied
+        && e.provider == link_in_bio_billing::chain_payments::ID
+        && e.kind == "purchase"
+        && e.created_at + REFUND_WINDOW > n
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RefundRequestBody {
+    #[serde(default)]
+    reason: String,
+}
+
+/// Asks for a refund of an unapplied payment instead of the months it was credited as (once per payment, within 30
+/// days). The operator sends it by hand and records it in the console.
+async fn refund_request(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(event): Path<Uuid>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let a = account(&app, &headers).await?;
+    let b: RefundRequestBody = if body.iter().all(u8::is_ascii_whitespace) {
+        RefundRequestBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::BadRequest(format!("not a refund request: {e}")))?
+    };
+    let reason = b.reason.trim();
+    if reason.chars().count() > 1000 || reason.chars().any(|c| c.is_control() && c != '\n') {
+        return Err(ApiError::Unprocessable("The reason is at most 1000 characters of text.".into()));
+    }
+    let n = now();
+    let e = app.store.billing_events(a.id).await?.into_iter().find(|e| e.id == event).ok_or(ApiError::NotFound)?;
+    if !e.unapplied || e.provider != link_in_bio_billing::chain_payments::ID || e.kind != "purchase" {
+        return Err(ApiError::Unprocessable(
+            "Only a Chain Payments payment that arrived after its checkout was paid or closed can be refunded this way."
+                .into(),
+        ));
+    }
+    if e.created_at + REFUND_WINDOW <= n {
+        return Err(ApiError::Unprocessable("A refund can be asked for within 30 days of the payment.".into()));
+    }
+    let detail = app.store.billing_event(e.id).await?.ok_or(ApiError::NotFound)?;
+    let Some(id) = app.store.create_refund_request(e.id, a.id, reason).await? else {
+        return Err(ApiError::Conflict("A refund was already asked for this payment.".into()));
+    };
+    app.store
+        .audit(
+            &format!("account:{}", a.id),
+            "refund-requested",
+            &a.id.to_string(),
+            &json!({ "request": id, "event": e.id, "months": e.months, "amountPence": e.amount_pence,
+                     "digest": detail.evidence["digest"], "reason": reason }),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(json!({ "refundRequest": id, "status": "open", "event": e.id }))))
 }
 
 #[derive(Deserialize)]
@@ -1357,6 +1432,7 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v1/page/versions/{version}/restore", post(page_restore))
         .route("/api/v1/billing", get(billing))
         .route("/api/v1/billing/checkouts", post(checkout_create))
+        .route("/api/v1/billing/events/{id}/refund-request", post(refund_request))
         .route("/api/v1/billing/checkouts/{id}", get(checkout_get))
         .route("/api/v1/billing/checkouts/{id}/open-payments", post(open_payments_start))
         .route("/api/v1/billing/checkouts/{id}/open-payments/finish", post(open_payments_finish))

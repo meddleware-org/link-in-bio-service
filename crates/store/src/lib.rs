@@ -190,6 +190,51 @@ pub struct BillingEvent {
     pub amount_pence: i64,
     pub paid_until_after: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// A payment that arrived after its checkout was paid or closed (credited as months; refundable on request).
+    pub unapplied: bool,
+}
+
+/// One billing event with its account and evidence.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct BillingEventDetail {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub provider: String,
+    pub kind: String,
+    pub months: i32,
+    pub amount_pence: i64,
+    pub evidence: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// An account holder's request to refund an unapplied payment, with what the operator needs to send it.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct RefundRequest {
+    pub id: Uuid,
+    pub event_id: Uuid,
+    pub account_id: Uuid,
+    pub handle: String,
+    pub reason: String,
+    pub status: String,
+    pub refund_reference: Option<String>,
+    pub refund_event: Option<Uuid>,
+    pub decided_by: Option<String>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub provider: String,
+    pub months: i32,
+    pub amount_pence: i64,
+    pub evidence: Value,
+    pub paid_at: DateTime<Utc>,
+}
+
+/// A recorded refund: whose period changed, to when, and the refund's own billing event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefundDone {
+    pub account_id: Uuid,
+    pub event_id: Uuid,
+    pub months: i32,
+    pub paid_until: DateTime<Utc>,
 }
 
 /// One change to an account's paid period.
@@ -1168,6 +1213,18 @@ impl Store {
         now: DateTime<Utc>,
     ) -> Result<Option<DateTime<Utc>>, DbError> {
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
+        let applied = Self::change_period_in(&mut tx, c, now).await?;
+        tx.commit().await?;
+        Ok(applied.map(|(_, until)| until))
+    }
+
+    /// [`Store::change_period`] inside a transaction: the new event's id and `paid_until`, or `None` when the event
+    /// was already applied.
+    async fn change_period_in(
+        tx: &mut Transaction<'_, Postgres>,
+        c: &PeriodChange<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(Uuid, DateTime<Utc>)>, DbError> {
         let id = Uuid::new_v4();
         let inserted = sqlx::query(
             "INSERT INTO lib.billing_events (id, account_id, provider, provider_event, kind, months, amount_pence, evidence)
@@ -1181,7 +1238,7 @@ impl Store {
         .bind(c.months)
         .bind(c.amount_pence)
         .bind(&c.evidence)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected()
             == 1;
@@ -1198,32 +1255,157 @@ impl Store {
         .bind(c.account_id)
         .bind(span)
         .bind(now)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         sqlx::query("UPDATE lib.billing_events SET paid_until_after = $2 WHERE id = $1")
             .bind(id)
             .bind(until)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         if let Some(ch) = c.checkout {
             sqlx::query("UPDATE lib.checkouts SET status = 'paid', completed_at = $2 WHERE id = $1")
                 .bind(ch)
                 .bind(now)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
         }
-        tx.commit().await?;
-        Ok(Some(until))
+        Ok(Some((id, until)))
     }
 
     pub async fn billing_events(&self, account: Uuid) -> Result<Vec<BillingEvent>, DbError> {
         sqlx::query_as(
-            "SELECT id, provider, provider_event, kind, months, amount_pence, paid_until_after, created_at
+            "SELECT id, provider, provider_event, kind, months, amount_pence, paid_until_after, created_at,
+                    coalesce((evidence->>'unapplied')::boolean, false) AS unapplied
                FROM lib.billing_events WHERE account_id = $1 ORDER BY created_at DESC",
         )
         .bind(account)
         .fetch_all(&self.pool)
         .await
+    }
+
+    pub async fn billing_event(&self, id: Uuid) -> Result<Option<BillingEventDetail>, DbError> {
+        sqlx::query_as(
+            "SELECT id, account_id, provider, kind, months, amount_pence, evidence, created_at
+               FROM lib.billing_events WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    // ── refund requests ────────────────────────────────────────────────────
+
+    /// Records an account holder's refund request for a billing event: its id, or `None` when that event already has
+    /// one.
+    pub async fn create_refund_request(
+        &self,
+        event: Uuid,
+        account: Uuid,
+        reason: &str,
+    ) -> Result<Option<Uuid>, DbError> {
+        sqlx::query_scalar(
+            "INSERT INTO lib.refund_requests (id, event_id, account_id, reason) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (event_id) DO NOTHING RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(event)
+        .bind(account)
+        .bind(reason)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    const REFUND_SELECT: &'static str =
+        "SELECT r.id, r.event_id, r.account_id, a.handle, r.reason, r.status, r.refund_reference, r.refund_event,
+                r.decided_by, r.decided_at, r.created_at, e.provider, e.months, e.amount_pence, e.evidence,
+                e.created_at AS paid_at
+           FROM lib.refund_requests r JOIN lib.billing_events e ON e.id = r.event_id
+           JOIN lib.accounts a ON a.id = r.account_id";
+
+    /// Requests by status, oldest first (the console's queue).
+    pub async fn refund_requests(&self, status: &str, limit: i64) -> Result<Vec<RefundRequest>, DbError> {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "{} WHERE r.status = $1 ORDER BY r.created_at LIMIT $2",
+            Self::REFUND_SELECT
+        )))
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// An account's requests (what its billing view shows).
+    pub async fn refund_requests_of(&self, account: Uuid) -> Result<Vec<RefundRequest>, DbError> {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "{} WHERE r.account_id = $1 ORDER BY r.created_at DESC",
+            Self::REFUND_SELECT
+        )))
+        .bind(account)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn refund_request(&self, id: Uuid) -> Result<Option<RefundRequest>, DbError> {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!("{} WHERE r.id = $1", Self::REFUND_SELECT)))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// The operator sent the refund: records its reference and takes the payment's months back as a `refund` event,
+    /// in one transaction and once (`None` when the request is not open).
+    pub async fn record_refund(
+        &self,
+        request: Uuid,
+        reference: &str,
+        by: &str,
+        note: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<RefundDone>, DbError> {
+        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT r.account_id, r.event_id, e.provider, e.months, e.amount_pence
+               FROM lib.refund_requests r JOIN lib.billing_events e ON e.id = r.event_id
+              WHERE r.id = $1 AND r.status = 'open' FOR UPDATE OF r",
+        )
+        .bind(request)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let account_id: Uuid = row.get("account_id");
+        let original: Uuid = row.get("event_id");
+        let provider: String = row.get("provider");
+        let months: i32 = row.get("months");
+        let amount: i64 = row.get("amount_pence");
+        let event_key = format!("refund-request:{request}");
+        let change = PeriodChange {
+            account_id,
+            provider: &provider,
+            provider_event: &event_key,
+            kind: "refund",
+            months: -months,
+            amount_pence: -amount,
+            evidence: serde_json::json!({
+                "refundRequest": request, "refundOf": original, "reference": reference, "operator": by, "note": note,
+            }),
+            checkout: None,
+        };
+        let Some((event_id, paid_until)) = Self::change_period_in(&mut tx, &change, now).await? else {
+            return Ok(None);
+        };
+        sqlx::query(
+            "UPDATE lib.refund_requests SET status = 'refunded', refund_reference = $2, refund_event = $3,
+                    decided_by = $4, decided_at = $5 WHERE id = $1",
+        )
+        .bind(request)
+        .bind(reference)
+        .bind(event_id)
+        .bind(by)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(RefundDone { account_id, event_id, months, paid_until }))
     }
 
     // ── Open Payments grants ───────────────────────────────────────────────
