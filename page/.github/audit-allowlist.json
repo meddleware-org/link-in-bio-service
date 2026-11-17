@@ -1,1 +1,7 @@
-[]
+[
+  {
+    "id": "GHSA-fc5q-39xc-vjpf",
+    "reason": "picomatch has no patched release (all <= 4.0.7). It is a dev-only transitive of the page's lint tooling (stylelint > micromatch; @meddleware/frontend-config > typescript-eslint > tinyglobby), which matches the repository's own fixed glob patterns; nothing from it ships in the image or runs on a visitor's input.",
+    "expires": "2027-01-31"
+  }
+]
