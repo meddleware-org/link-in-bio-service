@@ -195,6 +195,7 @@ impl BillingProvider for ChainPayments {
         let session = data["sessionId"].as_str().ok_or_else(|| BillingError::Malformed("no sessionId".into()))?;
         let outcome = match v["event"].as_str() {
             Some("session.paid") => Outcome::Paid,
+            Some("payment.unapplied") => Outcome::Unapplied,
             // Events this adapter does not act on are acknowledged and ignored.
             _ => return Ok(Vec::new()),
         };
@@ -202,17 +203,15 @@ impl BillingProvider for ChainPayments {
             "webhook": webhook_id,
             "method": data["method"], "coinType": data["coinType"], "amount": data["amount"], "price": data["price"],
             "digest": data["digest"], "payer": data["payer"], "paidUntilMs": data["paidUntilMs"],
-            "amountPence": data["amountPence"], "units": data["units"],
+            "amountPence": data["amountPence"], "units": data["units"], "sessionStatus": data["sessionStatus"],
         });
         // A session is paid at most once, so the session is the idempotency key (the worker's reconciliation of a
         // checkout whose webhook never came uses the same key: the period is never extended twice).
-        Ok(vec![ProviderEvent {
-            event_id: paid_event_id(session),
-            provider_ref: session.to_string(),
-            outcome,
-            months: None,
-            evidence,
-        }])
+        // An unapplied payment is its own event (one session may receive several): keyed by the webhook's id, which
+        // Chain Payments keeps across delivery attempts.
+        let event_id =
+            if outcome == Outcome::Unapplied { format!("unapplied:{webhook_id}") } else { paid_event_id(session) };
+        Ok(vec![ProviderEvent { event_id, provider_ref: session.to_string(), outcome, months: None, evidence }])
     }
 
     async fn checkout_outcome(&self, provider_ref: &str) -> Result<Outcome, BillingError> {

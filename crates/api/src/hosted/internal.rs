@@ -61,6 +61,44 @@ pub async fn apply_event(app: &Shared, provider: &str, e: &ProviderEvent) -> Api
                 }
             }
         }
+        Outcome::Unapplied => {
+            // Paid on-chain after the checkout was paid or closed: credited as the months its quote was for. No money
+            // moves, so nothing here can be used to make the operator pay network fees. A refund instead is the account
+            // holder's request, sent by the operator by hand from the recipient (then recorded as a refund).
+            let mut evidence = e.evidence.clone();
+            evidence["unapplied"] = json!(true);
+            evidence["checkout"] = json!(c.id);
+            let applied = app
+                .store
+                .change_period(
+                    &PeriodChange {
+                        account_id: c.account_id,
+                        provider,
+                        provider_event: &e.event_id,
+                        kind: "purchase",
+                        months: c.months,
+                        amount_pence: c.amount_pence,
+                        evidence,
+                        checkout: None,
+                    },
+                    n,
+                )
+                .await?;
+            if let Some(until) = applied {
+                Metrics::inc(&app.metrics.payments);
+                app.store
+                    .audit(
+                        &format!("provider:{provider}"),
+                        "late-payment-credited",
+                        &c.account_id.to_string(),
+                        &json!({ "checkout": c.id, "months": c.months, "paidUntil": until, "digest": e.evidence["digest"] }),
+                    )
+                    .await?;
+                if let Some(a) = app.store.account(c.account_id).await? {
+                    app.pages.forget(&format!("{}.{}", a.handle, app.config.pages_domain)).await;
+                }
+            }
+        }
         Outcome::Refunded => {
             let months = -(e.months.unwrap_or(c.months as u32) as i32);
             app.store

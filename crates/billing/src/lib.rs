@@ -99,6 +99,9 @@ pub struct CheckoutStart {
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
     Paid,
+    /// A real payment for a checkout that was already paid or closed (Chain Payments' `payment.unapplied`). It is
+    /// credited as the months its quote was for; a refund is the buyer's request and the operator's manual act.
+    Unapplied,
     Refunded,
     Failed,
     Expired,

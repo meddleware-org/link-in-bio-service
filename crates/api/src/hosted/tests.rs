@@ -569,11 +569,29 @@ async fn wallet_signup_recovery_and_chain_payments_checkout() {
     assert_eq!(state["status"], "paid");
     let events = s.billing_events(s.account_by_handle("carol").await.unwrap().unwrap().id).await.unwrap();
     assert_eq!(events.len(), 1);
+
+    // A second payment of the same session (two tabs) arrives as payment.unapplied: credited as the quote's months,
+    // once however often it is delivered, and the checkout stays paid.
+    let late = serde_json::to_vec(&json!({ "id": uuid::Uuid::new_v4().to_string(), "event": "payment.unapplied",
+        "data": { "sessionId": "ab".repeat(16), "sessionStatus": "paid", "units": 3, "amountPence": 900, "digest": "D2", "payer": "0x2" } })).unwrap();
+    let mut m = format!("{t}.").into_bytes();
+    m.extend_from_slice(&late);
+    let late_sig = format!("t={t},ed25519={}", STANDARD.encode(kp.sign(&m)));
+    assert_eq!(send(&internal, hook(late_sig.clone(), late.clone())).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(send(&internal, hook(late_sig, late)).await.status, StatusCode::NO_CONTENT);
+    let credited = s.account_by_handle("carol").await.unwrap().unwrap().paid_until.unwrap();
+    let months = (credited - after).num_days();
+    assert!((88..=93).contains(&months), "three more months, once: {months} days");
+    let events = s.billing_events(s.account_by_handle("carol").await.unwrap().unwrap().id).await.unwrap();
+    assert_eq!(events.len(), 2);
+    let state =
+        send(&app_r, call("GET", &format!("/api/v1/billing/checkouts/{checkout}"), None, Some(&cookie))).await.json();
+    assert_eq!(state["status"], "paid");
     // Now publishing works.
     assert_eq!(send(&app_r, call("POST", "/api/v1/page/publish", None, Some(&cookie))).await.status, StatusCode::OK);
     // Metrics answer on the internal port.
     let metrics = send(&internal, Request::get("/metrics").body(Body::empty()).unwrap()).await.text();
-    assert!(metrics.contains("link_in_bio_payments_total 1"));
+    assert!(metrics.contains("link_in_bio_payments_total 2"));
     assert!(metrics.contains("link_in_bio_accounts_paid 1"));
     std::fs::remove_dir_all(dir).ok();
 }

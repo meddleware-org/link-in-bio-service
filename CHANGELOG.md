@@ -20,6 +20,8 @@
     in the console).
 
   Provider notifications arrive at `/api/v1/webhooks/<provider>`.
+- A Chain Payments payment that arrives after its checkout was paid or closed (`payment.unapplied`) is credited as the
+  months its quote was for, once. A refund instead is the account holder's request and the operator's manual act.
 - Custom domains by DNS TXT (off unless `CUSTOM_HOSTNAME_CAP` > 0); `openapi/app.json` and `openapi/admin.json`.
 
 ## 0.0.1 — 2026-11-16
