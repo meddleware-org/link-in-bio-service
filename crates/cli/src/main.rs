@@ -139,6 +139,14 @@ enum AccountAction {
         #[arg(long, env = "TERMS_VERSION")]
         terms_version: String,
     },
+    /// Let another Sui wallet sign in to one of the operator's own accounts (for example a browser wallet next to the
+    /// CLI key the account was created with). Tenants link wallets in the app, by signing with them.
+    AddWallet {
+        #[arg(long)]
+        handle: String,
+        #[arg(long)]
+        wallet: String,
+    },
 }
 
 fn now() -> u64 {
@@ -239,6 +247,33 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Migrate => runtime()?.block_on(async {
             store(1, false)?.migrate().await.map_err(|e| e.to_string())?;
             println!("schema up to date");
+            Ok(())
+        }),
+        Command::Account { action: AccountAction::AddWallet { handle, wallet } } => runtime()?.block_on(async move {
+            let store = store(1, false)?;
+            let wallet = link_in_bio_auth::wallet::canonical_address(&wallet).ok_or("--wallet is not a Sui address")?;
+            let account = store
+                .account_by_handle(&handle.trim().to_ascii_lowercase())
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("no account has that handle")?;
+            if !account.operator {
+                return Err("only the operator's own accounts take a wallet here; tenants link wallets in the app".into());
+            }
+            match store.wallet_owner(&wallet).await.map_err(|e| e.to_string())? {
+                Some(owner) if owner == account.id => {
+                    println!("{wallet} already signs in to {}", account.handle);
+                    return Ok(());
+                }
+                Some(_) => return Err("that wallet already signs in to another account".into()),
+                None => {}
+            }
+            store.add_wallet(account.id, &wallet).await.map_err(|e| e.to_string())?;
+            store
+                .audit("operator:cli", "wallet-added", &account.id.to_string(), &serde_json::json!({ "wallet": wallet }))
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("{wallet} now signs in to {}", account.handle);
             Ok(())
         }),
         Command::Account { action: AccountAction::Create { handle, wallet, terms_version } } => runtime()?.block_on(async move {
@@ -357,8 +392,15 @@ fn store(pool: u32, read_only: bool) -> Result<link_in_bio_store::Store, String>
     Ok(link_in_bio_store::Store::new(settings.lazy_pool(pool, access).map_err(|e| e.to_string())?))
 }
 
+/// The hosted settings a process reads. The page server (read-only) never takes payments and holds no provider key,
+/// so for it `BILLING_PROVIDERS` is always `manual`, whatever the shared configuration says.
+fn hosted_env(read_only: bool, get: impl Fn(&str) -> Option<String>) -> impl Fn(&str) -> Option<String> {
+    move |k: &str| if read_only && k == "BILLING_PROVIDERS" { Some("manual".into()) } else { get(k) }
+}
+
 fn hosted_app(pool: u32, read_only: bool) -> Result<hosted::Shared, String> {
-    let config = hosted::HostedConfig::from_env(|k| std::env::var(k).ok()).map_err(|e| e.to_string())?;
+    let config =
+        hosted::HostedConfig::from_env(hosted_env(read_only, |k| std::env::var(k).ok())).map_err(|e| e.to_string())?;
     let cache = std::env::var("PAGE_CACHE_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(30).clamp(1, 600);
     let app = hosted::App::new(store(pool, read_only)?, config, std::time::Duration::from_secs(cache))?;
     Ok(Arc::new(app))
@@ -380,5 +422,16 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod hosted_env_tests {
+    #[test]
+    fn the_page_server_never_reads_payment_providers() {
+        let shared = |k: &str| (k == "BILLING_PROVIDERS").then(|| "chain-payments,square".to_string());
+        assert_eq!(super::hosted_env(true, shared)("BILLING_PROVIDERS").as_deref(), Some("manual"));
+        assert_eq!(super::hosted_env(false, shared)("BILLING_PROVIDERS").as_deref(), Some("chain-payments,square"));
+        assert_eq!(super::hosted_env(true, shared)("PAGES_DOMAIN"), None);
     }
 }

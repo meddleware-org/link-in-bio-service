@@ -720,3 +720,39 @@ async fn bank_transfer_paid_by_an_imported_statement() {
     assert_eq!(send(&app_r, hook("chain-payments")).await.status, StatusCode::NOT_FOUND);
     assert_eq!(send(&app_r, hook("square")).await.status, StatusCode::NOT_FOUND, "square is not switched on here");
 }
+
+#[tokio::test]
+async fn an_operator_account_with_a_reserved_handle_is_served() {
+    // The operator's own account may use a reserved handle (created by the operator's CLI). The app publishes its page,
+    // and the page server must parse it by the same rules and serve it (2026-11-17: it re-checked the reserved list and
+    // answered 404 for a page the app had published).
+    let Some(s) = store().await else { return };
+    let a = app(s.clone(), config(&[]));
+    let app_r = super::app::router(a.clone());
+    let pages = super::pages::router(a.clone());
+    let id = uuid::Uuid::new_v4();
+    s.create_account(
+        &link_in_bio_store::NewAccount {
+            id,
+            handle: "meddleware",
+            handle_skeleton: &link_in_bio_core::limits::handle_skeleton("meddleware"),
+            terms_version: "2026-11",
+            country_declared: None,
+            billing_ref: "ref-operator-00000001",
+            operator: true,
+            draft: r#"{"schema":1,"identity":{"displayName":"meddleware","handle":"meddleware"},"items":[]}"#,
+            invite_hash: None,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    let (value, hash) = link_in_bio_auth::session::new_token();
+    s.create_session(&hash, id, chrono::Utc::now() + chrono::Duration::days(1)).await.unwrap();
+    let cookie = format!("{}={value}", link_in_bio_auth::session::COOKIE);
+    let published = send(&app_r, call("POST", "/api/v1/page/publish", None, Some(&cookie))).await;
+    assert_eq!(published.status, StatusCode::OK, "{}", published.text());
+    let page = send(&pages, page_get("meddleware.example.link", "/")).await;
+    assert_eq!(page.status, StatusCode::OK, "third-party pages are off, but this is the operator's own account");
+    assert!(page.text().contains("meddleware"));
+}

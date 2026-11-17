@@ -23,7 +23,7 @@ use link_in_bio_billing::{CheckoutRequest, Evidence, months_ahead};
 use link_in_bio_core::assets::Bundle;
 use link_in_bio_core::limits::{handle_skeleton, limits_json, looks_reserved};
 use link_in_bio_core::manifest::check_handle;
-use link_in_bio_core::{Issue, Manifest, Owner, ParseOptions};
+use link_in_bio_core::{Issue, Manifest, ParseOptions};
 use link_in_bio_store::{Account, AssetRow, Checkout, CreateError, NewAccount, sha256};
 
 use super::error::{ApiError, ApiResult};
@@ -718,8 +718,7 @@ fn page_host(app: &Shared, handle: &str) -> String {
 }
 
 fn tenant_options() -> ParseOptions {
-    // The account's own handle passed the reserved check at sign-up; the document must carry exactly that handle.
-    ParseOptions { owner: Owner::Tenant, check_reserved: false }
+    super::account_page_options()
 }
 
 /// Parses an edited document for an account: the parser's rules, plus the account's own handle and pictures.

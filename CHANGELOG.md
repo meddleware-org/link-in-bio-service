@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.3 — 2026-11-17
+
+Fixes from the first hosted deploy:
+
+- The page server parses an account's page by the same rules as the app (`hosted::account_page_options`). It used to
+  re-check the handle against the reserved list, so the operator's own account with a reserved handle published a page
+  that was then answered 404.
+- The page server never reads payment providers: `serve --mode pages` treats `BILLING_PROVIDERS` as `manual`, so it
+  needs no provider settings and holds no key (it used to refuse to start without `CHAIN_PAYMENTS_KEY_FILE`).
+- `link-in-bio account add-wallet --handle <h> --wallet <0x…>`: another Sui wallet signs in to one of the operator's own
+  accounts. Tenants link wallets in the app by signing with them; this command refuses their accounts.
+
 ## 0.0.2 — 2026-11-17
 
 - The hosted service: `serve --mode pages` (tenant pages by host, read-only database role), `serve --mode app` (the

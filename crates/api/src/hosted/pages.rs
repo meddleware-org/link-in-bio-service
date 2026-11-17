@@ -20,13 +20,12 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 use link_in_bio_assets::Avatar as Picture;
-use link_in_bio_core::Owner;
 use link_in_bio_core::manifest::Item;
 use link_in_bio_store::{AssetRow, sha256};
 
 use super::{Shared, metrics::Metrics};
 use crate::headers::{CACHE_NONE, secure};
-use crate::site::{Site, parse_options};
+use crate::site::Site;
 use crate::static_mode;
 
 /// What a host resolves to.
@@ -115,7 +114,7 @@ async fn build(app: &Shared, host: &str) -> Result<Built, link_in_bio_store::DbE
         return Ok(Built::Status(StatusCode::NOT_FOUND, "There is no page here."));
     }
     let Some(doc) = p.published else { return Ok(Built::Status(StatusCode::NOT_FOUND, "There is no page here.")) };
-    let parsed = match link_in_bio_core::parse(doc.as_bytes(), parse_options(Owner::Tenant)) {
+    let parsed = match link_in_bio_core::parse(doc.as_bytes(), super::account_page_options()) {
         Ok(p) => p,
         Err(issues) => {
             // A stored document the current parser refuses (a rule tightened after it was published): not served.

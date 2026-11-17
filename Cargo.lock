@@ -1918,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "link-in-bio"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "axum",
  "chrono",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "link-in-bio-api"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "access-gate-gateway-core",
  "axum",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "link-in-bio-assets"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "hex",
  "image",
@@ -1981,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "link-in-bio-auth"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "access-gate-gateway-core",
  "base64 0.23.1",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "link-in-bio-billing"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "link-in-bio-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "hex",
  "maud",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "link-in-bio-safety"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "axum",
  "chrono",
@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "link-in-bio-store"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "chrono",
  "serde",

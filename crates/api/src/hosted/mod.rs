@@ -166,3 +166,11 @@ impl App {
 pub fn now() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
 }
+
+/// The rules an account's page document is parsed with, by the app when it is saved and published and by the page
+/// server when it is shown (the same rules on both sides, so a page the app published is a page that is served). The
+/// handle is not checked against the reserved list here: the account's handle passed that check at sign-up (or is the
+/// operator's own, created by the operator), and the app requires the document to carry exactly that handle.
+pub fn account_page_options() -> link_in_bio_core::ParseOptions {
+    link_in_bio_core::ParseOptions { owner: link_in_bio_core::Owner::Tenant, check_reserved: false }
+}
