@@ -37,13 +37,17 @@ in the environment. Every switch starts at its safest value, and each one can on
 | `PRICE_PENCE` | `300` | the price of one month in pence (GBP) |
 | `GRACE_DAYS` | `7` | how long a page stays online after its paid period ends |
 | `CUSTOM_HOSTNAME_CAP` | `0` | custom domains allowed in total; `0` means off, with a hard stop at 100 |
-| `WEB_RISK_KEY_FILE` | unset | Google Web Risk API key; without it, screening uses the built-in checks and the lists only. Use a key for this service alone: once a project calls `computeDiff`, any `uris.search` call on it is billed (see "Screening") |
-| `WEB_RISK_MONTHLY_CAP` | `90000` | a hard cap on Web Risk calls per month over every process, `threatLists.computeDiff` and `hashes.search` together (at most 100 000) |
-| `WEB_RISK_CONFIRM_MONTHLY_CAP` | `0` | `hashes.search` calls a month, part of the cap above. It is the only billed call ($50 per 1 000, no free tier), so the default spends nothing: a link that matches a local prefix is then hidden until an operator reviews it. Each call allowed can cost $0.05 |
-| `WEB_RISK_MAX_ENTRIES` | `262144` | the most hash prefixes kept per list (`constraints.maxDatabaseEntries`, a power of two from 1024 to 1048576); about 1 MB of memory per list in the app and the worker at the default |
-| `ACCOUNT_LIMITS` | `standard` | how much one account may change its page: `standard` (30 publishes an hour, 120 new links a day) or `generous` (300 and 1 200). Each value below overrides the preset on its own; `0` means no limit |
-| `PUBLISHES_PER_ACCOUNT_HOUR` | preset | publishes per UTC hour, picture uploads counted with them. A publish that only removes or hides links is never counted or refused |
+| `WEB_RISK_KEY_FILE` | unset | Google Web Risk API key; without it, screening uses the built-in checks and the lists only. The Google project and its key must serve this service alone (see "Web Risk: two modes") |
+| `WEB_RISK_MODE` | `lookup` | `lookup` (`uris.search`, free up to 100 000 calls a month) or `update` (local hash-prefix lists; confirmations billed). Never both; see "Web Risk: two modes" before switching |
+| `WEB_RISK_MONTHLY_CAP` | `90000` | lookup: the free allowance of `uris.search` calls a month (at most 100 000); update: a hard cap on every call, `threatLists.computeDiff` and `hashes.search` together. Counted across every process |
+| `WEB_RISK_PAID_MONTHLY_CALLS` | `0` | lookup only: `uris.search` calls a month beyond the free allowance ($0.50 per 1 000), the two together a hard stop. Refused in update mode |
+| `WEB_RISK_CONFIRM_MONTHLY_CAP` | `0` | update only: `hashes.search` calls a month, part of `WEB_RISK_MONTHLY_CAP`. It is that mode's only billed call ($50 per 1 000, no free tier), so the default spends nothing and a link matching a local prefix is hidden until an operator reviews it. Each call allowed can cost $0.05. Refused in lookup mode |
+| `WEB_RISK_MAX_ENTRIES` | `262144` | update only: the most hash prefixes kept per list (`constraints.maxDatabaseEntries`, a power of two from 1024 to 1048576); about 1 MB of memory per list in the app and the worker at the default |
+| `ACCOUNT_LIMITS` | `standard` | how much one account may change its page: `standard` (30 changes an hour, 120 new links a day) or `generous` (300 and 1 200). Each value below overrides the preset on its own; `0` means no limit |
+| `CHANGES_PER_ACCOUNT_HOUR` | preset | changes per UTC hour: publishes and picture uploads, one count. A publish that only removes or hides links is never counted or refused |
 | `NEW_LINKS_PER_ACCOUNT_DAY` | preset | links an account's published page did not have before, per UTC day (what an account can make the service screen) |
+| `BANK_TRANSFER_REFUND_FEE_PENCE` | `0` | what sending one refund by bank transfer costs the operator, in pence; deducted once per refund line |
+| `OPEN_PAYMENTS_REFUND_FEE_PENCE` | `0` | what sending one refund from the operator's Open Payments wallet costs, in pence; deducted once per refund line |
 | `THREATFOX_KEY_FILE` | unset | abuse.ch Auth-Key; when set, the worker syncs the last 7 days of ThreatFox indicators every 6 hours |
 | `FEDERATION` | `on` | WebFinger, the read-only ActivityPub actor and NIP-05 on tenant pages |
 | `SUI_NETWORK` | `testnet` | the chain id in the wallet sign-in message (`sui:<network>`) |
@@ -149,10 +153,17 @@ in the environment. Every switch starts at its safest value, and each one can on
   - **A late Chain Payments payment** (one that arrived after its checkout was paid or closed, credited as months):
     whole, within 30 days.
   - **The fee share** of a refund of `k` of a purchase's `m` months is `(fixed + percent × paid) × k ÷ m`, with the
-    method's fees (`<PROVIDER>_FIXED_PENCE`, `<PROVIDER>_PERCENT_BPS`): providers keep their fee when a payment is
-    refunded. It is charged as a share of what was paid, so a purchase paid in another currency or a coin pays the
-    same share without an exchange rate. Money is counted in the unit paid; the amount is rounded down to its smallest
-    unit (each deduction up). A refund that would be 0 or less is refused, saying why.
+    method's fees as recorded on its checkout when it was made (`lib.checkouts.fee_fixed_pence`, `fee_percent_bps`;
+    for a checkout made before schema 6, the fees configured now, `<PROVIDER>_FIXED_PENCE` and
+    `<PROVIDER>_PERCENT_BPS`): providers keep their fee when a payment is refunded. Chain Payments' fee is its 0.2 %
+    (20 bps, what its package sends the platform treasury of each payment; no fixed fee, so its `min_months` stays 1 and
+    no price shown changes). It is charged as a share of what was paid, so a purchase paid in another currency or a coin
+    pays the same share without an exchange rate.
+  - **Sending costs:** what the operator pays to send a refund by bank transfer or from the Open Payments wallet
+    (`BANK_TRANSFER_REFUND_FEE_PENCE`, `OPEN_PAYMENTS_REFUND_FEE_PENCE`, default 0) is deducted once per line, as a
+    share of what was paid in its unit. A Sui transaction's gas is a fraction of a penny and is not deducted.
+  - **Rounding:** money is counted in the unit paid; the amount is rounded down to its smallest unit (each deduction
+    up). A refund that would be 0 or less is refused, saying why.
   - **Where it goes:** Square, GoCardless and Paddle are refunded in their dashboards (Paddle in the buyer's currency);
     Chain Payments in the same coin, pro rata of what was received, from the recipient to the payer; a bank transfer
     to the paying account, named from the statement when it says (`Dbtr`, `DbtrAcct`, `DbtrAgt`; bunq's counterparty);
@@ -180,30 +191,57 @@ in the environment. Every switch starts at its safest value, and each one can on
 - **Screening, in layers.**
   1. Built-in checks: IP-address hosts, unusual ports, link shorteners.
   2. The operator's blocklist and ThreatFox.
-  3. Web Risk's Update API, checked locally (below).
+  3. Web Risk, in the mode `WEB_RISK_MODE` names (below).
 
   A flagged link is hidden until an operator decides. A link that could not be checked is shown and checked again
-  within the hour. Clean links are checked again daily, locally and at no cost; unused screens are pruned as before.
-- **Web Risk, Update API** (`crates/safety/src/webrisk.rs`). The worker alone keeps the MALWARE, SOCIAL_ENGINEERING and
-  UNWANTED_SOFTWARE lists of hash prefixes in `lib.web_risk_lists` with `threatLists.computeDiff` (uncompressed answers;
-  a `RESET` replaces a list, a `DIFF` removes then adds, and the SHA-256 of the sorted result must equal the answer's
-  checksum or the diff is discarded and the next update asks for the whole list), asking again at
-  `recommendedNextDiff` (30 minutes when none is given; failures back off from 15 minutes to 8 hours). The app and the
-  worker hold the lists in memory and reload them within a minute of a change. A link is canonicalised and its host
-  and path expressions hashed as "URLs and hashing" specifies
-  (<https://cloud.google.com/web-risk/docs/urls-hashing>; its test vectors are in the tests). Only when a hash matches
-  a local prefix is that prefix sent to `hashes.search`; full hashes are cached until their `expireTime`, and a
-  prefix's absence until its `negativeExpireTime`. A match that may not be confirmed (the confirmation cap reached; 0
-  by default) is hidden until an operator reviews it and checked again daily, so a list update clears it.
-  - **Cost** (<https://cloud.google.com/web-risk/pricing>, read 2026-11-18): "Update API threatLists.computeDiff:
-    unlimited free use"; `hashes.search` "to confirm threats" is "$50.00 / 1,000 count", with no free tier; and
-    "Calling threatLists.computeDiff changes the pricing of uris.search calls to the pricing of hashes.search calls".
-    The lists and the local checks cost nothing however many links are held; only confirmations do, and
-    `WEB_RISK_CONFIRM_MONTHLY_CAP` (default 0) bounds them, inside `WEB_RISK_MONTHLY_CAP` over every call.
-  - **Privacy:** full URLs are no longer sent to Google. Only a hash prefix (typically 4 bytes) of a link that matches a
-    local list entry is, and Google answers with every full hash on its lists that starts with it.
-- **Change limits per account** (`ACCOUNT_LIMITS`, `crates/api/src/hosted/limits.rs`). Publishes (and picture uploads)
-  an hour and new links a day are counted in `lib.counters`; over a limit the answer is 429 with the limit, when it
+  within the hour. Unused screens are pruned as before.
+- **Web Risk: two modes, never both.**
+  - **Lookup** (`WEB_RISK_MODE=lookup`, the default; `uris.search`). A link is looked up when a page that adds it is
+    published. The worker looks up again, weekly, only the links a published page of an active account shows: links
+    only in a draft, hidden or removed are not rechecked (their next check moves a week on, and a publish screens them
+    again if their verdict is older than a week). Unknown links are still checked within the hour and flagged ones
+    weekly. Every call counts against the month's allowance, `WEB_RISK_MONTHLY_CAP` (the free 100 000 at most) plus
+    `WEB_RISK_PAID_MONTHLY_CALLS` (default 0; $0.50 per 1 000), a hard stop; the worker's rechecks stop at 80 % of
+    it, so the last 20 % is kept for links being published. Over the allowance a link is unknown, shown, and screened
+    by the lists. There is no per-account Web Risk cap: `NEW_LINKS_PER_ACCOUNT_DAY` bounds the lookups an account's
+    publishes make, and the links it holds (60 a page at most) its weekly rechecks. This mode never calls
+    `threatLists.computeDiff` or `hashes.search`.
+  - **Update** (`WEB_RISK_MODE=update`; `crates/safety/src/webrisk.rs`). The worker alone keeps the MALWARE,
+    SOCIAL_ENGINEERING and UNWANTED_SOFTWARE lists of hash prefixes in `lib.web_risk_lists` with
+    `threatLists.computeDiff` (uncompressed answers; a `RESET` replaces a list, a `DIFF` removes then adds, and the
+    SHA-256 of the sorted result must equal the answer's checksum or the diff is discarded and the next update asks for
+    the whole list), asking again at `recommendedNextDiff` (30 minutes when none is given; failures back off from 15
+    minutes to 8 hours). The app and the worker hold the lists in memory and reload them within a minute of a change;
+    the lists are built and loaded in this mode only. A link is canonicalised and its host and path expressions hashed
+    as "URLs and hashing" specifies (<https://cloud.google.com/web-risk/docs/urls-hashing>; its test vectors are in the
+    tests), and every link is checked again daily, locally and at no cost. Only when a hash matches a local prefix is
+    that prefix sent to `hashes.search`; full hashes are cached until their `expireTime`, and a prefix's absence until
+    its `negativeExpireTime`. A match that may not be confirmed (`WEB_RISK_CONFIRM_MONTHLY_CAP` reached; 0 by default)
+    is hidden until an operator reviews it (source `webrisk-prefix`) and checked again daily, so a list update clears
+    it. This mode never calls `uris.search`.
+  - **Cost** (<https://cloud.google.com/web-risk/pricing>, read 2026-11-18): "Lookup API uris.search: free for up to
+    100,000 calls per month", then $0.50 per 1 000; "Update API threatLists.computeDiff: unlimited free use";
+    `hashes.search` "to confirm threats" is "$50.00 / 1,000 count", with no free tier; and "Calling
+    threatLists.computeDiff changes the pricing of uris.search calls to the pricing of hashes.search calls".
+  - **The trade-off.** Lookup costs nothing up to 100 000 calls a month, but its calls grow with the links held (one per
+    link on a published page a week: about 260 a month for a full page of 60, so the default 90 000, whose rechecks
+    stop at 72 000, keeps about 275 full pages rechecked; beyond that, links wait for next month), and each lookup sends
+    Google the full URL. Update costs nothing however many links
+    are held, rechecks daily, and sends only a hash prefix, and only on a local match; but a match is either confirmed
+    at $0.05 a call or hidden until an operator reviews it, and the lists take memory (about 1 MB each at the default
+    size) and the worker's updates.
+  - **One project, one service, one mode.** The Google Cloud project and its key must serve this service alone:
+    anything else calling `uris.search` on it is repriced too once this service calls `computeDiff`. Switching from
+    update to lookup: in the month the switch is made, every lookup is billed at the `hashes.search` rate ($50 per
+    1 000), because `computeDiff` was called that month. Switch at the start of a month (after the last `computeDiff`
+    of the old month) or with a fresh project and key. Switching from lookup to update costs nothing extra.
+  - **Privacy:** in update mode full URLs are not sent to Google, only a hash prefix (typically 4 bytes) of a link that
+    matches a local list entry, and Google answers with every full hash on its lists that starts with it. In lookup
+    mode each new link, and each link on a published page weekly, is sent to Google in full.
+  - **The console's Overview** shows the mode and the month's counters: calls against the allowance (and where
+    rechecks stop) in lookup mode; calls, confirmations and the lists in update mode.
+- **Change limits per account** (`ACCOUNT_LIMITS`, `crates/api/src/hosted/limits.rs`). Changes (publishes and picture
+  uploads, one count) an hour and new links a day are counted in `lib.counters`; over a limit the answer is 429 with the limit, when it
   resets and `Retry-After`, and the draft is kept. Removing or hiding links and unpublishing are never limited: a
   publish whose only differences from the published page are links removed or hidden is always accepted.
   `NEW_LINKS_PER_ACCOUNT_DAY` is also what bounds how many links an account can make the service screen. The console's
@@ -229,7 +267,7 @@ in the environment. Every switch starts at its safest value, and each one can on
 | Handle, the 18+ declaration with the terms version and time, declared country, flags | `lib.accounts` | the account; evidence of consent; tax evidence |
 | Passkey public keys, wallet addresses, recovery code hashes, session hashes | `lib.passkeys`, `lib.wallets`, `lib.recovery_codes`, `lib.sessions` | sign-in |
 | The draft, the published document and the last 20 versions; pictures (re-encoded, metadata stripped) | `lib.pages`, `lib.page_versions`, `lib.assets` | the page |
-| Checkouts and billing events (with the countries seen at purchase) | `lib.checkouts`, `lib.billing_events` | accounting and tax records, kept after an account is deleted |
+| Checkouts and billing events (with the countries seen at purchase, and the method's fees then) | `lib.checkouts`, `lib.billing_events` | accounting and tax records, kept after an account is deleted |
 | Open Payments grants: the buyer's wallet address, the outgoing payment, and (only until it is continued) the grant's continuation | `lib.open_payments_grants` | the payment's evidence; deleted with the checkout |
 | Where each bank feed left off, and its own state (bunq's installation token and server key, a rotated Revolut refresh token) | `lib.bank_feeds` | reconciliation; never shown |
 | Refund requests and their lines: the reason given, each purchase's amount, unit and destination (a payer address, a bank account named by the statement), the refund's reference, who recorded it and when | `lib.refund_requests`, `lib.refund_lines` | accounting records, kept with the billing events |
@@ -293,8 +331,9 @@ and the worker's two-year retention goes through `lib.prune_audit_log`.
   `refund_lines`, `open_payments_grants`, `domains`, `reports`, `appeals`, `link_screens`, `blocklist`, `threat_iocs`,
   `counters`, `bank_feeds`, `web_risk_lists`.
 
-`lib.web_risk_lists` is written by the worker only (it keeps the lists); the app reads it to load them, the console to
-show their state.
+`lib.web_risk_lists` is written by the worker only, in update mode (it keeps the lists); the app reads it to load them,
+the console to show their state. In lookup mode the worker also moves the next check of due links no published page
+shows (`link_screens` U, which it has) and reads `pages` and `accounts` to tell them apart.
 
 **Writes made only for a narrow reason** (a finer grant than the table would need a column grant or a function):
 

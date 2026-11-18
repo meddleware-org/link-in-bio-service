@@ -50,18 +50,28 @@ Refunds on request, per-account change limits, and Web Risk's Update API:
   it); the operator refunds by hand and records the reference, or declines (`…/{id}/declined`). A provider's refund
   notification of exactly a line's amount closes it. A request's refund takes back exactly its months. Schema 6
   (`lib.refund_lines`; purchases name their checkout and refunds their purchase).
-- Per-account change limits (`ACCOUNT_LIMITS=standard|generous`, with `PUBLISHES_PER_ACCOUNT_HOUR` 30/300 and
+- Per-account change limits (`ACCOUNT_LIMITS=standard|generous`, with `CHANGES_PER_ACCOUNT_HOUR` 30/300 and
   `NEW_LINKS_PER_ACCOUNT_DAY` 120/1200 overridable; 0 is no limit): over a limit, 429 with the limit, its reset and
-  `Retry-After`, the draft kept. Picture uploads count with publishes. A publish that only removes or hides links, and
+  `Retry-After`, the draft kept. Changes are publishes and picture uploads, one count. A publish that only removes or hides links, and
   unpublishing, are never limited. The console's Overview shows the values in effect; `link_in_bio_limited_total`.
-- Web Risk moves from Lookup (`uris.search`) to the Update API: the worker keeps the MALWARE, SOCIAL_ENGINEERING and
-  UNWANTED_SOFTWARE hash-prefix lists in `lib.web_risk_lists` (schema 6) with `threatLists.computeDiff` (checksum
-  checked, `recommendedNextDiff` followed); the app and the worker check links locally, canonicalised and hashed as
-  "URLs and hashing" specifies. Only a local match sends a hash prefix to `hashes.search`, cached until its expiry: full
-  URLs no longer go to Google. `computeDiff` is free; `hashes.search` is billed ($50 per 1 000, no free tier), so
-  `WEB_RISK_CONFIRM_MONTHLY_CAP` (default 0) bounds it inside `WEB_RISK_MONTHLY_CAP`; an unconfirmed match is hidden
-  until an operator reviews it. `WEB_RISK_MAX_ENTRIES` (default 262 144) bounds each list. `WEB_RISK_ACCOUNT_DAILY_CAP`
-  (unreleased) is removed: `NEW_LINKS_PER_ACCOUNT_DAY` bounds what an account can make the service check.
+- Web Risk in one of two modes, `WEB_RISK_MODE=lookup|update` (default `lookup`), never both in one project:
+  - lookup (`uris.search`): new links at publish time; the worker rechecks weekly only links a published page of an
+    active account shows, and stops at 80 % of the month's allowance, keeping the rest for publishes. The allowance is
+    `WEB_RISK_MONTHLY_CAP` (the free 100 000 at most) plus `WEB_RISK_PAID_MONTHLY_CALLS` (default 0, $0.50 per 1 000), a
+    hard stop. It never calls `computeDiff` or `hashes.search`. A publish screens again any link whose verdict is due
+    or stale.
+  - update: the worker keeps the MALWARE, SOCIAL_ENGINEERING and UNWANTED_SOFTWARE hash-prefix lists in
+    `lib.web_risk_lists` (schema 6) with `threatLists.computeDiff` (checksum checked, `recommendedNextDiff` followed);
+    the app and the worker check links locally, daily, canonicalised and hashed as "URLs and hashing" specifies. Only a
+    local match sends a hash prefix to `hashes.search` (billed: $50 per 1 000, no free tier), under
+    `WEB_RISK_CONFIRM_MONTHLY_CAP` (default 0); an unconfirmed match is hidden until an operator reviews it. Full URLs
+    are not sent to Google. `WEB_RISK_MAX_ENTRIES` (default 262 144) bounds each list. It never calls `uris.search`.
+  - The console's Overview shows the mode and the month's counters. `WEB_RISK_ACCOUNT_DAILY_CAP` (unreleased) is
+    removed: `NEW_LINKS_PER_ACCOUNT_DAY` bounds what an account can make the service check.
+- Refunds: Chain Payments' `Fees` carry its 0.2 % platform fee (20 bps; no fixed fee, so no price shown and no
+  `min_months` changes), so its refunds' fee share covers it. `BANK_TRANSFER_REFUND_FEE_PENCE` and
+  `OPEN_PAYMENTS_REFUND_FEE_PENCE` (default 0) are deducted once per refund line. A checkout records its method's fees
+  when it is made (schema 6), and a refund's fee share uses those.
 - Metrics: `link_in_bio_web_risk_confirms`, `…_confirm_cap` and `…_prefixes` beside the existing call count and cap.
 
 ## 0.0.4 — 2026-11-18

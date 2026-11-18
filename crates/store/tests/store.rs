@@ -241,6 +241,8 @@ async fn open_payments_grants_are_used_once() {
         country_request: Some("GB".into()),
         created_at: now,
         completed_at: None,
+        fee_fixed_pence: None,
+        fee_percent_bps: None,
     };
     s.create_checkout(&c).await.unwrap();
     assert!(s.open_payments_grant(c.id).await.unwrap().is_none());
@@ -423,6 +425,8 @@ async fn refunds_take_months_back_pro_rata_and_never_more_than_bought() {
         country_request: None,
         created_at: now,
         completed_at: None,
+        fee_fixed_pence: None,
+        fee_percent_bps: None,
     };
     let c = uuid::Uuid::new_v4();
     s.create_checkout(&paid_checkout(c, "open")).await.unwrap();
@@ -501,6 +505,8 @@ async fn refund_lines_take_back_exactly_their_months_once() {
         country_request: None,
         created_at: now,
         completed_at: None,
+        fee_fixed_pence: None,
+        fee_percent_bps: None,
     })
     .await
     .unwrap();
@@ -529,6 +535,7 @@ async fn refund_lines_take_back_exactly_their_months_once() {
         unit: "GBP".into(),
         scale: Some(2),
         fee_minor: 13,
+        charge_minor: 0,
         used_minor: 0,
         days_used: 0,
         amount_pence: amount,

@@ -18,7 +18,8 @@ use super::error::ApiResult;
 use super::{Shared, now};
 use crate::time::rfc3339_full as ts;
 
-/// A method's fees as configured (what the providers keep when a payment is refunded).
+/// A method's fees as configured now (what the providers keep when a payment is refunded): the fallback for checkouts
+/// made before schema 6 recorded their own.
 pub fn fees_for(config: &HostedConfig, provider: &str) -> Fees {
     let none = Fees { fixed_pence: 0, percent_bps: 0 };
     match provider {
@@ -31,7 +32,17 @@ pub fn fees_for(config: &HostedConfig, provider: &str) -> Fees {
         "paddle" => {
             config.paddle.as_ref().map_or(none, |c| Fees { fixed_pence: c.fixed_pence, percent_bps: c.percent_bps })
         }
+        "chain-payments" => Fees { fixed_pence: 0, percent_bps: link_in_bio_billing::chain_payments::PLATFORM_FEE_BPS },
         _ => none,
+    }
+}
+
+/// What sending one refund costs the operator, in pence (bank transfers and Open Payments; Sui gas is negligible).
+pub fn refund_charge_for(config: &HostedConfig, provider: &str) -> u64 {
+    match provider {
+        "bank-transfer" => config.bank_transfer.as_ref().map_or(0, |c| u64::from(c.refund_fee_pence)),
+        "open-payments" => config.open_payments.as_ref().map_or(0, |c| u64::from(c.refund_fee_pence)),
+        _ => 0,
     }
 }
 
@@ -65,7 +76,14 @@ pub async fn history(app: &Shared, a: &Account) -> ApiResult<Vec<Entry>> {
                 unapplied: e.evidence["unapplied"].as_bool().unwrap_or(false),
                 amount_pence: pence,
                 received,
-                fees: fees_for(&app.config, &e.provider),
+                // The fees recorded on the checkout when it was made; the configured ones for older checkouts.
+                fees: match (e.fee_fixed_pence, e.fee_percent_bps) {
+                    (Some(f), Some(b)) => {
+                        Fees { fixed_pence: u32::try_from(f).unwrap_or(0), percent_bps: u32::try_from(b).unwrap_or(0) }
+                    }
+                    _ => fees_for(&app.config, &e.provider),
+                },
+                refund_charge_pence: refund_charge_for(&app.config, &e.provider),
                 destination: refunds::destination(&e.provider, &e.evidence, e.provider_ref.as_deref()),
                 checkout: e.checkout_id,
             }
@@ -90,7 +108,8 @@ pub fn offer_line_json(l: &Line) -> Value {
     json!({
         "purchase": l.purchase, "provider": l.provider, "months": l.months,
         "amountMinor": l.amount_minor, "amount": decimal(l.amount_minor as i64, scale), "unit": l.unit, "scale": l.scale,
-        "feeMinor": l.fee_minor, "usedMinor": l.used_minor, "daysUsed": l.days_used, "destination": l.destination,
+        "feeMinor": l.fee_minor, "chargeMinor": l.charge_minor, "usedMinor": l.used_minor, "daysUsed": l.days_used,
+        "destination": l.destination,
     })
 }
 
@@ -105,7 +124,8 @@ pub fn line_json(l: &RefundLine) -> Value {
     json!({
         "purchase": l.purchase_id, "checkout": l.checkout_id, "provider": l.provider, "months": l.months,
         "amountMinor": l.amount_minor, "amount": decimal(l.amount_minor, l.scale), "unit": l.unit, "scale": l.scale,
-        "feeMinor": l.fee_minor, "usedMinor": l.used_minor, "daysUsed": l.days_used, "amountPence": l.amount_pence,
+        "feeMinor": l.fee_minor, "chargeMinor": l.charge_minor, "usedMinor": l.used_minor, "daysUsed": l.days_used,
+        "amountPence": l.amount_pence,
         "destination": l.destination, "status": l.status, "refundReference": l.refund_reference,
         "refundEvent": l.refund_event, "refundedAt": l.refunded_at.map(ts),
         // The months its purchase still gives: a line can take back at most these.
@@ -125,6 +145,7 @@ pub fn new_lines(o: &Offer) -> Vec<NewRefundLine> {
             unit: l.unit.clone(),
             scale: l.scale.map(|s| s as i32),
             fee_minor: i64::try_from(l.fee_minor).unwrap_or(i64::MAX),
+            charge_minor: i64::try_from(l.charge_minor).unwrap_or(i64::MAX),
             used_minor: i64::try_from(l.used_minor).unwrap_or(i64::MAX),
             days_used: l.days_used as i32,
             amount_pence: l.amount_pence,

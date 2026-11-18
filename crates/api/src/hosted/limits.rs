@@ -1,5 +1,5 @@
-//! How much one account may change its page ([`AccountLimits`], `ACCOUNT_LIMITS`): publishes (and picture uploads) an
-//! hour, and links a published page did not have before, a day, counted in `lib.counters` by UTC hour and day.
+//! How much one account may change its page ([`AccountLimits`], `ACCOUNT_LIMITS`): changes (publishes and picture
+//! uploads, one shared count) an hour, and links a published page did not have before, a day, counted in `lib.counters` by UTC hour and day.
 //!
 //! Removing or hiding links and unpublishing are never limited: a publish whose only differences from the published
 //! page are links removed or hidden ([`only_removes`]) is always accepted, past every budget, so nobody is ever stuck
@@ -105,8 +105,8 @@ pub fn takes(
     now: OffsetDateTime,
 ) -> Vec<(String, String, i64, i64)> {
     let mut t = Vec::new();
-    if limits.publishes_per_hour > 0 {
-        t.push((format!("publishes:{account}"), hour(now), 1, limits.publishes_per_hour));
+    if limits.changes_per_hour > 0 {
+        t.push((format!("changes:{account}"), hour(now), 1, limits.changes_per_hour));
     }
     if limits.new_links_per_day > 0 && new_links > 0 {
         t.push((
@@ -122,13 +122,13 @@ pub fn takes(
 /// The refusal for the take at `index` of [`takes`].
 pub fn refusal(take: &(String, String, i64, i64), used: i64, now: OffsetDateTime, upload: bool) -> ApiError {
     let (name, _, by, cap) = take;
-    if name.starts_with("publishes:") {
+    if name.starts_with("changes:") {
         let (secs, when) = wait(now, next_hour(now));
-        let what = if upload { "Picture uploads count with publishes: you" } else { "You" };
+        let what = if upload { "This picture upload is refused: you" } else { "You" };
         ApiError::TooMany {
             message: format!(
-                "{what} have published or uploaded {used} times this hour, the most an account may \
-                 (PUBLISHES_PER_ACCOUNT_HOUR = {cap}). You can again from {when}. Your draft is kept; removing or \
+                "{what} have made {used} changes (publishes and picture uploads) this hour, the most an account may \
+                 (CHANGES_PER_ACCOUNT_HOUR = {cap}). You can make more from {when}. Your draft is kept; removing or \
                  hiding links, and unpublishing, are always possible."
             ),
             retry_after: secs,
@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(next_day(now), datetime!(2026-11-19 00:00 UTC));
         let limits = AccountLimits {
             preset: super::super::LimitsPreset::Standard,
-            publishes_per_hour: 30,
+            changes_per_hour: 30,
             new_links_per_day: 120,
         };
         let id = Uuid::nil();
@@ -222,12 +222,16 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert_eq!(t[1], (format!("new-links:{id}"), "2026-11-18".to_string(), 7, 120));
         assert_eq!(takes(&limits, id, 0, now).len(), 1, "no new link, nothing to take for them");
-        let off = AccountLimits { publishes_per_hour: 0, new_links_per_day: 0, ..limits };
+        let off = AccountLimits { changes_per_hour: 0, new_links_per_day: 0, ..limits };
         assert!(takes(&off, id, 7, now).is_empty(), "0 means no limit");
         match refusal(&t[0], 30, now, false) {
             ApiError::TooMany { message, retry_after } => {
                 assert_eq!(retry_after, 22 * 60 + 50);
-                assert!(message.contains("PUBLISHES_PER_ACCOUNT_HOUR = 30") && message.contains("14:00 UTC"));
+                assert!(
+                    message.contains("CHANGES_PER_ACCOUNT_HOUR = 30")
+                        && message.contains("changes (publishes and picture uploads)")
+                        && message.contains("14:00 UTC")
+                );
             }
             e => panic!("{e:?}"),
         }

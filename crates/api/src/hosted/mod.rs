@@ -33,10 +33,10 @@ use std::time::Duration;
 use link_in_bio_auth::passkey::Passkeys;
 use link_in_bio_billing::chain_payments::{self, ChainPayments};
 use link_in_bio_billing::{BillingProvider, Router as Billing, RouterConfig};
-use link_in_bio_safety::{Screener, WebRisk};
+use link_in_bio_safety::{Screener, WebRiskLookup, WebRiskUpdate};
 use link_in_bio_store::Store;
 
-pub use config::{AccountLimits, HostedConfig, Keys, LimitsPreset, SignupMode};
+pub use config::{AccountLimits, HostedConfig, Keys, LimitsPreset, SignupMode, WebRiskMode};
 pub use error::{ApiError, ApiResult};
 
 pub struct App {
@@ -163,15 +163,25 @@ impl App {
             },
             providers,
         );
-        let web_risk = match &config.web_risk_key_file {
-            Some(f) if keys && config.web_risk_monthly_cap > 0 => Some(WebRisk::new(
-                read_secret(f)?,
-                config.web_risk_monthly_cap,
-                config.web_risk_confirm_monthly_cap,
-                config.web_risk_max_entries,
-            )),
-            _ => None,
-        };
+        // One Web Risk mode, never both: the lists are built and loaded in update mode only.
+        let mut screener = Screener::default();
+        if let Some(f) = config.web_risk_key_file.as_ref().filter(|_| keys && config.web_risk_monthly_cap > 0) {
+            let key = read_secret(f)?;
+            match config.web_risk_mode {
+                config::WebRiskMode::Lookup => {
+                    screener.lookup =
+                        Some(WebRiskLookup::new(key, config.web_risk_monthly_cap, config.web_risk_paid_monthly_calls));
+                }
+                config::WebRiskMode::Update => {
+                    screener.update = Some(WebRiskUpdate::new(
+                        key,
+                        config.web_risk_monthly_cap,
+                        config.web_risk_confirm_monthly_cap,
+                        config.web_risk_max_entries,
+                    ));
+                }
+            }
+        }
         let access = config.access.as_ref().map(|a| {
             access::Admins::new(access::AccessConfig {
                 issuer: a.team_domain.clone(),
@@ -186,7 +196,7 @@ impl App {
             config,
             billing,
             passkeys,
-            screener: Screener { web_risk },
+            screener,
             metrics: metrics::Metrics::default(),
             pages: pages::PageCache::new(page_cache),
             access,

@@ -99,6 +99,9 @@ impl ChainPayments {
 }
 
 /// The ledger's event id for a paid session.
+/// What the Chain Payments package keeps of each payment for the platform treasury, in basis points (0.2 %).
+pub const PLATFORM_FEE_BPS: u32 = 20;
+
 pub fn paid_event_id(session: &str) -> String {
     format!("paid:{session}")
 }
@@ -138,8 +141,9 @@ impl BillingProvider for ChainPayments {
                 provider: ID.into(),
                 label: label.clone(),
                 seller: Seller::Operator,
-                // The payer pays the network fee; Chain Payments charges nothing.
-                fees: Fees { fixed_pence: 0, percent_bps: 0 },
+                // The payer pays the network fee; the package sends 0.2 % of the coin amount to the platform treasury
+                // (the webhook's `platformFee`), so the recipient receives 99.8 %. No fixed fee: `min_months` stays 1.
+                fees: Fees { fixed_pence: 0, percent_bps: PLATFORM_FEE_BPS },
                 recurring: false,
             })
             .collect()
@@ -206,6 +210,7 @@ impl BillingProvider for ChainPayments {
             "method": data["method"], "coinType": data["coinType"], "amount": data["amount"], "price": data["price"],
             "digest": data["digest"], "payer": data["payer"], "paidUntilMs": data["paidUntilMs"],
             "amountPence": data["amountPence"], "units": data["units"], "sessionStatus": data["sessionStatus"],
+            "platformFee": data["platformFee"],
         });
         // A session is paid at most once, so the session is the idempotency key (the worker's reconciliation of a
         // checkout whose webhook never came uses the same key: the period is never extended twice).

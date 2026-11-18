@@ -121,7 +121,8 @@ boundaries are well drawn:
 - **F27:** a card provider's payment is applied only when what it says was paid covers the checkout.
 - **F26 (OQ1, decided: refunds on request take back exactly their months, others pro rata):** refunds never take back more than the
   purchase bought.
-- **F28 (OQ2, decided):** Web Risk moved to the Update API (links checked locally, confirmations under their own cap,
+- **F28 (OQ2, decided):** Web Risk in two switchable modes (lookup, the default: weekly rechecks of published links only,
+  a 20 % reserve for publishes, a paid allowance as a hard stop; update: local lists, confirmations under their own cap,
   default 0) and per-account change limits (`NEW_LINKS_PER_ACCOUNT_DAY`); **F29:** pictures keyed per account.
 
 **Open:** none above Info but F30–F34 (each dispositioned below).
@@ -661,7 +662,10 @@ fee share is `(fixed + percent × paid) × k ÷ m`, charged as a share of what w
 amount is rounded down in the unit paid. A request's refund takes back exactly its months: with the fee netted off, the
 pro-rata rule would have left the account holder a month they were refunded for. `Store::refund_purchase`'s pro rata
 stays for refunds that match no request, counted over every refund of the purchase (`billing_events.refund_of`, schema 6).
-No process holds a key that can refund; a provider's refund notification of exactly a line's amount closes it.
+No process holds a key that can refund; a provider's refund notification of exactly a line's amount closes it. The fee
+share uses the fees recorded on the checkout when it was made (schema 6; the configured ones for older checkouts),
+Chain Payments' include its 0.2 % platform fee, and the operator's cost of sending a bank or Open Payments refund
+(`BANK_TRANSFER_REFUND_FEE_PENCE`, `OPEN_PAYMENTS_REFUND_FEE_PENCE`) is deducted once per line; Sui gas is negligible.
 Tests: the refund rules in `crates/billing/src/refunds.rs` (cancel, fee share in another currency and a coin, newest
 purchases first, the month in progress and granted months kept, 0 or less refused), `refund_lines_take_back_exactly_their_months_once`
 (store) and `refunds_on_request_net_of_fees_matched_or_recorded_exactly` (hosted).
@@ -701,28 +705,39 @@ lists only); no money is spent (the cap is hard). Latent: no Web Risk key and no
 **Remediation / evidence:** a per-account daily budget of Web Risk calls (the number is OQ2), with links beyond it recorded
 as unknown and rescreened by the worker. Tracked in FU-0141.
 
-First built as a per-account daily budget of Lookup calls; then replaced, as decided, because cost grew with the links held
-(each clean link was looked up again daily: about 1 800 calls a month for one full page, so about 50 full accounts reached
-the 90 000 cap) and the worker's rescreen was bounded per account by nothing:
+First built as a per-account daily budget of Lookup calls; then reworked, as decided, because cost grew with the links
+held (each clean link was looked up again daily: about 1 800 calls a month for one full page, so about 50 full accounts
+reached the 90 000 cap) and the worker's rescreen was bounded per account by nothing. Web Risk now runs in one of two
+modes (`WEB_RISK_MODE`), never both:
 
-- Web Risk's Update API (`crates/safety/src/webrisk.rs`). The worker alone keeps the three lists of hash prefixes in
+- **Lookup** (the default, `uris.search`): links are looked up when published and rechecked weekly, and only while a
+  published page of an active account shows them (`Store::screens_due_on_published`: draft-only, hidden and removed
+  links are deferred a week, and a publish screens again any verdict that is due or stale). The worker's rechecks stop
+  at 80 % of the month's allowance, keeping the rest for publishes; the allowance, `WEB_RISK_MONTHLY_CAP` (the free
+  100 000 at most) plus `WEB_RISK_PAID_MONTHLY_CALLS` (default 0), is a hard stop. A full page now costs about 260 calls
+  a month, not 1 800. This mode never calls `computeDiff` or `hashes.search`.
+- **Update** (`crates/safety/src/webrisk.rs`): the worker alone keeps the three lists of hash prefixes in
   `lib.web_risk_lists` with `threatLists.computeDiff` (RAW; `RESET` and `DIFF`; the SHA-256 checksum verified, a
   mismatch discarding the diff and asking for the whole list; `recommendedNextDiff` followed). The app and the worker
-  hold the lists in memory and reload them when they change. Links are canonicalised and expanded as "URLs and hashing"
-  specifies (every canonicalisation test vector of that page and its expression examples pass) and checked locally, so
-  daily rechecks cost nothing. Only a local match sends its prefix (never the URL) to `hashes.search`, cached until
-  `expireTime` / `negativeExpireTime`.
-- Pricing (<https://cloud.google.com/web-risk/pricing>, read 2026-11-18): `computeDiff` is free without limit;
-  `hashes.search` is $50 per 1 000 with no free tier, and calling `computeDiff` moves `uris.search` onto that price. So
-  `WEB_RISK_MONTHLY_CAP` stays the hard stop over every call, and `WEB_RISK_CONFIRM_MONTHLY_CAP` (default 0) bounds the
-  billed one; with it at 0, a local match is hidden until an operator reviews it (`webrisk-prefix`), checked again daily.
+  hold the lists in memory (built in this mode only) and reload them when they change. Links are canonicalised and
+  expanded as "URLs and hashing" specifies (every canonicalisation test vector of that page and its expression examples
+  pass) and checked locally, so daily rechecks cost nothing. Only a local match sends its prefix (never the URL) to
+  `hashes.search`, cached until `expireTime` / `negativeExpireTime`, under `WEB_RISK_CONFIRM_MONTHLY_CAP` (default 0);
+  an unconfirmed match is hidden until an operator reviews it (`webrisk-prefix`). This mode never calls `uris.search`.
+- Pricing (<https://cloud.google.com/web-risk/pricing>, read 2026-11-18): `uris.search` free to 100 000 a month, then
+  $0.50 per 1 000; `computeDiff` free without limit; `hashes.search` $50 per 1 000 with no free tier; and calling
+  `computeDiff` prices that month's `uris.search` calls as `hashes.search`. So the project and key serve this service
+  alone, and a switch from update to lookup is made at a month's start or with a fresh project (`docs/HOSTED.md`).
 - `WEB_RISK_ACCOUNT_DAILY_CAP` is removed: `NEW_LINKS_PER_ACCOUNT_DAY` (`ACCOUNT_LIMITS`) bounds what one account can make
-  the service check, and `PUBLISHES_PER_ACCOUNT_HOUR` how often; a publish that only removes or hides links is never
+  the service check, and `CHANGES_PER_ACCOUNT_HOUR` how often; a publish that only removes or hides links is never
   limited.
 
 Tests: `webrisk::tests::*` (the spec's vectors, expressions and hash prefixes; a reset then a diff with its checksum;
-lookups; answers read), `layers_lists_caps_and_outage` (safety, against a stand-in Update API),
-`an_account_has_change_budgets_but_can_always_remove_links` (hosted) and `limits::tests::*`.
+lookups; answers read), `layers_lists_caps_and_outage` and `lookup_mode_keeps_a_reserve_for_publishes_and_stops_at_the_paid_allowance`
+(safety, against stand-ins: lookup mode makes no `computeDiff` or `hashes.search` call),
+`lookup_mode_never_updates_lists_and_rechecks_only_links_on_published_pages` and
+`an_account_has_change_budgets_but_can_always_remove_links` (hosted), `limits::tests::*` and
+`each_web_risk_mode_takes_only_its_own_budget` (config).
 
 ### F29 — Pictures are keyed by their hash across accounts
 
@@ -813,7 +828,7 @@ nothing by themselves (an operator decides).
 | I20 | Values are bound parameters; no string-built SQL with values | `store` | inspection | HOLDS (code-only) |
 | I21 | Database transport is `verify-full` only (or an explicit local switch); secrets never in `Debug` or errors | `DatabaseSettings::parse` | config tests incl. `the_password_never_appears_in_debug_or_errors` | HOLDS |
 | I22 | Reserved and look-alike handles cannot be taken | `check_handle`, `looks_reserved`, unique `handle_skeleton` | `skeletons`; store handle test | HOLDS |
-| I23 | The screening budget never passes its monthly cap | `take_from_counter(s)`: every call monthly, `hashes.search` under its own cap; links an account can add per day (F28) | `layers_lists_caps_and_outage`, `an_account_has_change_budgets_but_can_always_remove_links` | HOLDS |
+| I23 | The screening budget never passes its monthly cap | `take_from_counter(s)`: lookup within the allowance (rechecks to 80 %), update's calls monthly and `hashes.search` under its own cap; links an account can add per day (F28) | `layers_lists_caps_and_outage`, `lookup_mode_keeps_a_reserve_for_publishes_and_stops_at_the_paid_allowance`, `an_account_has_change_budgets_but_can_always_remove_links` | HOLDS |
 | I24 | No panic on attacker input; no `unsafe` | `forbid(unsafe_code)`; no `unwrap` on request paths (OS RNG only); `overflow-checks`, `panic = "abort"` | clippy; parser property tests | HOLDS (code-only for the handlers) |
 
 ## Section B — Supply-chain, publish-authority & capability matrix
@@ -927,7 +942,7 @@ sign-in message.
 
 ## Section C — Test-coverage & hermetic/live split
 
-### C.1 Coverage grade — B+ (163 tests on stable, 28 of them against PostgreSQL over TLS)
+### C.1 Coverage grade — B+ (167 tests on stable, 30 of them against PostgreSQL over TLS)
 
 | Dimension | Assessment |
 | --- | --- |
@@ -1052,8 +1067,9 @@ Not covered by tests:
   14 days less the days used and the fee share; unstarted months later, newest purchases first), taking back exactly
   their months; other refunds pro rata, rounded down, on the running total.
 - **OQ2** — How many Web Risk calls may one account spend a day, and what happens beyond it? (F28, FU-0141) Decided
-  2026-11-18: none per account; the Update API checks links locally, `NEW_LINKS_PER_ACCOUNT_DAY` bounds what an account
-  can make the service check, and `WEB_RISK_CONFIRM_MONTHLY_CAP` (default 0, the only billed call) the confirmations.
+  2026-11-18: none per account; `NEW_LINKS_PER_ACCOUNT_DAY` bounds what an account can make the service check. Web Risk
+  runs in lookup mode (weekly rechecks of published links, a 20 % reserve for publishes, `WEB_RISK_PAID_MONTHLY_CALLS`
+  default 0) or update mode (local lists, `WEB_RISK_CONFIRM_MONTHLY_CAP` default 0), the maintainer's switch.
 
 ## Risks (residual)
 

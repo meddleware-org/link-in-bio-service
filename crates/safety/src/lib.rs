@@ -3,13 +3,18 @@
 //! 1. Built-in checks (no network): an IP address instead of a name, a port other than 443, a URL shortener (it hides
 //!    the destination; link to the destination instead).
 //! 2. The operator's blocklist and the ThreatFox indicators (CC0, synced into the database by the worker).
-//! 3. Google Web Risk's Update API ([`webrisk`]): its threat lists as local hash prefixes, kept current by the worker;
-//!    a link is checked locally, and only a match sends its hash prefix (never the URL) to Google to confirm, behind
-//!    hard monthly caps counted in the database across every process.
+//! 3. Google Web Risk, in one of two modes (`WEB_RISK_MODE`), never both:
+//!    - **lookup** ([`WebRiskLookup`], the default): `uris.search` for each new link at publish time and weekly for
+//!      links on published pages, within the free monthly allowance (and any paid calls), with the last 20 % of it
+//!      kept for publishes;
+//!    - **update** ([`WebRiskUpdate`], [`webrisk`]): the threat lists as local hash prefixes, kept current by the
+//!      worker; a link is checked locally (daily, at no cost), and only a match sends its hash prefix (never the URL)
+//!      to Google to confirm, under a cap of its own.
 //!
-//! A flagged link is hidden from the page until an operator reviews it; a link that could not be checked (the lists
-//! not loaded yet, Web Risk down) is shown and checked again within the hour. Clean links are checked again daily,
-//! locally.
+//!    Every call is counted in the database across every process, against hard monthly caps.
+//!
+//! A flagged link is hidden from the page until an operator reviews it; a link that could not be checked (Web Risk
+//! down, the allowance spent, the lists not loaded yet) is shown and checked again within the hour.
 
 pub mod webrisk;
 
@@ -141,7 +146,7 @@ pub fn builtin(link: &str) -> Option<(String, String)> {
 /// worker and held in memory here; a link is checked locally, and only a local match sends its hash prefix (never the
 /// URL) to `hashes.search`. Every call counts against `monthly_cap` (`computeDiff` and `hashes.search` together), and
 /// `hashes.search`, the only billed call, against `confirm_monthly_cap` as well.
-pub struct WebRisk {
+pub struct WebRiskUpdate {
     pub api: webrisk::UpdateApi,
     pub monthly_cap: i64,
     pub confirm_monthly_cap: i64,
@@ -162,7 +167,7 @@ struct Loaded {
 /// How often a process compares its lists with the database's.
 const RELOAD_EVERY: StdDuration = StdDuration::from_secs(60);
 
-impl WebRisk {
+impl WebRiskUpdate {
     pub fn new(key: String, monthly_cap: i64, confirm_monthly_cap: i64, max_entries: u32) -> Self {
         Self {
             api: webrisk::UpdateApi::new(key),
@@ -325,31 +330,169 @@ pub fn period(now: OffsetDateTime) -> String {
     format!("{:04}-{:02}", now.year(), now.month() as u8)
 }
 
+/// Web Risk's Lookup API (`uris.search`, the default mode): one call per link screened. `free_monthly` is the free
+/// allowance (`WEB_RISK_MONTHLY_CAP`, at most 100 000) and `paid_monthly` the calls bought on top of it
+/// (`WEB_RISK_PAID_MONTHLY_CALLS`, $0.50 per 1 000), together a hard stop. The worker's rechecks stop at 80 % of that, so
+/// the rest is kept for links being published. This mode never calls `computeDiff` or `hashes.search`: one `computeDiff`
+/// would price every `uris.search` of the month at $50 per 1 000.
+#[derive(Clone)]
+pub struct WebRiskLookup {
+    pub key: String,
+    pub endpoint: String,
+    pub http: reqwest::Client,
+    pub free_monthly: i64,
+    pub paid_monthly: i64,
+}
+
+/// The longest `uris.search` answer read (a few hundred bytes).
+const MAX_LOOKUP_BYTES: usize = 64 * 1024;
+
+/// The share of the month's allowance the worker's rechecks may use (the rest is kept for publishes).
+pub const RECHECK_SHARE_PERCENT: i64 = 80;
+
+impl WebRiskLookup {
+    pub const ENDPOINT: &'static str = "https://webrisk.googleapis.com/v1/uris:search";
+
+    pub fn new(key: String, free_monthly: i64, paid_monthly: i64) -> Self {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("link-in-bio/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(StdDuration::from_secs(3))
+            .timeout(StdDuration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        Self { key, endpoint: Self::ENDPOINT.into(), http, free_monthly, paid_monthly }
+    }
+
+    /// The month's hard stop: the free allowance and the paid calls.
+    pub fn allowance(&self) -> i64 {
+        self.free_monthly.saturating_add(self.paid_monthly)
+    }
+
+    /// Where the worker's rechecks stop: 80 % of the allowance.
+    pub fn recheck_stop(&self) -> i64 {
+        self.allowance() * RECHECK_SHARE_PERCENT / 100
+    }
+
+    /// The threat types Web Risk reports for a URL (empty: none known), or an error to retry later.
+    pub async fn lookup(&self, link: &str) -> Result<Vec<String>, String> {
+        let mut u = url::Url::parse(&self.endpoint).map_err(|_| "the Web Risk endpoint is not a URL".to_string())?;
+        u.query_pairs_mut()
+            .append_pair("threatTypes", "MALWARE")
+            .append_pair("threatTypes", "SOCIAL_ENGINEERING")
+            .append_pair("threatTypes", "UNWANTED_SOFTWARE")
+            .append_pair("uri", link)
+            .append_pair("key", &self.key);
+        let r = self.http.get(u).send().await.map_err(|e| {
+            if e.is_timeout() { "Web Risk timed out".to_string() } else { "Web Risk unreachable".to_string() }
+        })?;
+        if !r.status().is_success() {
+            return Err(format!("Web Risk answered HTTP {}", r.status().as_u16()));
+        }
+        let body = read_limited(r, MAX_LOOKUP_BYTES).await.ok_or("Web Risk answered too much or broke off")?;
+        let v: Value =
+            serde_json::from_slice(&body).map_err(|_| "Web Risk answered something unreadable".to_string())?;
+        Ok(v["threat"]["threatTypes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+            .unwrap_or_default())
+    }
+
+    /// Layer 3 for one link: `None` when a recheck must wait (the recheck share of the month is spent).
+    async fn check(&self, store: &Store, link: &str, now: OffsetDateTime, recheck: bool) -> Option<Verdict> {
+        let cap = if recheck { self.recheck_stop() } else { self.allowance() };
+        match store.take_from_counter("webrisk", &period(now), 1, cap).await {
+            Ok(true) => {}
+            Ok(false) if recheck => return None,
+            Ok(false) => return Some(Verdict::Unknown { reason: "the Web Risk monthly allowance is reached".into() }),
+            Err(_) => return Some(Verdict::Unknown { reason: "the Web Risk counter could not be read".into() }),
+        }
+        Some(match self.lookup(link).await {
+            Ok(t) if t.is_empty() => Verdict::Clean { source: "webrisk" },
+            Ok(t) => Verdict::Flagged { source: "webrisk".into(), detail: t.join(", ") },
+            Err(reason) => Verdict::Unknown { reason },
+        })
+    }
+}
+
+/// How often a clean link on a published page is looked up again in lookup mode.
+pub const RESCAN_CLEAN_LOOKUP: Duration = Duration::days(7);
+
+/// The layers, with at most one Web Risk mode (both `None`: the built-in checks and the lists only).
+#[derive(Default)]
 pub struct Screener {
-    pub web_risk: Option<WebRisk>,
+    pub lookup: Option<WebRiskLookup>,
+    pub update: Option<WebRiskUpdate>,
 }
 
 impl Screener {
-    /// Screens one link (layers 1–3), without recording anything.
-    pub async fn screen(&self, store: &Store, link: &str, now: OffsetDateTime) -> Verdict {
-        if let Some((source, detail)) = builtin(link) {
-            return Verdict::Flagged { source, detail };
-        }
-        match store.blocked(link, &hosts_of(link)).await {
-            Ok(Some((source, detail))) => return Verdict::Flagged { source, detail },
-            Ok(None) => {}
-            Err(_) => return Verdict::Unknown { reason: "the blocklist could not be read".into() },
-        }
-        if link.starts_with("mailto:") {
-            return Verdict::Clean { source: "lists" };
-        }
-        match &self.web_risk {
-            Some(w) => w.check(store, link, now).await,
-            None => Verdict::Clean { source: "lists" },
+    /// `lookup`, `update`, or `None` without Web Risk.
+    pub fn mode(&self) -> Option<&'static str> {
+        match (&self.lookup, &self.update) {
+            (Some(_), _) => Some("lookup"),
+            (None, Some(_)) => Some("update"),
+            (None, None) => None,
         }
     }
 
-    /// Screens and records the verdict (unless an operator has overridden the link).
+    /// How long a clean verdict holds before the link is checked again: a week in lookup mode (each check is a call),
+    /// a day otherwise (local).
+    pub fn clean_for(&self) -> Duration {
+        if self.lookup.is_some() { RESCAN_CLEAN_LOOKUP } else { RESCAN_CLEAN }
+    }
+
+    /// When a verdict is checked again: unknown within the hour, flagged weekly (an unconfirmed prefix match daily),
+    /// clean after [`Screener::clean_for`].
+    pub fn next_check(&self, v: &Verdict, now: OffsetDateTime) -> OffsetDateTime {
+        match v {
+            Verdict::Clean { .. } => now + self.clean_for(),
+            other => other.next_check(now),
+        }
+    }
+
+    async fn layers(&self, store: &Store, link: &str, now: OffsetDateTime, recheck: bool) -> Option<Verdict> {
+        if let Some((source, detail)) = builtin(link) {
+            return Some(Verdict::Flagged { source, detail });
+        }
+        match store.blocked(link, &hosts_of(link)).await {
+            Ok(Some((source, detail))) => return Some(Verdict::Flagged { source, detail }),
+            Ok(None) => {}
+            Err(_) => return Some(Verdict::Unknown { reason: "the blocklist could not be read".into() }),
+        }
+        if link.starts_with("mailto:") {
+            return Some(Verdict::Clean { source: "lists" });
+        }
+        match (&self.lookup, &self.update) {
+            (Some(l), _) => l.check(store, link, now, recheck).await,
+            (None, Some(u)) => Some(u.check(store, link, now).await),
+            (None, None) => Some(Verdict::Clean { source: "lists" }),
+        }
+    }
+
+    /// Screens one link being published (layers 1–3), without recording anything.
+    pub async fn screen(&self, store: &Store, link: &str, now: OffsetDateTime) -> Verdict {
+        self.layers(store, link, now, false)
+            .await
+            .unwrap_or_else(|| Verdict::Unknown { reason: "Web Risk is not available".into() })
+    }
+
+    async fn record(
+        &self,
+        store: &Store,
+        link: &str,
+        v: &Verdict,
+        now: OffsetDateTime,
+    ) -> Result<(), link_in_bio_store::DbError> {
+        let (source, detail) = match v {
+            Verdict::Clean { source } => (source.to_string(), String::new()),
+            Verdict::Flagged { source, detail } => (source.clone(), detail.clone()),
+            Verdict::Unknown { reason } => ("none".to_string(), reason.clone()),
+        };
+        store.put_screen(link, v.as_str(), &source, &detail, self.next_check(v, now), now).await
+    }
+
+    /// Screens a link being published and records the verdict (unless an operator has overridden the link).
     pub async fn screen_and_record(
         &self,
         store: &Store,
@@ -357,13 +500,21 @@ impl Screener {
         now: OffsetDateTime,
     ) -> Result<Verdict, link_in_bio_store::DbError> {
         let v = self.screen(store, link, now).await;
-        let (source, detail) = match &v {
-            Verdict::Clean { source } => (source.to_string(), String::new()),
-            Verdict::Flagged { source, detail } => (source.clone(), detail.clone()),
-            Verdict::Unknown { reason } => ("none".to_string(), reason.clone()),
-        };
-        store.put_screen(link, v.as_str(), &source, &detail, v.next_check(now), now).await?;
+        self.record(store, link, &v, now).await?;
         Ok(v)
+    }
+
+    /// The worker's recheck of a due link: screened and recorded, or `None` when rechecks must stop for now (lookup
+    /// mode, the month's recheck share spent), leaving the link as it was.
+    pub async fn recheck(
+        &self,
+        store: &Store,
+        link: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Verdict>, link_in_bio_store::DbError> {
+        let Some(v) = self.layers(store, link, now, true).await else { return Ok(None) };
+        self.record(store, link, &v, now).await?;
+        Ok(Some(v))
     }
 }
 
@@ -371,7 +522,7 @@ impl Screener {
 /// version, applies the answer and stores it only if the checksum matches. A mismatch keeps the list as it was and asks
 /// for the whole list at the next allowed time; a failure keeps it and tries again after `retry`.
 pub async fn update_list(
-    w: &WebRisk,
+    w: &WebRiskUpdate,
     store: &Store,
     threat: &str,
     now: OffsetDateTime,

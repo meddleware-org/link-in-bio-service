@@ -184,6 +184,9 @@ pub struct Checkout {
     pub country_request: Option<String>,
     pub created_at: OffsetDateTime,
     pub completed_at: Option<OffsetDateTime>,
+    /// The method's fees when the checkout was made (`None` before schema 6).
+    pub fee_fixed_pence: Option<i32>,
+    pub fee_percent_bps: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -250,6 +253,7 @@ pub struct RefundLine {
     pub unit: String,
     pub scale: Option<i32>,
     pub fee_minor: i64,
+    pub charge_minor: i64,
     pub used_minor: i64,
     pub days_used: i32,
     pub amount_pence: i64,
@@ -273,6 +277,7 @@ pub struct NewRefundLine {
     pub unit: String,
     pub scale: Option<i32>,
     pub fee_minor: i64,
+    pub charge_minor: i64,
     pub used_minor: i64,
     pub days_used: i32,
     pub amount_pence: i64,
@@ -313,6 +318,9 @@ pub struct Extension {
     pub checkout_id: Option<Uuid>,
     pub method: Option<String>,
     pub provider_ref: Option<String>,
+    /// The method's fees recorded on its checkout (`None` before schema 6).
+    pub fee_fixed_pence: Option<i32>,
+    pub fee_percent_bps: Option<i32>,
 }
 
 /// One Web Risk threat list as the worker keeps it (`prefixes`: sorted, each a length byte and its bytes).
@@ -1281,8 +1289,8 @@ impl Store {
     pub async fn create_checkout(&self, c: &Checkout) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO lib.checkouts (id, account_id, provider, provider_ref, method, months, amount_pence, status,
-                                        country_declared, country_request, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8, $9, $10)",
+                                        country_declared, country_request, created_at, fee_fixed_pence, fee_percent_bps)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8, $9, $10, $11, $12)",
         )
         .bind(c.id)
         .bind(c.account_id)
@@ -1294,6 +1302,8 @@ impl Store {
         .bind(&c.country_declared)
         .bind(&c.country_request)
         .bind(c.created_at)
+        .bind(c.fee_fixed_pence)
+        .bind(c.fee_percent_bps)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -1302,7 +1312,7 @@ impl Store {
     pub async fn checkout(&self, id: Uuid) -> Result<Option<Checkout>, DbError> {
         sqlx::query_as(
             "SELECT id, account_id, provider, provider_ref, method, months, amount_pence, status, country_declared,
-                    country_request, created_at, completed_at FROM lib.checkouts WHERE id = $1",
+                    country_request, created_at, completed_at, fee_fixed_pence, fee_percent_bps FROM lib.checkouts WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -1312,7 +1322,7 @@ impl Store {
     pub async fn checkout_by_ref(&self, provider: &str, provider_ref: &str) -> Result<Option<Checkout>, DbError> {
         sqlx::query_as(
             "SELECT id, account_id, provider, provider_ref, method, months, amount_pence, status, country_declared,
-                    country_request, created_at, completed_at FROM lib.checkouts WHERE provider = $1 AND provider_ref = $2",
+                    country_request, created_at, completed_at, fee_fixed_pence, fee_percent_bps FROM lib.checkouts WHERE provider = $1 AND provider_ref = $2",
         )
         .bind(provider)
         .bind(provider_ref)
@@ -1324,7 +1334,7 @@ impl Store {
     pub async fn stale_checkouts(&self, before: OffsetDateTime, limit: i64) -> Result<Vec<Checkout>, DbError> {
         sqlx::query_as(
             "SELECT id, account_id, provider, provider_ref, method, months, amount_pence, status, country_declared,
-                    country_request, created_at, completed_at
+                    country_request, created_at, completed_at, fee_fixed_pence, fee_percent_bps
                FROM lib.checkouts WHERE status = 'open' AND created_at < $1 ORDER BY created_at LIMIT $2",
         )
         .bind(before)
@@ -1548,7 +1558,7 @@ impl Store {
     pub async fn extensions(&self, account: Uuid) -> Result<Vec<Extension>, DbError> {
         sqlx::query_as(
             "SELECT e.id, e.provider, e.kind, e.months, e.amount_pence, e.evidence, e.created_at, e.paid_until_after,
-                    e.checkout_id, c.method, c.provider_ref,
+                    e.checkout_id, c.method, c.provider_ref, c.fee_fixed_pence, c.fee_percent_bps,
                     (e.months + coalesce((SELECT sum(r.months) FROM lib.billing_events r WHERE r.refund_of = e.id), 0))::bigint
                       AS held
                FROM lib.billing_events e LEFT JOIN lib.checkouts c ON c.id = e.checkout_id
@@ -1645,8 +1655,9 @@ impl Store {
         for l in lines {
             sqlx::query(
                 "INSERT INTO lib.refund_lines (request_id, purchase_id, checkout_id, provider, months, amount_minor, unit,
-                                               scale, fee_minor, used_minor, days_used, amount_pence, destination)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                                               scale, fee_minor, charge_minor, used_minor, days_used, amount_pence,
+                                               destination)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
             )
             .bind(id)
             .bind(l.purchase_id)
@@ -1657,6 +1668,7 @@ impl Store {
             .bind(&l.unit)
             .bind(l.scale)
             .bind(l.fee_minor)
+            .bind(l.charge_minor)
             .bind(l.used_minor)
             .bind(l.days_used)
             .bind(l.amount_pence)
@@ -1707,7 +1719,7 @@ impl Store {
 
     const LINE_SELECT: &'static str =
         "SELECT l.request_id, l.purchase_id, l.checkout_id, l.provider, l.months, l.amount_minor, l.unit, l.scale,
-                l.fee_minor, l.used_minor, l.days_used, l.amount_pence, l.destination, l.status, l.refund_reference,
+                l.fee_minor, l.charge_minor, l.used_minor, l.days_used, l.amount_pence, l.destination, l.status, l.refund_reference,
                 l.refund_event, l.refunded_at,
                 (p.months + coalesce((SELECT sum(x.months) FROM lib.billing_events x WHERE x.refund_of = p.id), 0))::bigint
                   AS held
@@ -2391,6 +2403,44 @@ impl Store {
         )
         .bind(now)
         .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Lookup mode's rechecks: the due screens of links a published page of an active account shows (not hidden), up to
+    /// `limit`, oldest first. Due screens of links no published page shows (only in drafts, removed, hidden) are not
+    /// rechecked: their next check moves to `defer_until`, and a publish screens them again if they are stale by then.
+    pub async fn screens_due_on_published(
+        &self,
+        now: OffsetDateTime,
+        limit: i64,
+        defer_until: OffsetDateTime,
+    ) -> Result<Vec<Screen>, DbError> {
+        sqlx::query_as(
+            "WITH due AS (
+                SELECT s.url_hash,
+                       EXISTS (SELECT 1 FROM lib.pages p JOIN lib.accounts a ON a.id = p.account_id AND a.status = 'active'
+                                WHERE p.published IS NOT NULL AND strpos(p.published, s.url) > 0
+                                  AND (jsonb_path_exists(p.published::jsonb,
+                                         '$.items[*] ? (@.url == $u && !(exists(@.hidden ? (@ == true))))',
+                                         jsonb_build_object('u', s.url))
+                                    OR jsonb_path_exists(p.published::jsonb,
+                                         '$.items[*].items[*] ? (@.url == $u && !(exists(@.hidden ? (@ == true))))',
+                                         jsonb_build_object('u', s.url)))) AS shown
+                  FROM lib.link_screens s
+                 WHERE s.next_check_at <= $1 AND s.overridden_by IS NULL
+                 ORDER BY s.next_check_at LIMIT $2 * 5
+             ), deferred AS (
+                UPDATE lib.link_screens l SET next_check_at = $3 FROM due WHERE l.url_hash = due.url_hash AND NOT due.shown
+                RETURNING l.url_hash
+             )
+             SELECT s.url_hash, s.url, s.verdict, s.source, s.detail, s.checked_at, s.next_check_at, s.overridden_by
+               FROM lib.link_screens s JOIN due ON due.url_hash = s.url_hash
+              WHERE due.shown ORDER BY s.next_check_at LIMIT $2",
+        )
+        .bind(now)
+        .bind(limit)
+        .bind(defer_until)
         .fetch_all(&self.pool)
         .await
     }

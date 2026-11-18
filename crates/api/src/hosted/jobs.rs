@@ -76,7 +76,8 @@ pub async fn lift_suspensions(app: &Shared) {
 /// Updates each Web Risk list that is due, then reloads this process's copy. A failure waits 15 minutes, doubling up to
 /// 8 hours (Web Risk's back-off), and keeps the lists as they were.
 pub async fn update_web_risk(app: &Shared, s: &mut Schedule) {
-    let Some(w) = &app.screener.web_risk else { return };
+    // Update mode only: in lookup mode no list is kept and `computeDiff` is never called.
+    let Some(w) = &app.screener.update else { return };
     let n = now();
     let retry = Duration::minutes(15) * 2i32.pow(s.web_risk_failures.min(5));
     let mut changed = false;
@@ -103,16 +104,28 @@ pub async fn update_web_risk(app: &Shared, s: &mut Schedule) {
     }
 }
 
+/// Screens again the links that are due. In lookup mode (each check a call) only links a published page shows are
+/// rechecked, and rechecks stop for the month at 80 % of the allowance, keeping the rest for publishes; other due links
+/// wait a week (a publish screens them again if they are stale). Otherwise every due link is checked, locally.
 pub async fn rescreen(app: &Shared, limit: i64) {
     let n = now();
-    match app.store.screens_due(n, limit).await {
+    let due = if app.screener.lookup.is_some() {
+        app.store.screens_due_on_published(n, limit, n + link_in_bio_safety::RESCAN_CLEAN_LOOKUP).await
+    } else {
+        app.store.screens_due(n, limit).await
+    };
+    match due {
         Ok(due) => {
             for s in due {
-                if let Err(e) = app.screener.screen_and_record(&app.store, &s.url, n).await {
-                    failed(app, "screening", e);
-                    return;
+                match app.screener.recheck(&app.store, &s.url, n).await {
+                    Ok(Some(_)) => Metrics::inc(&app.metrics.screenings),
+                    // The month's recheck share is spent: the rest waits for next month (or a publish).
+                    Ok(None) => return,
+                    Err(e) => {
+                        failed(app, "screening", e);
+                        return;
+                    }
                 }
-                Metrics::inc(&app.metrics.screenings);
             }
         }
         Err(e) => failed(app, "screening", e),

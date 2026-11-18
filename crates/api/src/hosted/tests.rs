@@ -1196,6 +1196,8 @@ async fn card_payments_apply_only_when_they_cover_the_checkout_and_refunds_take_
         country_request: Some("GB".into()),
         created_at: n,
         completed_at: None,
+        fee_fixed_pence: None,
+        fee_percent_bps: None,
     })
     .await
     .unwrap();
@@ -1249,10 +1251,8 @@ async fn card_payments_apply_only_when_they_cover_the_checkout_and_refunds_take_
 #[tokio::test]
 async fn an_account_has_change_budgets_but_can_always_remove_links() {
     let Some(s) = store().await else { return };
-    let a = app(
-        s.clone(),
-        config(&[("PUBLISHES_PER_ACCOUNT_HOUR", "3".into()), ("NEW_LINKS_PER_ACCOUNT_DAY", "4".into())]),
-    );
+    let a =
+        app(s.clone(), config(&[("CHANGES_PER_ACCOUNT_HOUR", "3".into()), ("NEW_LINKS_PER_ACCOUNT_DAY", "4".into())]));
     let app_r = super::app::router(a.clone());
     let (id, cookie) = account_with_session(&s, "erin").await;
     s.set_flags(id, false, true, true, &[]).await.unwrap();
@@ -1298,7 +1298,7 @@ async fn an_account_has_change_budgets_but_can_always_remove_links() {
     // A fourth publish this hour is refused; picture uploads count with publishes.
     let r = publish(&[one, three, four], "N").await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
-    assert!(r.json()["error"].as_str().unwrap().contains("PUBLISHES_PER_ACCOUNT_HOUR"), "{}", r.text());
+    assert!(r.json()["error"].as_str().unwrap().contains("CHANGES_PER_ACCOUNT_HOUR"), "{}", r.text());
     let up = Request::post("/api/v1/page/avatar")
         .header(header::HOST, "app.example.link")
         .header(header::ORIGIN, APP)
@@ -1308,7 +1308,7 @@ async fn an_account_has_change_budgets_but_can_always_remove_links() {
         .unwrap();
     let r = send(&app_r, up).await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.text());
-    assert!(r.json()["error"].as_str().unwrap().contains("Picture uploads count with publishes"));
+    assert!(r.json()["error"].as_str().unwrap().contains("changes (publishes and picture uploads)"));
     // Hiding a link, and then unpublishing, still work past every budget.
     let hidden = json!({ "schema": 1, "identity": { "displayName": "erin", "handle": "erin" }, "items": [
         { "kind": "link", "id": "one", "title": "M", "url": one },
@@ -1324,7 +1324,96 @@ async fn an_account_has_change_budgets_but_can_always_remove_links() {
     );
     // The console shows the preset and the values in effect.
     let o = send(&super::admin::router(a), admin_call("GET", "/api/v1/admin/overview", None)).await.json();
-    assert_eq!(o["accountLimits"], json!({ "preset": "standard", "publishesPerHour": 3, "newLinksPerDay": 4 }));
+    assert_eq!(o["accountLimits"], json!({ "preset": "standard", "changesPerHour": 3, "newLinksPerDay": 4 }));
+}
+
+#[tokio::test]
+async fn lookup_mode_never_updates_lists_and_rechecks_only_links_on_published_pages() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let Some(s) = store().await else { return };
+    // A Web Risk stand-in counting lookups and list updates.
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let diffs = Arc::new(AtomicUsize::new(0));
+    let (l2, d2) = (lookups.clone(), diffs.clone());
+    let stub = Router::new()
+        .route(
+            "/v1/uris:search",
+            axum::routing::get(move || {
+                let l = l2.clone();
+                async move {
+                    l.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({}))
+                }
+            }),
+        )
+        .route(
+            "/v1/threatLists:computeDiff",
+            axum::routing::get(move || {
+                let d = d2.clone();
+                async move {
+                    d.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+    let key = std::env::temp_dir().join(format!("lib-webrisk-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&key, "test-key").unwrap();
+    let c = config(&[("WEB_RISK_KEY_FILE", key.display().to_string())]);
+    assert_eq!(c.web_risk_mode, super::WebRiskMode::Lookup, "lookup is the default");
+    let mut a = App::new(s.clone(), c, Duration::from_millis(200)).unwrap();
+    assert!(a.screener.update.is_none(), "no list is built in lookup mode");
+    a.screener.lookup.as_mut().unwrap().endpoint = format!("http://{addr}/v1/uris:search");
+    let a: Shared = Arc::new(a);
+    let app_r = super::app::router(a.clone());
+
+    // A published page shows one link and hides another; a third is in the draft only.
+    let (id, cookie) = account_with_session(&s, "hana").await;
+    s.set_flags(id, false, true, true, &[]).await.unwrap();
+    let doc =
+        |items: Value| json!({ "schema": 1, "identity": { "displayName": "hana", "handle": "hana" }, "items": items });
+    let shown = json!({ "kind": "link", "id": "a", "title": "A", "url": "https://shown.example/" });
+    let hidden = json!({ "kind": "link", "id": "b", "title": "B", "url": "https://hidden.example/", "hidden": true });
+    assert_eq!(
+        send(&app_r, call("PUT", "/api/v1/page", Some(doc(json!([shown, hidden]))), Some(&cookie))).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(send(&app_r, call("POST", "/api/v1/page/publish", None, Some(&cookie))).await.status, StatusCode::OK);
+    assert_eq!(lookups.load(Ordering::SeqCst), 1, "the shown link was looked up at publish time");
+    let draft_only = json!({ "kind": "link", "id": "c", "title": "C", "url": "https://draft.example/" });
+    assert_eq!(
+        send(&app_r, call("PUT", "/api/v1/page", Some(doc(json!([shown, hidden, draft_only]))), Some(&cookie)))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    for u in ["https://hidden.example/", "https://draft.example/"] {
+        s.put_screen(u, "clean", "webrisk", "", time::OffsetDateTime::now_utc(), time::OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+    }
+    // Everything is due: the worker rechecks the shown link only, and asks for no list.
+    sqlx::query("UPDATE lib.link_screens SET next_check_at = now() - interval '1 minute'")
+        .execute(s.pool())
+        .await
+        .unwrap();
+    let mut schedule = super::jobs::Schedule::default();
+    super::jobs::update_web_risk(&a, &mut schedule).await;
+    super::jobs::rescreen(&a, 100).await;
+    assert_eq!(lookups.load(Ordering::SeqCst), 2, "one recheck: the link a published page shows");
+    assert_eq!(diffs.load(Ordering::SeqCst), 0, "no computeDiff call in lookup mode");
+    let screens = s
+        .screens(
+            &["https://shown.example/", "https://hidden.example/", "https://draft.example/"]
+                .map(|u| link_in_bio_store::sha256(u.as_bytes())),
+        )
+        .await
+        .unwrap();
+    let week = time::OffsetDateTime::now_utc() + time::Duration::days(6);
+    assert!(screens.iter().all(|x| x.next_check_at > week), "rechecked weekly, the others deferred a week");
+    let _ = std::fs::remove_file(key);
 }
 
 #[tokio::test]
@@ -1341,6 +1430,10 @@ async fn refunds_on_request_net_of_fees_matched_or_recorded_exactly() {
             ("SQUARE_LOCATION_ID", "L1".into()),
             ("SQUARE_ACCESS_TOKEN_FILE", dir.join("token").display().to_string()),
             ("SQUARE_SIGNATURE_KEY_FILE", dir.join("sig").display().to_string()),
+            // Square's fees are configured as nothing now; the checkouts recorded 25p + 1.4 % when they were made, and
+            // those are what a refund's fee share uses.
+            ("SQUARE_FIXED_PENCE", "0".into()),
+            ("SQUARE_PERCENT_BPS", "0".into()),
         ]),
     );
     let app_r = super::app::router(a.clone());
@@ -1363,6 +1456,8 @@ async fn refunds_on_request_net_of_fees_matched_or_recorded_exactly() {
                 country_request: Some("GB".into()),
                 created_at: time::OffsetDateTime::now_utc(),
                 completed_at: None,
+                fee_fixed_pence: Some(25),
+                fee_percent_bps: Some(140),
             })
             .await
             .unwrap();
@@ -1502,7 +1597,7 @@ async fn the_console_starts_without_any_key_and_shows_the_switches() {
     let c = HostedConfig::from_env_with(get, super::Keys::DisplayOnly).unwrap();
     let a = app(s, c);
     assert!(a.billing.provider("chain-payments").is_none() && a.billing.provider("square").is_none());
-    assert!(a.screener.web_risk.is_none());
+    assert!(a.screener.lookup.is_none() && a.screener.update.is_none());
     let admin = super::admin::router(a);
     let o = send(&admin, admin_call("GET", "/api/v1/admin/overview", None)).await;
     assert_eq!(o.status, StatusCode::OK, "{}", o.text());

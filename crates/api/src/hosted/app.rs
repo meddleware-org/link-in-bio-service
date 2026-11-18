@@ -823,7 +823,7 @@ async fn page_publish(State(app): State<Shared>, headers: HeaderMap) -> ApiResul
     }
     let p = app.store.page(a.id).await?.ok_or(ApiError::NotFound)?;
     let (m, _) = check_document(&app, &a, p.draft.as_bytes()).await?;
-    // The account's budgets (PUBLISHES_PER_ACCOUNT_HOUR, NEW_LINKS_PER_ACCOUNT_DAY), taken before anything is screened.
+    // The account's budgets (CHANGES_PER_ACCOUNT_HOUR, NEW_LINKS_PER_ACCOUNT_DAY), taken before anything is screened.
     // A publish that only removes or hides links is never limited.
     let published = p
         .published
@@ -836,12 +836,16 @@ async fn page_publish(State(app): State<Shared>, headers: HeaderMap) -> ApiResul
         Metrics::inc(&app.metrics.limited);
         return Err(e);
     }
-    // Screen every link not screened yet before the page goes out (at most 60 links: the parser's limit).
-    let screens = screening_of(&app, &m).await?;
-    for s in &screens {
-        if s["verdict"] == "unchecked"
-            && let Some(u) = s["url"].as_str()
-        {
+    // Screen every link not screened yet, due, or stale before the page goes out (at most 60 links: the parser's
+    // limit). Stale: older than a clean verdict holds (lookup mode's rechecks skip links no published page shows).
+    let urls: Vec<String> = m.visible_links().map(|l| l.url.clone()).collect();
+    let hashes: Vec<Vec<u8>> = urls.iter().map(|u| sha256(u.as_bytes())).collect();
+    let known = app.store.screens(&hashes).await?;
+    for u in &urls {
+        let fresh = known.iter().find(|s| &s.url == u).is_some_and(|s| {
+            s.overridden_by.is_some() || (s.next_check_at > n && s.checked_at + app.screener.clean_for() > n)
+        });
+        if !fresh {
             app.screener.screen_and_record(&app.store, u, n).await?;
             Metrics::inc(&app.metrics.screenings);
         }
@@ -892,7 +896,7 @@ async fn page_restore(
 
 async fn avatar_upload(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
     let a = account(&app, &headers).await?;
-    // Uploads count with publishes (PUBLISHES_PER_ACCOUNT_HOUR), taken before the picture is decoded.
+    // Uploads are changes too (CHANGES_PER_ACCOUNT_HOUR, one count with publishes), taken before the picture is decoded.
     if let Err(e) = super::limits::take(&app, a.id, 0, true, now()).await {
         Metrics::inc(&app.metrics.limited);
         return Err(e);
@@ -1251,6 +1255,9 @@ async fn checkout_create(
             country_request: ev.request,
             created_at: n,
             completed_at: None,
+            // The method's fees now: a refund's fee share uses these, whatever is configured later.
+            fee_fixed_pence: Some(offer.method.fees.fixed_pence as i32),
+            fee_percent_bps: Some(offer.method.fees.percent_bps as i32),
         })
         .await?;
     Metrics::inc(&app.metrics.checkouts);

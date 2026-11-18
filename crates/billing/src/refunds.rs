@@ -11,7 +11,10 @@
 //!   comes back whole within [`UNAPPLIED_WINDOW`] (the buyer never meant to buy those months).
 //!
 //! The fee share of a refund of `k` of a purchase's `m` months is `(fixed + percent × paid) × k ÷ m`, with the method's
-//! [`Fees`] (providers keep their fee when a payment is refunded). Money is counted in the unit the purchase was paid in
+//! [`Fees`] as recorded on its checkout (providers keep their fee when a payment is refunded; Chain Payments' 0.2 % stays
+//! with the platform treasury). What the operator pays to send a refund (a bank transfer's or a wallet's outgoing
+//! charge, [`Entry::refund_charge_pence`]) is deducted once per line; a Sui transaction's gas is negligible and not
+//! charged. Money is counted in the unit the purchase was paid in
 //! (pence, cents, a coin's smallest unit), so a refund carries no exchange-rate exposure: the gross is rounded down and
 //! each deduction up, so a refund is never more than its exact value. A refund that would be 0 or less is refused.
 
@@ -64,6 +67,9 @@ pub struct Entry {
     /// What was received; `None` when the ledger does not say (such a purchase cannot be refunded on request).
     pub received: Option<Received>,
     pub fees: Fees,
+    /// What sending a refund of this purchase costs the operator, in pence, once per line
+    /// (`BANK_TRANSFER_REFUND_FEE_PENCE`, `OPEN_PAYMENTS_REFUND_FEE_PENCE`).
+    pub refund_charge_pence: u64,
     /// Where a refund goes (provider payment, payer address, the debtor's account), for the operator.
     pub destination: Value,
     pub checkout: Option<Uuid>,
@@ -100,8 +106,9 @@ pub struct Line {
     pub amount_minor: u64,
     pub unit: String,
     pub scale: Option<u32>,
-    /// The deductions, in the same unit: the fee share and the days used.
+    /// The deductions, in the same unit: the fee share, the outgoing charge and the days used.
     pub fee_minor: u64,
+    pub charge_minor: u64,
     pub used_minor: u64,
     pub days_used: u32,
     /// The refund's value in pence, for the ledger.
@@ -163,9 +170,20 @@ fn line(e: &Entry, k: u32, d: u32, with_fee: bool) -> Result<Line, Refusal> {
     };
     let fees = if with_fee { e.fees } else { Fees { fixed_pence: 0, percent_bps: 0 } };
     let (gross, fee, used) = parts(r.minor, e.months, k, d, e.amount_pence, fees)?;
-    let net = gross.saturating_sub(fee).saturating_sub(used);
+    // The outgoing charge, in pence, as a share of what was paid in its unit (rounded up), once for the line.
+    let charge = match (e.refund_charge_pence, e.amount_pence) {
+        (0, _) => 0,
+        (_, 0) => {
+            return refuse("This purchase's amount is not on record, so the refund's charge cannot be worked out.");
+        }
+        (c, a) => u64::try_from(ceil_div(u128::from(r.minor) * u128::from(c), u128::from(a))).unwrap_or(u64::MAX),
+    };
+    let net = gross.saturating_sub(fee).saturating_sub(used).saturating_sub(charge);
     if net == 0 {
-        return refuse("After the days already used and the payment provider's fee, nothing would be left to refund.");
+        return refuse(
+            "After the days already used, the payment provider's fee and the cost of sending it, nothing would be left \
+             to refund.",
+        );
     }
     let pence =
         if r.minor == 0 { 0 } else { (u128::from(e.amount_pence) * u128::from(net) / u128::from(r.minor)) as i64 };
@@ -178,6 +196,7 @@ fn line(e: &Entry, k: u32, d: u32, with_fee: bool) -> Result<Line, Refusal> {
         unit: r.unit.clone(),
         scale: r.scale,
         fee_minor: fee,
+        charge_minor: charge,
         used_minor: used,
         days_used: d,
         amount_pence: pence,
@@ -404,6 +423,7 @@ mod tests {
             amount_pence: pence,
             received: Some(Received { minor: pence, unit: "GBP".into(), scale: Some(2) }),
             fees,
+            refund_charge_pence: 0,
             destination: json!({}),
             checkout: Some(Uuid::new_v4()),
         }
@@ -521,6 +541,26 @@ mod tests {
         let l = &cancel(&e, NOW).unwrap().lines[0];
         // ceil(4100 × 2.20/36) = ceil(250.55) = 251; one day of €41/12/30 = 11.38 → 12.
         assert_eq!((l.unit.as_str(), l.fee_minor, l.used_minor, l.amount_minor), ("EUR", 251, 12, 4100 - 251 - 12));
+    }
+
+    #[test]
+    fn chain_payments_fee_share_is_its_platform_fee_and_bank_refunds_carry_their_charge() {
+        // 0.2 % of 7.5 SUI stays with the platform treasury: the recipient received 99.8 %, and that comes back.
+        let mut e = purchase(6, 1800, NOW - Duration::days(1), NOW + MONTH, Fees { fixed_pence: 0, percent_bps: 20 });
+        e.provider = "chain-payments".into();
+        e.received = received("chain-payments", &json!({ "coinType": "0x2::sui::SUI", "amount": "7500000000" }), 1800);
+        let l = &cancel(&e, NOW).unwrap().lines[0];
+        assert_eq!((l.fee_minor, l.amount_minor), (15_000_000, 7_485_000_000));
+        // A SEPA refund costing the operator 30p, once, as a share of what was paid (€3.50 for £3): ceil(350 × 30/300).
+        let mut b = purchase(1, 300, NOW - Duration::days(1), NOW + MONTH, NONE);
+        b.provider = "bank-transfer".into();
+        b.received = received("bank-transfer", &json!({ "amountMinor": 350, "currency": "EUR" }), 300);
+        b.refund_charge_pence = 30;
+        let l = &cancel(&b, NOW).unwrap().lines[0];
+        assert_eq!((l.charge_minor, l.amount_minor), (35, 315));
+        // A charge larger than what would come back: refused.
+        b.refund_charge_pence = 400;
+        assert!(cancel(&b, NOW).unwrap_err().0.contains("nothing would be left"));
     }
 
     #[test]

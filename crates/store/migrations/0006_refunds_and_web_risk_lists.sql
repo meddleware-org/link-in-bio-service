@@ -2,6 +2,11 @@
 --
 -- Refunds on request, and Web Risk's Update API lists.
 
+-- The method's fees when the checkout was made (a refund's fee share uses these, not whatever is configured later);
+-- NULL on checkouts made before schema 6.
+ALTER TABLE lib.checkouts ADD COLUMN fee_fixed_pence integer CHECK (fee_fixed_pence >= 0);
+ALTER TABLE lib.checkouts ADD COLUMN fee_percent_bps integer CHECK (fee_percent_bps >= 0);
+
 -- Which checkout a purchase paid, and which purchase a refund took months back from, so what a purchase still gives
 -- is its months plus those of the refunds of it.
 ALTER TABLE lib.billing_events ADD COLUMN checkout_id uuid REFERENCES lib.checkouts (id);
@@ -41,6 +46,8 @@ CREATE TABLE lib.refund_lines (
   unit              text NOT NULL CHECK (length(unit) BETWEEN 1 AND 200),
   scale             integer CHECK (scale BETWEEN 0 AND 18),
   fee_minor         bigint NOT NULL DEFAULT 0 CHECK (fee_minor >= 0),
+  -- What the operator pays to send it (a bank transfer's or a wallet's outgoing charge), once per line.
+  charge_minor      bigint NOT NULL DEFAULT 0 CHECK (charge_minor >= 0),
   used_minor        bigint NOT NULL DEFAULT 0 CHECK (used_minor >= 0),
   days_used         integer NOT NULL DEFAULT 0 CHECK (days_used >= 0),
   amount_pence      bigint NOT NULL DEFAULT 0,

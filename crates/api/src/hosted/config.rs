@@ -58,8 +58,13 @@ pub struct HostedConfig {
     /// Custom domains allowed in total (0 = custom domains off). Hard stop at 100.
     pub custom_hostname_cap: i64,
     pub web_risk_key_file: Option<String>,
-    /// Web Risk calls a month over every process, `threatLists.computeDiff` and `hashes.search` together.
+    /// Which Web Risk API screens links ([`WebRiskMode`]).
+    pub web_risk_mode: WebRiskMode,
+    /// Web Risk calls a month over every process. Lookup: the free allowance of `uris.search` (at most 100 000).
+    /// Update: `threatLists.computeDiff` and `hashes.search` together.
     pub web_risk_monthly_cap: i64,
+    /// Lookup only: `uris.search` calls a month beyond the free allowance ($0.50 per 1 000), a hard stop; 0 by default.
+    pub web_risk_paid_monthly_calls: i64,
     /// `hashes.search` calls a month (the billed call: $50 per 1 000, no free tier); 0 means none, so a local prefix
     /// match is hidden until an operator reviews it.
     pub web_risk_confirm_monthly_cap: i64,
@@ -85,14 +90,26 @@ pub struct HostedConfig {
     pub access: Option<AccessEnv>,
 }
 
+/// Which Web Risk API screens links. Never both in one Google project: once a project calls `threatLists.computeDiff`,
+/// its `uris.search` calls are priced as `hashes.search` ($50 per 1 000) for the month.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebRiskMode {
+    /// `uris.search` for each new link and weekly for links on published pages, within the free allowance (and any
+    /// paid calls). The default.
+    Lookup,
+    /// Local hash-prefix lists (`threatLists.computeDiff`, free) checked daily; `hashes.search` only to confirm a match.
+    Update,
+}
+
 /// How much one account may change its page, from a preset (`ACCOUNT_LIMITS=standard|generous`) with each value
 /// overridable on its own; 0 means no limit. Removing or hiding links and unpublishing are never limited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountLimits {
     pub preset: LimitsPreset,
-    /// Publishes an hour (`PUBLISHES_PER_ACCOUNT_HOUR`), picture uploads counted with them.
-    pub publishes_per_hour: i64,
+    /// Changes an hour (`CHANGES_PER_ACCOUNT_HOUR`): publishes and picture uploads, counted together.
+    pub changes_per_hour: i64,
     /// Links a published page did not have before, a day (`NEW_LINKS_PER_ACCOUNT_DAY`).
     pub new_links_per_day: i64,
 }
@@ -105,7 +122,7 @@ pub enum LimitsPreset {
 }
 
 impl LimitsPreset {
-    /// `(publishes an hour, new links a day)`: standard is 30 and 120 (two full pages), generous ten times that.
+    /// `(changes an hour, new links a day)`: standard is 30 and 120 (two full pages), generous ten times that.
     pub fn values(self) -> (i64, i64) {
         match self {
             LimitsPreset::Standard => (30, 120),
@@ -148,6 +165,8 @@ pub struct PaddleEnv {
 pub struct BankTransferEnv {
     pub payee: String,
     pub scheme: link_in_bio_billing::bank_transfer::Scheme,
+    /// What sending one refund by bank transfer costs the operator, in pence (`BANK_TRANSFER_REFUND_FEE_PENCE`).
+    pub refund_fee_pence: u32,
 }
 
 /// One bank feed's settings (keys and tokens are files; the API bases default to each bank's sandbox).
@@ -168,6 +187,8 @@ pub struct OpenPaymentsEnv {
     pub asset_code: String,
     pub asset_scale: u8,
     pub minor_per_month: Option<u64>,
+    /// What sending one refund from the operator's wallet costs, in pence (`OPEN_PAYMENTS_REFUND_FEE_PENCE`).
+    pub refund_fee_pence: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -375,7 +396,11 @@ impl HostedConfig {
                     ));
                 }
             };
-            Some(BankTransferEnv { payee: need("BANK_TRANSFER_PAYEE")?, scheme })
+            Some(BankTransferEnv {
+                payee: need("BANK_TRANSFER_PAYEE")?,
+                scheme,
+                refund_fee_pence: number(&get, "BANK_TRANSFER_REFUND_FEE_PENCE", 0u32, 0, 10_000)?,
+            })
         } else {
             None
         };
@@ -395,6 +420,7 @@ impl HostedConfig {
                 asset_code: get("OPEN_PAYMENTS_ASSET_CODE").unwrap_or_else(|| "GBP".into()).trim().to_string(),
                 asset_scale: number(&get, "OPEN_PAYMENTS_ASSET_SCALE", 2u8, 0, 18)?,
                 minor_per_month,
+                refund_fee_pence: number(&get, "OPEN_PAYMENTS_REFUND_FEE_PENCE", 0u32, 0, 10_000)?,
             })
         } else {
             None
@@ -471,8 +497,28 @@ impl HostedConfig {
             None => serde_json::from_value(serde_json::json!({ "baseUrl": format!("https://{pages_domain}/") }))
                 .map_err(|e| HostedConfigError::Invalid("SITE_CONFIG", e.to_string()))?,
         };
+        let web_risk_mode = match get("WEB_RISK_MODE").as_deref().map(str::trim) {
+            None | Some("") | Some("lookup") => WebRiskMode::Lookup,
+            Some("update") => WebRiskMode::Update,
+            Some(o) => return Err(HostedConfigError::Invalid("WEB_RISK_MODE", format!("{o} is not lookup or update"))),
+        };
         let web_risk_monthly_cap = number(&get, "WEB_RISK_MONTHLY_CAP", 90_000i64, 0, 100_000)?;
+        let web_risk_paid_monthly_calls = number(&get, "WEB_RISK_PAID_MONTHLY_CALLS", 0i64, 0, 9_900_000)?;
         let web_risk_confirm_monthly_cap = number(&get, "WEB_RISK_CONFIRM_MONTHLY_CAP", 0i64, 0, 100_000)?;
+        // Each mode's own budget only: a value meant for the other mode would not do what it says.
+        if web_risk_mode == WebRiskMode::Update && web_risk_paid_monthly_calls > 0 {
+            return Err(HostedConfigError::Invalid(
+                "WEB_RISK_PAID_MONTHLY_CALLS",
+                "applies to WEB_RISK_MODE=lookup only (update mode bills hashes.search: WEB_RISK_CONFIRM_MONTHLY_CAP)"
+                    .into(),
+            ));
+        }
+        if web_risk_mode == WebRiskMode::Lookup && web_risk_confirm_monthly_cap > 0 {
+            return Err(HostedConfigError::Invalid(
+                "WEB_RISK_CONFIRM_MONTHLY_CAP",
+                "applies to WEB_RISK_MODE=update only (lookup mode never calls hashes.search)".into(),
+            ));
+        }
         if web_risk_confirm_monthly_cap > web_risk_monthly_cap {
             return Err(HostedConfigError::Invalid(
                 "WEB_RISK_CONFIRM_MONTHLY_CAP",
@@ -496,7 +542,7 @@ impl HostedConfig {
         let (publishes, new_links) = preset.values();
         let account_limits = AccountLimits {
             preset,
-            publishes_per_hour: number(&get, "PUBLISHES_PER_ACCOUNT_HOUR", publishes, 0, 100_000)?,
+            changes_per_hour: number(&get, "CHANGES_PER_ACCOUNT_HOUR", publishes, 0, 100_000)?,
             new_links_per_day: number(&get, "NEW_LINKS_PER_ACCOUNT_DAY", new_links, 0, 1_000_000)?,
         };
         let custom_hostname_cap = number(&get, "CUSTOM_HOSTNAME_CAP", 0i64, 0, 100)?;
@@ -515,7 +561,9 @@ impl HostedConfig {
             billing_countries,
             custom_hostname_cap,
             web_risk_key_file: key_opt("WEB_RISK_KEY_FILE"),
+            web_risk_mode,
             web_risk_monthly_cap,
+            web_risk_paid_monthly_calls,
             web_risk_confirm_monthly_cap,
             web_risk_max_entries,
             account_limits,
@@ -576,9 +624,10 @@ mod tests {
         assert_eq!(c.custom_hostname_cap, 0);
         assert!(c.bank_feeds.is_empty() && c.open_payments.is_none());
         assert_eq!(c.web_risk_confirm_monthly_cap, 0, "no billed Web Risk call unless asked for");
+        assert_eq!((c.web_risk_mode, c.web_risk_paid_monthly_calls), (WebRiskMode::Lookup, 0));
         assert_eq!(
             c.account_limits,
-            AccountLimits { preset: LimitsPreset::Standard, publishes_per_hour: 30, new_links_per_day: 120 }
+            AccountLimits { preset: LimitsPreset::Standard, changes_per_hour: 30, new_links_per_day: 120 }
         );
         assert!(!c.signup_open_to_public());
         assert_eq!(c.handle_of_host("alice.example.link"), Some("alice"));
@@ -649,7 +698,8 @@ mod tests {
         assert!(with(("BANK_FEEDS", "wise")).is_err(), "bank feeds need bank transfer");
         assert!(with(("CUSTOM_HOSTNAME_CAP", "101")).is_err(), "hard stop at 100");
         assert!(with(("WEB_RISK_MONTHLY_CAP", "100001")).is_err(), "a hard stop at 100 000");
-        assert!(with(("WEB_RISK_CONFIRM_MONTHLY_CAP", "100")).is_ok());
+        assert!(with(("WEB_RISK_CONFIRM_MONTHLY_CAP", "100")).is_err(), "lookup mode never confirms");
+        assert!(with(("WEB_RISK_MODE", "both")).is_err());
         assert!(with(("WEB_RISK_MONTHLY_CAP", "50")).is_ok());
         assert!(with(("WEB_RISK_MAX_ENTRIES", "300000")).is_err(), "a power of two");
         assert!(with(("ACCOUNT_LIMITS", "unlimited")).is_err());
@@ -678,12 +728,31 @@ mod tests {
             HostedConfig::from_env(env(&v)).unwrap().account_limits
         };
         let g = limits(&[("ACCOUNT_LIMITS", "generous")]);
-        assert_eq!((g.publishes_per_hour, g.new_links_per_day), (300, 1200));
+        assert_eq!((g.changes_per_hour, g.new_links_per_day), (300, 1200));
         let o = limits(&[("ACCOUNT_LIMITS", "generous"), ("NEW_LINKS_PER_ACCOUNT_DAY", "0")]);
-        assert_eq!((o.preset, o.publishes_per_hour, o.new_links_per_day), (LimitsPreset::Generous, 300, 0));
-        assert_eq!(limits(&[("PUBLISHES_PER_ACCOUNT_HOUR", "5")]).publishes_per_hour, 5);
+        assert_eq!((o.preset, o.changes_per_hour, o.new_links_per_day), (LimitsPreset::Generous, 300, 0));
+        assert_eq!(limits(&[("CHANGES_PER_ACCOUNT_HOUR", "5")]).changes_per_hour, 5);
         let mut both = base.to_vec();
         both.extend([("WEB_RISK_MONTHLY_CAP", "10"), ("WEB_RISK_CONFIRM_MONTHLY_CAP", "11")]);
         assert!(HostedConfig::from_env(env(&both)).is_err(), "confirmations are part of the monthly cap");
+    }
+
+    #[test]
+    fn each_web_risk_mode_takes_only_its_own_budget() {
+        let base = [("PAGES_DOMAIN", "example.link"), ("APP_HOST", "app.example.link")];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut v = base.to_vec();
+            v.extend_from_slice(extra);
+            HostedConfig::from_env(env(&v))
+        };
+        let l = with(&[("WEB_RISK_PAID_MONTHLY_CALLS", "20000")]).unwrap();
+        assert_eq!(
+            (l.web_risk_mode, l.web_risk_monthly_cap, l.web_risk_paid_monthly_calls),
+            (WebRiskMode::Lookup, 90_000, 20_000)
+        );
+        let u = with(&[("WEB_RISK_MODE", "update"), ("WEB_RISK_CONFIRM_MONTHLY_CAP", "50")]).unwrap();
+        assert_eq!((u.web_risk_mode, u.web_risk_confirm_monthly_cap), (WebRiskMode::Update, 50));
+        assert!(with(&[("WEB_RISK_MODE", "update"), ("WEB_RISK_PAID_MONTHLY_CALLS", "1")]).is_err());
+        assert!(with(&[("WEB_RISK_MONTHLY_CAP", "100001")]).is_err(), "the free allowance is 100 000");
     }
 }

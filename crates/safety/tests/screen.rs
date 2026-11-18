@@ -5,7 +5,7 @@
 use axum::Router;
 use axum::extract::Query;
 use axum::routing::get;
-use link_in_bio_safety::{Screener, UpdateOutcome, Verdict, WebRisk, period};
+use link_in_bio_safety::{Screener, UpdateOutcome, Verdict, WebRiskLookup, WebRiskUpdate, period};
 use link_in_bio_store::Store;
 use link_in_bio_store::config::{Access, DatabaseSettings};
 use serde_json::json;
@@ -113,10 +113,10 @@ async fn layers_lists_caps_and_outage() {
     let Some(s) = store().await else { return };
     let now = OffsetDateTime::now_utc();
     // Ten calls a month in all, two of them confirmations.
-    let mut w = WebRisk::new("test-key".into(), 10, 2, 1024);
+    let mut w = WebRiskUpdate::new("test-key".into(), 10, 2, 1024);
     w.api.base = web_risk().await;
-    let screener = Screener { web_risk: Some(w) };
-    let w = screener.web_risk.as_ref().unwrap();
+    let screener = Screener { lookup: None, update: Some(w) };
+    let w = screener.update.as_ref().unwrap();
 
     // Layer 1 and the blocklist answer without Web Risk.
     assert!(matches!(screener.screen(&s, "https://bit.ly/x", now).await, Verdict::Flagged { .. }));
@@ -168,4 +168,100 @@ async fn layers_lists_caps_and_outage() {
     assert!(matches!(&r, UpdateOutcome::Failed(e) if e.contains("checksum")), "{r:?}");
     let l = s.web_risk_list("MALWARE").await.unwrap().unwrap();
     assert_eq!((l.entries, l.version_token.as_str()), (3, ""), "kept, and a full list next time");
+}
+
+/// Lookup API stand-in that counts what each endpoint is asked: `phish.example` is SOCIAL_ENGINEERING, `down.example`
+/// answers 503, anything else is clean. `computeDiff` and `hashes.search` are counted so a test can show they are never
+/// called in lookup mode.
+async fn lookup_stand_in() -> (String, std::sync::Arc<[std::sync::atomic::AtomicUsize; 3]>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = std::sync::Arc::new([AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let (h0, h1, h2) = (hits.clone(), hits.clone(), hits.clone());
+    let app = Router::new()
+        .route(
+            "/v1/uris:search",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let h = h0.clone();
+                async move {
+                    h[0].fetch_add(1, Ordering::SeqCst);
+                    let uri = q.get("uri").cloned().unwrap_or_default();
+                    if uri.contains("down.example") {
+                        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({})));
+                    }
+                    let body = if uri.contains("phish.example") {
+                        json!({ "threat": { "threatTypes": ["SOCIAL_ENGINEERING"], "expireTime": "2099-01-01T00:00:00Z" } })
+                    } else {
+                        json!({})
+                    };
+                    (axum::http::StatusCode::OK, axum::Json(body))
+                }
+            }),
+        )
+        .route(
+            "/v1/threatLists:computeDiff",
+            get(move || {
+                let h = h1.clone();
+                async move {
+                    h[1].fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({}))
+                }
+            }),
+        )
+        .route(
+            "/v1/hashes:search",
+            get(move || {
+                let h = h2.clone();
+                async move {
+                    h[2].fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({}))
+                }
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (format!("http://{addr}/v1"), hits)
+}
+
+#[tokio::test]
+async fn lookup_mode_keeps_a_reserve_for_publishes_and_stops_at_the_paid_allowance() {
+    use std::sync::atomic::Ordering;
+    let Some(s) = store().await else { return };
+    let now = OffsetDateTime::now_utc();
+    let (base, hits) = lookup_stand_in().await;
+    // A free allowance of 10 and 2 paid calls: a hard stop at 12; rechecks stop at 80 % of it, 9.
+    let mut l = WebRiskLookup::new("test-key".into(), 10, 2);
+    l.endpoint = format!("{base}/uris:search");
+    assert_eq!((l.allowance(), l.recheck_stop()), (12, 9));
+    let screener = Screener { lookup: Some(l), update: None };
+    assert_eq!(screener.mode(), Some("lookup"));
+
+    // Publish time: one call per link.
+    let v = screener.screen_and_record(&s, "https://phish.example/login", now).await.unwrap();
+    assert!(matches!(&v, Verdict::Flagged { detail, .. } if detail == "SOCIAL_ENGINEERING"));
+    assert_eq!(screener.screen(&s, "https://fine.example/", now).await, Verdict::Clean { source: "webrisk" });
+    // A clean verdict holds a week in this mode (each check is a call).
+    assert_eq!(screener.next_check(&Verdict::Clean { source: "webrisk" }, now), now + time::Duration::days(7));
+    // An outage is unknown: shown, checked again within the hour.
+    assert!(matches!(screener.screen(&s, "https://down.example/", now).await, Verdict::Unknown { .. }));
+    assert_eq!(s.counter("webrisk", &period(now)).await.unwrap(), 3);
+
+    // The worker's rechecks run up to 9 calls, then stop without changing anything: the rest is for publishes.
+    let mut rechecked = 0;
+    while let Some(v) = screener.recheck(&s, "https://fine.example/", now).await.unwrap() {
+        assert_eq!(v, Verdict::Clean { source: "webrisk" });
+        rechecked += 1;
+        assert!(rechecked < 20, "rechecks must stop");
+    }
+    assert_eq!((rechecked, s.counter("webrisk", &period(now)).await.unwrap()), (6, 9));
+    // Publishes go on to the hard stop (the free allowance, then the paid calls), then a link is unknown and shown.
+    for _ in 0..3 {
+        assert_eq!(screener.screen(&s, "https://new.example/", now).await, Verdict::Clean { source: "webrisk" });
+    }
+    let v = screener.screen(&s, "https://later.example/", now).await;
+    assert!(matches!(&v, Verdict::Unknown { reason } if reason.contains("allowance")), "{v:?}");
+    assert_eq!(s.counter("webrisk", &period(now)).await.unwrap(), 12, "never past the hard stop");
+    // Lookup mode never asks for a list or a full hash (one computeDiff would reprice every lookup of the month).
+    assert_eq!(hits[0].load(Ordering::SeqCst), 12);
+    assert_eq!((hits[1].load(Ordering::SeqCst), hits[2].load(Ordering::SeqCst)), (0, 0));
 }

@@ -44,6 +44,22 @@ async fn me(Extension(op): Extension<Operator>) -> Json<Value> {
 async fn overview(State(app): State<Shared>) -> ApiResult<Json<Value>> {
     let s = app.store.stats(now()).await?;
     let c = &app.config;
+    // The lists exist in update mode only.
+    let lists: Vec<Value> = if c.web_risk_mode == super::config::WebRiskMode::Update {
+        app.store
+            .web_risk_lists()
+            .await?
+            .into_iter()
+            .map(|l| {
+                json!({
+                    "threatType": l.threat_type, "entries": l.entries, "updatedAt": ts(l.updated_at),
+                    "nextDiffAt": l.next_diff_at.map(ts), "lastError": l.last_error,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(Json(json!({
         "accounts": { "active": s.accounts_active, "suspended": s.accounts_suspended, "free": s.accounts_free, "paid": s.accounts_paid },
         "pagesPublished": s.pages_published,
@@ -58,15 +74,21 @@ async fn overview(State(app): State<Shared>) -> ApiResult<Json<Value>> {
         })).collect::<Vec<_>>(),
         // What one account may change (ACCOUNT_LIMITS and its overrides): the preset and the values in effect.
         "accountLimits": c.account_limits,
+        // The mode and this month's counters against their caps (from the configuration: the console holds no key).
         "webRisk": {
-            "on": c.web_risk_on, "monthlyCap": c.web_risk_monthly_cap, "confirmMonthlyCap": c.web_risk_confirm_monthly_cap,
-            "maxEntries": c.web_risk_max_entries,
+            "on": c.web_risk_on, "mode": c.web_risk_mode, "month": link_in_bio_safety::period(now()),
             "calls": app.store.counter("webrisk", &link_in_bio_safety::period(now())).await?,
+            "monthlyCap": c.web_risk_monthly_cap,
+            // Lookup: the free allowance plus the paid calls is the hard stop; rechecks stop at 80 % of it.
+            "paidMonthlyCalls": c.web_risk_paid_monthly_calls,
+            "allowance": c.web_risk_monthly_cap + c.web_risk_paid_monthly_calls,
+            "rechecksStopAt": (c.web_risk_mode == super::config::WebRiskMode::Lookup)
+                .then(|| (c.web_risk_monthly_cap + c.web_risk_paid_monthly_calls) * link_in_bio_safety::RECHECK_SHARE_PERCENT / 100),
+            // Update: the billed confirmations and the lists.
             "confirms": app.store.counter("webrisk-confirm", &link_in_bio_safety::period(now())).await?,
-            "lists": app.store.web_risk_lists().await?.into_iter().map(|l| json!({
-                "threatType": l.threat_type, "entries": l.entries, "updatedAt": ts(l.updated_at),
-                "nextDiffAt": l.next_diff_at.map(ts), "lastError": l.last_error,
-            })).collect::<Vec<_>>(),
+            "confirmMonthlyCap": c.web_risk_confirm_monthly_cap,
+            "maxEntries": c.web_risk_max_entries,
+            "lists": lists,
         },
         "switches": {
             "signup": c.signup, "thirdPartyPages": c.third_party_pages, "billingProviders": c.billing_providers,

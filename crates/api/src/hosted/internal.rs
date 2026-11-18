@@ -256,21 +256,29 @@ pub async fn notification(
 pub async fn metrics(State(app): State<Shared>) -> Response {
     let n = now();
     let stats = app.store.stats(n).await.ok();
-    let wr = match &app.screener.web_risk {
-        Some(w) => {
-            let month = link_in_bio_safety::period(n);
-            match (app.store.counter("webrisk", &month).await, app.store.counter("webrisk-confirm", &month).await) {
-                (Ok(calls), Ok(confirms)) => Some(super::metrics::WebRiskFigures {
-                    calls,
-                    cap: w.monthly_cap,
-                    confirms,
-                    confirm_cap: w.confirm_monthly_cap,
-                    prefixes: w.entries(),
-                }),
-                _ => None,
-            }
+    let month = link_in_bio_safety::period(n);
+    let counts = async {
+        match (app.store.counter("webrisk", &month).await, app.store.counter("webrisk-confirm", &month).await) {
+            (Ok(calls), Ok(confirms)) => Some((calls, confirms)),
+            _ => None,
         }
-        None => None,
+    };
+    let wr = match (&app.screener.lookup, &app.screener.update) {
+        (Some(l), _) => counts.await.map(|(calls, _)| super::metrics::WebRiskFigures {
+            calls,
+            cap: l.allowance(),
+            confirms: 0,
+            confirm_cap: 0,
+            prefixes: 0,
+        }),
+        (None, Some(w)) => counts.await.map(|(calls, confirms)| super::metrics::WebRiskFigures {
+            calls,
+            cap: w.monthly_cap,
+            confirms,
+            confirm_cap: w.confirm_monthly_cap,
+            prefixes: w.entries(),
+        }),
+        (None, None) => None,
     };
     let mut r = app.metrics.render(stats.as_ref(), wr).into_response();
     r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"));
