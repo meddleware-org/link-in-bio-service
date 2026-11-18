@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.4 — 2026-11-18
 
 - Open Payments (Interledger), off unless `BILLING_PROVIDERS` lists `open-payments`: an incoming payment on the
   operator's wallet address per checkout, the buyer's quote and interactive outgoing-payment grant (GNAP, RFC 9635) with
