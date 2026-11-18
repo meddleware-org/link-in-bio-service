@@ -16,6 +16,8 @@
 //! - [`bank_feed`]: the receiving banks' APIs (Wise, bunq, Revolut Business) as sources of the same credits a camt
 //!   statement gives.
 //! - [`keys`] and [`httpsig`]: the key files, signatures and digests the signing adapters share.
+//! - [`refunds`]: what an account holder may ask back and exactly how much (cancel within 14 days, unstarted months
+//!   later, an unapplied payment whole), net of the provider's fee share.
 
 pub mod bank_feed;
 pub mod bank_transfer;
@@ -26,6 +28,7 @@ pub mod keys;
 pub mod manual;
 pub mod open_payments;
 pub mod paddle;
+pub mod refunds;
 pub mod square;
 
 use std::collections::{BTreeMap, BTreeSet};

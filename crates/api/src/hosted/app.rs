@@ -823,18 +823,38 @@ async fn page_publish(State(app): State<Shared>, headers: HeaderMap) -> ApiResul
     }
     let p = app.store.page(a.id).await?.ok_or(ApiError::NotFound)?;
     let (m, _) = check_document(&app, &a, p.draft.as_bytes()).await?;
+    // The account's budgets (PUBLISHES_PER_ACCOUNT_HOUR, NEW_LINKS_PER_ACCOUNT_DAY), taken before anything is screened.
+    // A publish that only removes or hides links is never limited.
+    let published = p
+        .published
+        .as_deref()
+        .and_then(|d| link_in_bio_core::parse(d.as_bytes(), tenant_options()).ok())
+        .map(|x| x.manifest);
+    let removes_only = published.as_ref().is_some_and(|o| super::limits::only_removes(o, &m));
+    let new_links = super::limits::new_urls(published.as_ref(), &m).len();
+    if !removes_only && let Err(e) = super::limits::take(&app, a.id, new_links, false, n).await {
+        Metrics::inc(&app.metrics.limited);
+        return Err(e);
+    }
     // Screen every link not screened yet before the page goes out (at most 60 links: the parser's limit).
     let screens = screening_of(&app, &m).await?;
     for s in &screens {
         if s["verdict"] == "unchecked"
             && let Some(u) = s["url"].as_str()
         {
-            app.screener.screen_and_record_for(&app.store, u, n, Some(&a.id.to_string())).await?;
+            app.screener.screen_and_record(&app.store, u, n).await?;
             Metrics::inc(&app.metrics.screenings);
         }
     }
     let version = app.store.publish(a.id, &m.to_json(), n).await?;
-    app.store.audit(&format!("account:{}", a.id), "publish", &a.id.to_string(), &json!({ "version": version })).await?;
+    app.store
+        .audit(
+            &format!("account:{}", a.id),
+            "publish",
+            &a.id.to_string(),
+            &json!({ "version": version, "newLinks": new_links, "removesOnly": removes_only }),
+        )
+        .await?;
     app.pages.forget(&page_host(&app, &a.handle)).await;
     Metrics::inc(&app.metrics.publishes);
     let screening = screening_of(&app, &m).await?;
@@ -872,6 +892,11 @@ async fn page_restore(
 
 async fn avatar_upload(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
     let a = account(&app, &headers).await?;
+    // Uploads count with publishes (PUBLISHES_PER_ACCOUNT_HOUR), taken before the picture is decoded.
+    if let Err(e) = super::limits::take(&app, a.id, 0, true, now()).await {
+        Metrics::inc(&app.metrics.limited);
+        return Err(e);
+    }
     let pic = {
         let _turn = app.pictures.acquire().await.map_err(|_| ApiError::Internal)?;
         tokio::task::spawn_blocking(move || link_in_bio_assets::normalise_raster(&body))
@@ -939,8 +964,10 @@ async fn billing(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Jso
     let a = account(&app, &headers).await?;
     let n = now();
     let offers = app.billing.offers(&evidence(&a, &headers), months_ahead(a.paid_until, n));
-    let requests: BTreeMap<Uuid, link_in_bio_store::RefundRequest> =
-        app.store.refund_requests_of(a.id).await?.into_iter().map(|r| (r.event_id, r)).collect();
+    let all_requests = app.store.refund_requests_of(a.id).await?;
+    let lines = app.store.refund_lines(&all_requests.iter().map(|r| r.id).collect::<Vec<_>>()).await?;
+    let requests: BTreeMap<Uuid, &link_in_bio_store::RefundRequest> =
+        all_requests.iter().filter_map(|r| r.event_id.map(|e| (e, r))).collect();
     let events: Vec<Value> = app
         .store
         .billing_events(a.id)
@@ -961,11 +988,21 @@ async fn billing(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Jso
     Ok(Json(json!({
         "free": a.free, "paidUntil": a.paid_until.map(ts), "entitled": a.entitled(n, Duration::days(app.config.grace_days)),
         "pricePence": offers.price_pence, "currency": "GBP", "offers": offers.offers, "notes": offers.notes, "events": events,
+        "refundRequests": all_requests.iter().map(|r| request_json(r, &lines)).collect::<Vec<_>>(),
     })))
 }
 
+/// A refund request as its account holder sees it.
+fn request_json(r: &link_in_bio_store::RefundRequest, lines: &[link_in_bio_store::RefundLine]) -> Value {
+    json!({
+        "id": r.id, "kind": r.kind, "status": r.status, "reason": r.reason, "at": ts(r.created_at),
+        "decidedAt": r.decided_at.map(ts), "refundReference": r.refund_reference, "details": r.details,
+        "lines": lines.iter().filter(|l| l.request_id == r.id).map(super::refunds::line_json).collect::<Vec<_>>(),
+    })
+}
+
 /// How long after an unapplied payment its account holder may ask for a refund instead of the months.
-pub const REFUND_WINDOW: Duration = Duration::days(30);
+pub const REFUND_WINDOW: Duration = link_in_bio_billing::refunds::UNAPPLIED_WINDOW;
 
 /// An unapplied Chain Payments payment, credited as months, within the refund window.
 fn refundable(e: &link_in_bio_store::BillingEvent, n: time::OffsetDateTime) -> bool {
@@ -973,6 +1010,160 @@ fn refundable(e: &link_in_bio_store::BillingEvent, n: time::OffsetDateTime) -> b
         && e.provider == link_in_bio_billing::chain_payments::ID
         && e.kind == "purchase"
         && e.created_at + REFUND_WINDOW > n
+}
+
+/// What the signed-in account may ask back now, worked out exactly: each purchase it may cancel (within 14 days), its
+/// unstarted months (newest purchases first), late payments it may have back whole, and its open request if any.
+async fn refunds(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    use link_in_bio_billing::refunds as r;
+    let a = account(&app, &headers).await?;
+    let n = now();
+    let history = super::refunds::history(&app, &a).await?;
+    let open = app.store.refund_requests_of(a.id).await?.into_iter().find(|q| q.status == "open");
+    let open_lines = match &open {
+        Some(q) => app.store.refund_lines(&[q.id]).await?,
+        None => Vec::new(),
+    };
+    let answer = |o: Result<r::Offer, r::Refusal>| match o {
+        Ok(o) => json!({ "offer": super::refunds::offer_json(&o) }),
+        Err(e) => json!({ "refused": e.0 }),
+    };
+    let cancel: Vec<Value> = history
+        .iter()
+        .filter(|e| e.kind == "purchase" && !e.unapplied && e.at + r::CANCEL_WINDOW > n)
+        .map(|e| {
+            let mut v = answer(r::cancel(e, n));
+            v["purchase"] = json!(e.id);
+            v["at"] = json!(ts(e.at));
+            v
+        })
+        .collect();
+    let unapplied: Vec<Value> = history
+        .iter()
+        .filter(|e| e.unapplied && e.at + r::UNAPPLIED_WINDOW > n)
+        .map(|e| {
+            let mut v = answer(r::unapplied(e, n));
+            v["purchase"] = json!(e.id);
+            v
+        })
+        .collect();
+    Ok(Json(json!({
+        "openRequest": open.as_ref().map(|q| request_json(q, &open_lines)),
+        "cancel": cancel,
+        "unstarted": {
+            "months": r::refundable_unstarted(&history, a.paid_until, n),
+            "all": answer(r::unstarted(&history, a.paid_until, n, None)),
+        },
+        "unapplied": unapplied,
+        "rules": {
+            "cancelDays": r::CANCEL_WINDOW.whole_days(), "unappliedDays": r::UNAPPLIED_WINDOW.whole_days(),
+            "daysPerMonth": r::DAYS_PER_MONTH,
+        },
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RefundAsk {
+    /// `cancel` (one purchase, within 14 days), `unstarted` (months that have not begun) or `unapplied` (a late
+    /// payment, whole).
+    kind: String,
+    #[serde(default)]
+    purchase: Option<Uuid>,
+    /// For `unstarted`: how many (all of them when absent).
+    #[serde(default)]
+    months: Option<u32>,
+    #[serde(default)]
+    reason: String,
+}
+
+fn clean_reason(reason: &str) -> ApiResult<&str> {
+    let reason = reason.trim();
+    if reason.chars().count() > 1000 || reason.chars().any(|c| c.is_control() && c != '\n') {
+        return Err(ApiError::Unprocessable("The reason is at most 1000 characters of text.".into()));
+    }
+    Ok(reason)
+}
+
+/// Works out the refund asked for, now, and records it as one open request (the account's only one) for the operator,
+/// who sends it by hand. Nothing is refunded and no month is taken back until then.
+async fn ask_refund(app: &Shared, a: &Account, b: &RefundAsk) -> ApiResult<(StatusCode, Json<Value>)> {
+    use link_in_bio_billing::refunds as r;
+    let reason = clean_reason(&b.reason)?;
+    let n = now();
+    let history = super::refunds::history(app, a).await?;
+    let purchase = || -> ApiResult<&r::Entry> {
+        let id = b.purchase.ok_or_else(|| ApiError::BadRequest("name the purchase".into()))?;
+        history.iter().find(|e| e.id == id).ok_or(ApiError::NotFound)
+    };
+    let (offer, event) = match b.kind.as_str() {
+        "cancel" => (r::cancel(purchase()?, n), None),
+        "unapplied" => {
+            let p = purchase()?;
+            (r::unapplied(p, n), Some(p.id))
+        }
+        "unstarted" => (r::unstarted(&history, a.paid_until, n, b.months), None),
+        _ => return Err(ApiError::BadRequest("kind is cancel, unstarted or unapplied".into())),
+    };
+    let offer = offer.map_err(|e| ApiError::Unprocessable(e.0))?;
+    let lines = super::refunds::new_lines(&offer);
+    let id = match app
+        .store
+        .create_refund_request_lines(
+            a.id,
+            offer.kind.as_str(),
+            event,
+            reason,
+            &super::refunds::details(&offer, n),
+            &lines,
+            n,
+        )
+        .await?
+    {
+        Ok(id) => id,
+        Err(link_in_bio_store::RefundConflict::OpenRequest) => {
+            return Err(ApiError::Conflict(
+                "You already have an open refund request: withdraw it, or wait for the operator to send it.".into(),
+            ));
+        }
+        Err(link_in_bio_store::RefundConflict::AlreadyAsked) => {
+            return Err(ApiError::Conflict("A refund was already asked for this payment.".into()));
+        }
+    };
+    let offer_json = super::refunds::offer_json(&offer);
+    app.store
+        .audit(
+            &format!("account:{}", a.id),
+            "refund-requested",
+            &a.id.to_string(),
+            &json!({ "request": id, "kind": offer.kind, "months": offer.months, "lines": offer_json["lines"], "reason": reason }),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(json!({ "refundRequest": id, "status": "open", "offer": offer_json }))))
+}
+
+async fn refund_ask(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Json(b): Json<RefundAsk>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let a = account(&app, &headers).await?;
+    ask_refund(&app, &a, &b).await
+}
+
+/// Withdraws the account's open request (before the operator has refunded any of it).
+async fn refund_withdraw(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
+    let a = account(&app, &headers).await?;
+    let lines = app.store.refund_lines(&[id]).await?;
+    if lines.iter().any(|l| l.status == "refunded") {
+        return Err(ApiError::Conflict("Part of this request has been refunded already; ask the operator.".into()));
+    }
+    let actor = format!("account:{}", a.id);
+    if !app.store.close_refund_request(id, Some(a.id), "withdrawn", &actor, "", now()).await? {
+        return Err(ApiError::NotFound);
+    }
+    app.store.audit(&actor, "refund-withdrawn", &a.id.to_string(), &json!({ "request": id })).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize, Default)]
@@ -983,7 +1174,7 @@ struct RefundRequestBody {
 }
 
 /// Asks for a refund of an unapplied payment instead of the months it was credited as (once per payment, within 30
-/// days). The operator sends it by hand and records it in the console.
+/// days): the same as `POST /api/v1/billing/refund-requests` with `kind: unapplied`.
 async fn refund_request(
     State(app): State<Shared>,
     headers: HeaderMap,
@@ -996,35 +1187,10 @@ async fn refund_request(
     } else {
         serde_json::from_slice(&body).map_err(|e| ApiError::BadRequest(format!("not a refund request: {e}")))?
     };
-    let reason = b.reason.trim();
-    if reason.chars().count() > 1000 || reason.chars().any(|c| c.is_control() && c != '\n') {
-        return Err(ApiError::Unprocessable("The reason is at most 1000 characters of text.".into()));
-    }
-    let n = now();
-    let e = app.store.billing_events(a.id).await?.into_iter().find(|e| e.id == event).ok_or(ApiError::NotFound)?;
-    if !e.unapplied || e.provider != link_in_bio_billing::chain_payments::ID || e.kind != "purchase" {
-        return Err(ApiError::Unprocessable(
-            "Only a Chain Payments payment that arrived after its checkout was paid or closed can be refunded this way."
-                .into(),
-        ));
-    }
-    if e.created_at + REFUND_WINDOW <= n {
-        return Err(ApiError::Unprocessable("A refund can be asked for within 30 days of the payment.".into()));
-    }
-    let detail = app.store.billing_event(e.id).await?.ok_or(ApiError::NotFound)?;
-    let Some(id) = app.store.create_refund_request(e.id, a.id, reason).await? else {
-        return Err(ApiError::Conflict("A refund was already asked for this payment.".into()));
-    };
-    app.store
-        .audit(
-            &format!("account:{}", a.id),
-            "refund-requested",
-            &a.id.to_string(),
-            &json!({ "request": id, "event": e.id, "months": e.months, "amountPence": e.amount_pence,
-                     "digest": detail.evidence["digest"], "reason": reason }),
-        )
-        .await?;
-    Ok((StatusCode::CREATED, Json(json!({ "refundRequest": id, "status": "open", "event": e.id }))))
+    let ask = RefundAsk { kind: "unapplied".into(), purchase: Some(event), months: None, reason: b.reason };
+    let (status, Json(mut v)) = ask_refund(&app, &a, &ask).await?;
+    v["event"] = json!(event);
+    Ok((status, Json(v)))
 }
 
 #[derive(Deserialize)]
@@ -1443,6 +1609,9 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v1/billing", get(billing))
         .route("/api/v1/billing/checkouts", post(checkout_create))
         .route("/api/v1/billing/events/{id}/refund-request", post(refund_request))
+        .route("/api/v1/billing/refunds", get(refunds))
+        .route("/api/v1/billing/refund-requests", post(refund_ask))
+        .route("/api/v1/billing/refund-requests/{id}/withdraw", post(refund_withdraw))
         .route("/api/v1/billing/checkouts/{id}", get(checkout_get))
         .route("/api/v1/billing/checkouts/{id}/open-payments", post(open_payments_start))
         .route("/api/v1/billing/checkouts/{id}/open-payments/finish", post(open_payments_finish))

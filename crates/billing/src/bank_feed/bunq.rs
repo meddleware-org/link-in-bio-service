@@ -94,6 +94,18 @@ pub fn credits_from_payments(account: u64, page: &Value) -> (Vec<Credit>, Option
             currency: currency.to_string(),
             booked: p["created"].as_str().and_then(|c| c.get(..10)).map(String::from),
             entry: format!("bunq-{account}-{id}"),
+            // The paying account, as bunq names it (what a refund is sent back to).
+            debtor: {
+                let alias = &p["counterparty_alias"];
+                let text =
+                    |v: &Value| v.as_str().map(str::trim).filter(|t| !t.is_empty() && t.len() <= 140).map(String::from);
+                let d = bank_transfer::Debtor {
+                    name: text(&alias["display_name"]),
+                    account: text(&alias["iban"]),
+                    bic: text(&alias["bic"]),
+                };
+                (d != bank_transfer::Debtor::default()).then_some(d)
+            },
         });
     }
     (out, newest)

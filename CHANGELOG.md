@@ -32,12 +32,37 @@ Audit findings F25–F29:
 - A Square, GoCardless or Paddle payment is applied only when what the provider says was paid covers the checkout (Square
   and GoCardless at least its GBP amount; Paddle exactly its months of `PADDLE_PRICE_ID`). One that does not leaves the
   checkout open, is audited once as `payment-not-covering` and counted in `link_in_bio_payment_mismatches_total`.
-- Refunds take months back pro rata, rounded down, on the running total of a purchase's refunds: never more than it
-  bought, and every month once the whole amount is refunded. A refund of a checkout that was never paid takes nothing.
-- `WEB_RISK_ACCOUNT_DAILY_CAP` (default 200, `0` for none): Web Risk calls one account's publishes may spend in a day.
-  Past it, links are recorded as unknown and the worker screens them again within the hour under the monthly cap.
+- A refund that no request names takes months back pro rata, rounded down, on the running total of a purchase's
+  refunds: never more than it bought, and every month once the whole amount is refunded. A refund of a checkout that
+  was never paid takes nothing.
 - Schema 5: pictures are keyed by `(sha256, account_id)`, so two accounts can each use a byte-identical picture. During
   the rollout an upload on a pod of the previous release fails until that pod is replaced.
+
+Refunds on request, per-account change limits, and Web Risk's Update API:
+
+- Refunds on request, at no cost to the platform beyond the operator's time: within 14 days a purchase may be cancelled
+  (all of it back, less the days used at its monthly price ÷ 30 and its share of the provider's fee); later, whole
+  unstarted months come back, newest purchases first, at what each purchase paid per month, less their fee share; a
+  late Chain Payments payment comes back whole within 30 days. Amounts are in the unit paid (a coin, the buyer's
+  currency), rounded down; a refund of 0 or less is refused. `GET /api/v1/billing/refunds`,
+  `POST /api/v1/billing/refund-requests`, `…/{id}/withdraw`; one open request per account. The console's queue shows
+  each purchase's exact amount, months and destination (the payer's bank account when the camt statement or bunq names
+  it); the operator refunds by hand and records the reference, or declines (`…/{id}/declined`). A provider's refund
+  notification of exactly a line's amount closes it. A request's refund takes back exactly its months. Schema 6
+  (`lib.refund_lines`; purchases name their checkout and refunds their purchase).
+- Per-account change limits (`ACCOUNT_LIMITS=standard|generous`, with `PUBLISHES_PER_ACCOUNT_HOUR` 30/300 and
+  `NEW_LINKS_PER_ACCOUNT_DAY` 120/1200 overridable; 0 is no limit): over a limit, 429 with the limit, its reset and
+  `Retry-After`, the draft kept. Picture uploads count with publishes. A publish that only removes or hides links, and
+  unpublishing, are never limited. The console's Overview shows the values in effect; `link_in_bio_limited_total`.
+- Web Risk moves from Lookup (`uris.search`) to the Update API: the worker keeps the MALWARE, SOCIAL_ENGINEERING and
+  UNWANTED_SOFTWARE hash-prefix lists in `lib.web_risk_lists` (schema 6) with `threatLists.computeDiff` (checksum
+  checked, `recommendedNextDiff` followed); the app and the worker check links locally, canonicalised and hashed as
+  "URLs and hashing" specifies. Only a local match sends a hash prefix to `hashes.search`, cached until its expiry: full
+  URLs no longer go to Google. `computeDiff` is free; `hashes.search` is billed ($50 per 1 000, no free tier), so
+  `WEB_RISK_CONFIRM_MONTHLY_CAP` (default 0) bounds it inside `WEB_RISK_MONTHLY_CAP`; an unconfirmed match is hidden
+  until an operator reviews it. `WEB_RISK_MAX_ENTRIES` (default 262 144) bounds each list. `WEB_RISK_ACCOUNT_DAILY_CAP`
+  (unreleased) is removed: `NEW_LINKS_PER_ACCOUNT_DAY` bounds what an account can make the service check.
+- Metrics: `link_in_bio_web_risk_confirms`, `…_confirm_cap` and `…_prefixes` beside the existing call count and cap.
 
 ## 0.0.4 — 2026-11-18
 

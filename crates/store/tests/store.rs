@@ -207,6 +207,8 @@ async fn billing_periods_are_idempotent() {
         amount_pence: 300 * i64::from(months.abs()),
         evidence: json!({"country": "GB"}),
         checkout: None,
+        checkout_id: None,
+        refund_of: None,
     };
     let until = s.change_period(&change("s1", "purchase", 3), now).await.unwrap().unwrap();
     assert_eq!(until, now + link_in_bio_store::MONTH * 3);
@@ -288,6 +290,8 @@ async fn refund_requests_take_months_back_once() {
         amount_pence: 900,
         evidence: json!({ "unapplied": unapplied, "digest": "D2", "payer": "0x2" }),
         checkout: None,
+        checkout_id: None,
+        refund_of: None,
     };
     s.change_period(&change("paid:s1", false), now).await.unwrap().unwrap();
     let credited = s.change_period(&change("unapplied:w1", true), now).await.unwrap().unwrap();
@@ -300,7 +304,7 @@ async fn refund_requests_take_months_back_once() {
     let r = s.create_refund_request(late.id, a.id, "two tabs").await.unwrap().unwrap();
     assert!(s.create_refund_request(late.id, a.id, "again").await.unwrap().is_none(), "one request per event");
     let queue = s.refund_requests("open", 10).await.unwrap();
-    assert_eq!((queue.len(), queue[0].handle.as_str(), queue[0].months), (1, "alice", 3));
+    assert_eq!((queue.len(), queue[0].handle.as_str(), queue[0].months), (1, "alice", Some(3)));
     assert_eq!(s.refund_requests_of(a.id).await.unwrap()[0].id, r);
 
     let done = s.record_refund(r, "9xRefundDigest", "operator:op-1", "", now).await.unwrap().unwrap();
@@ -432,6 +436,8 @@ async fn refunds_take_months_back_pro_rata_and_never_more_than_bought() {
             amount_pence: 3600,
             evidence: json!({}),
             checkout: Some(c),
+            checkout_id: None,
+            refund_of: None,
         },
         now,
     )
@@ -474,6 +480,149 @@ async fn refunds_take_months_back_pro_rata_and_never_more_than_bought() {
         .unwrap()
         .unwrap();
     assert_eq!(r.months_taken, 0);
+}
+
+#[tokio::test]
+async fn refund_lines_take_back_exactly_their_months_once() {
+    let Some(s) = store().await else { return };
+    let now = time::macros::datetime!(2026-11-18 12:00 UTC);
+    let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
+    let c = uuid::Uuid::new_v4();
+    s.create_checkout(&link_in_bio_store::Checkout {
+        id: c,
+        account_id: a.id,
+        provider: "square".into(),
+        provider_ref: "ORD-L".into(),
+        method: "square:card".into(),
+        months: 12,
+        amount_pence: 3600,
+        status: "open".into(),
+        country_declared: None,
+        country_request: None,
+        created_at: now,
+        completed_at: None,
+    })
+    .await
+    .unwrap();
+    let paid = |event: &'static str| PeriodChange {
+        account_id: a.id,
+        provider: "square",
+        provider_event: event,
+        kind: "purchase",
+        months: 12,
+        amount_pence: 3600,
+        evidence: json!({ "paid": { "amountMinor": 3600, "currency": "GBP" } }),
+        checkout: Some(c),
+        checkout_id: None,
+        refund_of: None,
+    };
+    s.change_period(&paid("paid:ORD-L"), now).await.unwrap().unwrap();
+    let ext = s.extensions(a.id).await.unwrap();
+    assert_eq!((ext.len(), ext[0].held, ext[0].checkout_id), (1, 12, Some(c)), "the purchase names its checkout");
+    let purchase = ext[0].id;
+    let line = |months: i32, amount: i64| link_in_bio_store::NewRefundLine {
+        purchase_id: purchase,
+        checkout_id: Some(c),
+        provider: "square".into(),
+        months,
+        amount_minor: amount,
+        unit: "GBP".into(),
+        scale: Some(2),
+        fee_minor: 13,
+        used_minor: 0,
+        days_used: 0,
+        amount_pence: amount,
+        destination: json!({ "how": "Square" }),
+    };
+    let r = s
+        .create_refund_request_lines(a.id, "unstarted", None, "", &json!({}), &[line(2, 587)], now)
+        .await
+        .unwrap()
+        .unwrap();
+    // One open request per account.
+    assert_eq!(
+        s.create_refund_request_lines(a.id, "unstarted", None, "", &json!({}), &[line(1, 293)], now).await.unwrap(),
+        Err(link_in_bio_store::RefundConflict::OpenRequest)
+    );
+    let open = s.open_refund_line_for_checkout(c).await.unwrap().unwrap();
+    assert_eq!((open.request_id, open.months, open.held), (r, 2, 12));
+    // Refunded: exactly its two months, once.
+    let done = s.refund_line(r, purchase, "sq-1", "operator:op", None, json!({}), now).await.unwrap().unwrap();
+    assert_eq!((done.months_taken, done.request_closed), (2, true));
+    assert_eq!(done.paid_until, Some(now + link_in_bio_store::MONTH * 10));
+    assert!(s.refund_line(r, purchase, "sq-1", "operator:op", None, json!({}), now).await.unwrap().is_none());
+    assert_eq!(s.refund_request(r).await.unwrap().unwrap().status, "refunded");
+    assert_eq!(s.extensions(a.id).await.unwrap()[0].held, 10);
+    assert!(s.open_refund_line_for_checkout(c).await.unwrap().is_none());
+    // A provider's refund no request names counts what the line refunded: 587 + 1213 = 1800 of 3600 → 6 in all.
+    let pro_rata = link_in_bio_store::RefundChange {
+        account_id: a.id,
+        provider: "square",
+        provider_event: "refund:x",
+        checkout: c,
+        months: 12,
+        paid_minor: 3600,
+        refunded_minor: 1213,
+        amount_pence: 3600,
+        evidence: json!({}),
+    };
+    let r2 = s.refund_purchase(&pro_rata, months_refunded, now).await.unwrap().unwrap();
+    assert_eq!(r2.months_taken, 4, "6 in all, 2 already taken");
+    // Withdrawn by the account holder, or declined by the operator: nothing taken back.
+    let w = s
+        .create_refund_request_lines(a.id, "unstarted", None, "", &json!({}), &[line(1, 293)], now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !s.close_refund_request(w, Some(uuid::Uuid::new_v4()), "withdrawn", "x", "", now).await.unwrap(),
+        "not theirs"
+    );
+    assert!(s.close_refund_request(w, Some(a.id), "withdrawn", "account", "", now).await.unwrap());
+    let d = s
+        .create_refund_request_lines(a.id, "unstarted", None, "", &json!({}), &[line(1, 293)], now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(s.close_refund_request(d, None, "declined", "operator", "duplicate", now).await.unwrap());
+    assert!(!s.close_refund_request(d, None, "declined", "operator", "again", now).await.unwrap());
+    assert_eq!(s.extensions(a.id).await.unwrap()[0].held, 6);
+}
+
+#[tokio::test]
+async fn counters_are_taken_all_or_none_and_web_risk_lists_are_kept() {
+    let Some(s) = store().await else { return };
+    let now = OffsetDateTime::now_utc();
+    let t = |name: &str, by: i64, cap: i64| (name.to_string(), "2026-11-18T13".to_string(), by, cap);
+    assert_eq!(s.take_from_counters(&[t("p:a", 1, 3), t("n:a", 4, 4)]).await.unwrap(), None);
+    assert_eq!(s.take_from_counters(&[t("p:a", 1, 3), t("n:a", 1, 4)]).await.unwrap(), Some(1), "the second is full");
+    assert_eq!(s.counter("p:a", "2026-11-18T13").await.unwrap(), 1, "and the first was not taken either");
+
+    assert!(s.web_risk_list("MALWARE").await.unwrap().is_none());
+    let list = link_in_bio_store::WebRiskList {
+        threat_type: "MALWARE".into(),
+        version_token: "v1".into(),
+        entries: 2,
+        prefixes: vec![4, 1, 2, 3, 4, 4, 5, 6, 7, 8],
+        checksum: "c".into(),
+        next_diff_at: Some(now + Duration::minutes(30)),
+        updated_at: now,
+        last_error: None,
+    };
+    s.put_web_risk_list(&list).await.unwrap();
+    assert_eq!(s.web_risk_list("MALWARE").await.unwrap().unwrap().prefixes, list.prefixes);
+    // A failed update keeps the prefixes and their time (nobody reloads), and asks for a full list next time.
+    s.web_risk_list_failed("MALWARE", "checksum", now + Duration::hours(1), true).await.unwrap();
+    let after = s.web_risk_list("MALWARE").await.unwrap().unwrap();
+    assert_eq!(
+        (after.prefixes, after.version_token.as_str(), after.last_error.as_deref()),
+        (list.prefixes, "", Some("checksum"))
+    );
+    let states = s.web_risk_lists().await.unwrap();
+    assert_eq!((states.len(), states[0].entries), (1, 2));
+    // A first failure of a list never stored makes an empty row with nothing to load.
+    s.web_risk_list_failed("UNWANTED_SOFTWARE", "down", now, false).await.unwrap();
+    assert_eq!(s.web_risk_list("UNWANTED_SOFTWARE").await.unwrap().unwrap().entries, 0);
 }
 
 // ── Roles: the grants the database tier gives each process, set up here as the provisioner does ─────────────────
@@ -569,6 +718,8 @@ async fn the_pages_role_reads_only_the_public_views_and_writes_nothing() {
         "SELECT * FROM lib.sessions",
         "SELECT * FROM lib.accounts",
         "SELECT * FROM lib.billing_events",
+        "SELECT * FROM lib.refund_lines",
+        "SELECT * FROM lib.web_risk_lists",
         "INSERT INTO lib.audit_log (actor, action, subject) VALUES ('x', 'y', 'z')",
         "UPDATE lib.accounts SET free = true",
         "DELETE FROM lib.pages",

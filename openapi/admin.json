@@ -664,7 +664,7 @@
     },
     "/api/v1/admin/refund-requests": {
       "get": {
-        "summary": "Refund requests for unapplied payments (?status=open|refunded)",
+        "summary": "Refund requests with exactly what to send per purchase (?status=open|refunded|withdrawn|declined)",
         "security": [
           {
             "access": []
@@ -686,7 +686,39 @@
     },
     "/api/v1/admin/refund-requests/{id}/refunded": {
       "post": {
-        "summary": "Record a refund sent by hand (its transaction reference); takes the months back once",
+        "summary": "Record a refund sent by hand (its reference, and the purchase when several); takes its months back once",
+        "security": [
+          {
+            "access": []
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "An error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/refund-requests/{id}/declined": {
+      "post": {
+        "summary": "Decline an open refund request, saying why",
         "security": [
           {
             "access": []

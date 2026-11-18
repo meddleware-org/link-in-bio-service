@@ -64,6 +64,10 @@ pub async fn apply_event(app: &Shared, provider: &str, e: &ProviderEvent) -> Api
             evidence["countryDeclared"] = json!(c.country_declared);
             evidence["countryRequest"] = json!(c.country_request);
             evidence["method"] = json!(c.method);
+            // What the provider says was paid, kept: a refund on request is worked out from it.
+            if e.paid.is_some() {
+                evidence["paid"] = paid_json(e.paid.as_ref());
+            }
             let applied = app
                 .store
                 .change_period(
@@ -76,6 +80,8 @@ pub async fn apply_event(app: &Shared, provider: &str, e: &ProviderEvent) -> Api
                         amount_pence: c.amount_pence,
                         evidence,
                         checkout: Some(c.id),
+                        checkout_id: Some(c.id),
+                        refund_of: None,
                     },
                     n,
                 )
@@ -114,6 +120,8 @@ pub async fn apply_event(app: &Shared, provider: &str, e: &ProviderEvent) -> Api
                         amount_pence: c.amount_pence,
                         evidence,
                         checkout: None,
+                        checkout_id: Some(c.id),
+                        refund_of: None,
                     },
                     n,
                 )
@@ -134,8 +142,13 @@ pub async fn apply_event(app: &Shared, provider: &str, e: &ProviderEvent) -> Api
             }
         }
         Outcome::Refunded => {
-            // Pro rata, rounded down, counted over every refund of this purchase (FU-0139): a refund of the whole
-            // amount, or partial refunds that add up to it, take back every month, and never more.
+            // The refund an open request asked for, for exactly its amount: that request's months, exactly.
+            if super::refunds::match_provider_refund(app, provider, c.id, e).await? {
+                return Ok(());
+            }
+            // Any other refund (an operator's own, one the provider made): pro rata, rounded down, counted over every
+            // refund of this purchase (FU-0139), so a refund of the whole amount, or partial refunds that add up to it,
+            // take back every month, and never more.
             let (refunded, of) = match e.refunded {
                 Some(r) => (r.minor, r.of_minor.unwrap_or(c.amount_pence as u64)),
                 None => (c.amount_pence as u64, c.amount_pence as u64),
@@ -244,7 +257,19 @@ pub async fn metrics(State(app): State<Shared>) -> Response {
     let n = now();
     let stats = app.store.stats(n).await.ok();
     let wr = match &app.screener.web_risk {
-        Some(w) => app.store.counter("webrisk", &link_in_bio_safety::period(n)).await.ok().map(|u| (u, w.monthly_cap)),
+        Some(w) => {
+            let month = link_in_bio_safety::period(n);
+            match (app.store.counter("webrisk", &month).await, app.store.counter("webrisk-confirm", &month).await) {
+                (Ok(calls), Ok(confirms)) => Some(super::metrics::WebRiskFigures {
+                    calls,
+                    cap: w.monthly_cap,
+                    confirms,
+                    confirm_cap: w.confirm_monthly_cap,
+                    prefixes: w.entries(),
+                }),
+                _ => None,
+            }
+        }
         None => None,
     };
     let mut r = app.metrics.render(stats.as_ref(), wr).into_response();

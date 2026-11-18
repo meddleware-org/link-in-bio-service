@@ -1,6 +1,6 @@
 [package]
 name = "link-in-bio-safety"
-description = "Link in Bio: layered link screening (built-in checks, blocklist and ThreatFox, Google Web Risk behind a monthly cap)."
+description = "Link in Bio: layered link screening (built-in checks, blocklist and ThreatFox, Google Web Risk Update API lists behind monthly caps)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,8 @@ rustls.workspace = true
 url.workspace = true
 time.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

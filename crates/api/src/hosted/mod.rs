@@ -17,9 +17,11 @@ pub mod error;
 pub mod internal;
 pub mod jobs;
 pub mod jwt;
+pub mod limits;
 pub mod metrics;
 pub mod openapi;
 pub mod pages;
+pub mod refunds;
 pub mod routes;
 
 #[cfg(test)]
@@ -34,7 +36,7 @@ use link_in_bio_billing::{BillingProvider, Router as Billing, RouterConfig};
 use link_in_bio_safety::{Screener, WebRisk};
 use link_in_bio_store::Store;
 
-pub use config::{HostedConfig, Keys, SignupMode};
+pub use config::{AccountLimits, HostedConfig, Keys, LimitsPreset, SignupMode};
 pub use error::{ApiError, ApiResult};
 
 pub struct App {
@@ -162,12 +164,14 @@ impl App {
             providers,
         );
         let web_risk = match &config.web_risk_key_file {
-            Some(f) if keys && config.web_risk_monthly_cap > 0 => {
-                Some(WebRisk::new(read_secret(f)?, config.web_risk_monthly_cap))
-            }
+            Some(f) if keys && config.web_risk_monthly_cap > 0 => Some(WebRisk::new(
+                read_secret(f)?,
+                config.web_risk_monthly_cap,
+                config.web_risk_confirm_monthly_cap,
+                config.web_risk_max_entries,
+            )),
             _ => None,
         };
-        let account_daily_cap = config.web_risk_account_daily_cap;
         let access = config.access.as_ref().map(|a| {
             access::Admins::new(access::AccessConfig {
                 issuer: a.team_domain.clone(),
@@ -182,7 +186,7 @@ impl App {
             config,
             billing,
             passkeys,
-            screener: Screener { web_risk, account_daily_cap },
+            screener: Screener { web_risk },
             metrics: metrics::Metrics::default(),
             pages: pages::PageCache::new(page_cache),
             access,

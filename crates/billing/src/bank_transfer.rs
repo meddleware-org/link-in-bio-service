@@ -204,6 +204,44 @@ pub struct Credit {
     pub booked: Option<String>,
     /// The bank's own id of the entry (the account servicer reference), for the ledger.
     pub entry: String,
+    /// Who paid, when the statement says (what the operator needs to send a refund back).
+    pub debtor: Option<Debtor>,
+}
+
+/// The paying party of a credit, from the statement's related parties (`RltdPties`) and agents (`RltdAgts`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Debtor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The IBAN, or the account's other id (a UK sort code and account number).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bic: Option<String>,
+}
+
+/// The debtor of one statement entry or transaction (camt.053/054 of any version: `Dbtr/Nm` or `Dbtr/Pty/Nm`,
+/// `DbtrAcct/Id/IBAN` or `DbtrAcct/Id/Othr/Id`, `DbtrAgt/FinInstnId/BICFI` or `BIC`).
+fn find<'a, 'i>(n: roxmltree::Node<'a, 'i>, local: &str) -> Option<roxmltree::Node<'a, 'i>> {
+    n.descendants().find(|c| c.is_element() && c.tag_name().name() == local)
+}
+
+fn debtor_of(part: roxmltree::Node) -> Option<Debtor> {
+    let text = |n: Option<roxmltree::Node>| {
+        n.and_then(|n| n.text()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty() && t.len() <= 140)
+    };
+    let parties = find(part, "RltdPties");
+    let name = parties.and_then(|p| find(p, "Dbtr")).and_then(|d| text(find(d, "Nm")));
+    let account = parties.and_then(|p| find(p, "DbtrAcct")).and_then(|a| {
+        let id = find(a, "Id")?;
+        text(find(id, "IBAN")).or_else(|| find(id, "Othr").and_then(|o| text(child(o, "Id"))))
+    });
+    let bic = find(part, "RltdAgts")
+        .and_then(|a| find(a, "DbtrAgt"))
+        .and_then(|d| text(find(d, "BICFI")).or_else(|| text(find(d, "BIC"))));
+    let d = Debtor { name, account, bic };
+    (d != Debtor::default()).then_some(d)
 }
 
 /// A decimal amount (`12.5`, `9`, `3.00`; at most two decimals, never negative) in minor units.
@@ -286,6 +324,7 @@ pub fn credits_from_camt(xml: &str) -> Result<Vec<Credit>, BillingError> {
                 currency: currency.to_string(),
                 booked: booked.clone(),
                 entry: if entry.is_empty() { format!("entry-{i}") } else { format!("{entry}-{i}") },
+                debtor: debtor_of(part),
             });
         }
     }
@@ -300,7 +339,8 @@ pub fn paid_event(c: &Credit) -> ProviderEvent {
         outcome: Outcome::Paid,
         paid: None,
         refunded: None,
-        evidence: json!({ "entry": c.entry, "amountMinor": c.amount_minor, "currency": c.currency, "booked": c.booked }),
+        evidence: json!({ "entry": c.entry, "amountMinor": c.amount_minor, "currency": c.currency, "booked": c.booked,
+                          "debtor": c.debtor }),
     }
 }
 
@@ -375,6 +415,34 @@ mod tests {
         let c = credits_from_camt(camt053).unwrap();
         assert_eq!(c.len(), 1, "a reference split by a space in free text is not trusted; only a whole one");
         assert_eq!(c[0].amount_minor, 900);
+        assert!(c[0].debtor.is_none(), "no related parties in this statement");
         assert!(credits_from_camt("not xml").is_err());
+    }
+
+    #[test]
+    fn the_debtor_is_read_when_the_statement_names_it() {
+        // camt.053.001.08: the debtor's name under `Dbtr/Pty`, its IBAN and its bank's BIC.
+        let camt = r#"<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.08"><BkToCstmrStmt><Stmt>
+  <Ntry><Amt Ccy="EUR">3.50</Amt><CdtDbtInd>CRDT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>
+    <NtryDtls><TxDtls><Amt Ccy="EUR">3.50</Amt>
+      <RltdPties><Dbtr><Pty><Nm>Ada Lovelace</Nm></Pty></Dbtr><DbtrAcct><Id><IBAN>DE89370400440532013000</IBAN></Id></DbtrAcct></RltdPties>
+      <RltdAgts><DbtrAgt><FinInstnId><BICFI>COBADEFFXXX</BICFI></FinInstnId></DbtrAgt></RltdAgts>
+      <RmtInf><Strd><CdtrRefInf><Ref>RF18539007547034</Ref></CdtrRefInf></Strd></RmtInf></TxDtls></NtryDtls></Ntry>
+  <Ntry><Amt Ccy="GBP">9.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><Sts>BOOK</Sts>
+    <NtryDtls><TxDtls><RltdPties><DbtrAcct><Id><Othr><Id>20-00-00 12345678</Id></Othr></Id></DbtrAcct></RltdPties>
+      <RmtInf><Ustrd>RF18539007547034</Ustrd></RmtInf></TxDtls></NtryDtls></Ntry>
+</Stmt></BkToCstmrStmt></Document>"#;
+        let c = credits_from_camt(camt).unwrap();
+        assert_eq!(
+            c[0].debtor,
+            Some(Debtor {
+                name: Some("Ada Lovelace".into()),
+                account: Some("DE89370400440532013000".into()),
+                bic: Some("COBADEFFXXX".into())
+            })
+        );
+        assert_eq!(c[1].debtor.as_ref().and_then(|d| d.account.as_deref()), Some("20-00-00 12345678"));
+        // It goes into the payment's evidence, where a refund on request finds it.
+        assert_eq!(paid_event(&c[0]).evidence["debtor"]["name"], "Ada Lovelace");
     }
 }

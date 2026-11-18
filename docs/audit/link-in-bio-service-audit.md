@@ -119,9 +119,10 @@ boundaries are well drawn:
 - **F25:** one database role per process kind with grants per table and the audit log insert-only for all of them (its
   retention runs through an owner function); role tests for the page server and a writer; the console holds no key.
 - **F27:** a card provider's payment is applied only when what it says was paid covers the checkout.
-- **F26 (OQ1, built as pro rata rounded down):** refunds take months back in proportion to the amount, never more than the
+- **F26 (OQ1, decided: refunds on request take back exactly their months, others pro rata):** refunds never take back more than the
   purchase bought.
-- **F28 (OQ2, built as 200 a day by default):** a per-account daily budget of Web Risk calls; **F29:** pictures keyed per account.
+- **F28 (OQ2, decided):** Web Risk moved to the Update API (links checked locally, confirmations under their own cap,
+  default 0) and per-account change limits (`NEW_LINKS_PER_ACCOUNT_DAY`); **F29:** pictures keyed per account.
 
 **Open:** none above Info but F30–F34 (each dispositioned below).
 
@@ -570,7 +571,8 @@ deployment must provide.
 
 - Screening in layers: built-in checks (IP hosts, ports, 20 shorteners), the blocklist and ThreatFox (CC0, synced every 6 h,
   replaced in one transaction), then Web Risk under a monthly cap counted atomically in the database across processes
-  (`take_from_counter`). The Web Risk key is never in an error or log (fixed error strings). Every unscreened link is
+  (`take_from_counter`; since F28's rework, the Update API's local lists, with only a hash prefix sent to confirm a
+  match). The Web Risk key is never in an error or log (fixed error strings). Every unscreened link is
   screened before a publish; flagged links are hidden on every page within the cache time.
 - Reports need no account and record no reporter; reasons are an enumeration; details ≤ 4000 characters; an alert fires on
   a report open more than 24 h.
@@ -652,6 +654,18 @@ a refund of a checkout never paid takes nothing; a GoCardless failure or chargeb
 `refunds_take_months_back_pro_rata_and_never_more_than_bought` (store), `refunds_give_back_months_pro_rata_rounded_down`
 (billing) and the hosted Square case below.
 
+Then decided (refunds on request, `link_in_bio_billing::refunds`): within 14 days a purchase may be cancelled (all of it,
+less the days used and its fee share); later, whole unstarted months come back, newest purchases first, at what each
+purchase paid per month, less their fee share; a late Chain Payments payment comes back whole within 30 days. The
+fee share is `(fixed + percent × paid) × k ÷ m`, charged as a share of what was paid (no exchange-rate exposure), and the
+amount is rounded down in the unit paid. A request's refund takes back exactly its months: with the fee netted off, the
+pro-rata rule would have left the account holder a month they were refunded for. `Store::refund_purchase`'s pro rata
+stays for refunds that match no request, counted over every refund of the purchase (`billing_events.refund_of`, schema 6).
+No process holds a key that can refund; a provider's refund notification of exactly a line's amount closes it.
+Tests: the refund rules in `crates/billing/src/refunds.rs` (cancel, fee share in another currency and a coin, newest
+purchases first, the month in progress and granted months kept, 0 or less refused), `refund_lines_take_back_exactly_their_months_once`
+(store) and `refunds_on_request_net_of_fees_matched_or_recorded_exactly` (hosted).
+
 ### F27 — Notifications are applied without comparing the paid amount with the checkout
 
 **Severity:** Low   **Disposition:** RESOLVED (FU-0140)
@@ -677,7 +691,7 @@ refused) and `card_payments_apply_only_when_they_cover_the_checkout_and_refunds_
 
 ### F28 — One account can spend the shared Web Risk budget
 
-**Severity:** Low   **Disposition:** RESOLVED (FU-0141, OQ2)
+**Severity:** Low   **Disposition:** RESOLVED (FU-0141, OQ2; reworked 2026-11-18)
 **Where:** `hosted/app.rs::page_publish` (every unscreened link of up to 60 is screened); `safety::Screener::screen` (the
 monthly cap is global).
 **Issue:** Each publish with 60 new URLs spends 60 calls. At the ingress limit one account could spend the 90 000 monthly calls in
@@ -687,9 +701,28 @@ lists only); no money is spent (the cap is hard). Latent: no Web Risk key and no
 **Remediation / evidence:** a per-account daily budget of Web Risk calls (the number is OQ2), with links beyond it recorded
 as unknown and rescreened by the worker. Tracked in FU-0141.
 
-Done: `WEB_RISK_ACCOUNT_DAILY_CAP` (default 200, `0` for none) is taken from `lib.counters` per account and UTC day before
-each Web Risk call a publish makes; past it the link is recorded as unknown, shown, and screened again by the worker within
-the hour under the monthly cap. Test: `one_account_cannot_spend_everyones_screening` (hosted).
+First built as a per-account daily budget of Lookup calls; then replaced, as decided, because cost grew with the links held
+(each clean link was looked up again daily: about 1 800 calls a month for one full page, so about 50 full accounts reached
+the 90 000 cap) and the worker's rescreen was bounded per account by nothing:
+
+- Web Risk's Update API (`crates/safety/src/webrisk.rs`). The worker alone keeps the three lists of hash prefixes in
+  `lib.web_risk_lists` with `threatLists.computeDiff` (RAW; `RESET` and `DIFF`; the SHA-256 checksum verified, a
+  mismatch discarding the diff and asking for the whole list; `recommendedNextDiff` followed). The app and the worker
+  hold the lists in memory and reload them when they change. Links are canonicalised and expanded as "URLs and hashing"
+  specifies (every canonicalisation test vector of that page and its expression examples pass) and checked locally, so
+  daily rechecks cost nothing. Only a local match sends its prefix (never the URL) to `hashes.search`, cached until
+  `expireTime` / `negativeExpireTime`.
+- Pricing (<https://cloud.google.com/web-risk/pricing>, read 2026-11-18): `computeDiff` is free without limit;
+  `hashes.search` is $50 per 1 000 with no free tier, and calling `computeDiff` moves `uris.search` onto that price. So
+  `WEB_RISK_MONTHLY_CAP` stays the hard stop over every call, and `WEB_RISK_CONFIRM_MONTHLY_CAP` (default 0) bounds the
+  billed one; with it at 0, a local match is hidden until an operator reviews it (`webrisk-prefix`), checked again daily.
+- `WEB_RISK_ACCOUNT_DAILY_CAP` is removed: `NEW_LINKS_PER_ACCOUNT_DAY` (`ACCOUNT_LIMITS`) bounds what one account can make
+  the service check, and `PUBLISHES_PER_ACCOUNT_HOUR` how often; a publish that only removes or hides links is never
+  limited.
+
+Tests: `webrisk::tests::*` (the spec's vectors, expressions and hash prefixes; a reset then a diff with its checksum;
+lookups; answers read), `layers_lists_caps_and_outage` (safety, against a stand-in Update API),
+`an_account_has_change_budgets_but_can_always_remove_links` (hosted) and `limits::tests::*`.
 
 ### F29 — Pictures are keyed by their hash across accounts
 
@@ -772,7 +805,7 @@ nothing by themselves (an operator decides).
 | I12 | A provider event changes a paid period at most once | unique `(provider, provider_event)`; shared `paid:<ref>` key | `billing_periods_are_idempotent`; conformance suite | HOLDS |
 | I13 | Only an authentic notification is applied | each adapter's `verify_notification` | `crates/billing/tests/conformance.rs` (tampered and stale refused) | HOLDS |
 | I14 | A notification credits only what was paid | `apply_event` with `ProviderEvent::paid` (F27) | `a_payment_counts_only_when_it_covers_the_checkout`, `card_payments_apply_only_when_they_cover_the_checkout_and_refunds_take_months_pro_rata` | HOLDS |
-| I15 | Refunds take back what was refunded | `Store::refund_purchase` (pro rata on the running total, F26) | `refunds_take_months_back_pro_rata_and_never_more_than_bought`, `refunds_give_back_months_pro_rata_rounded_down` | HOLDS |
+| I15 | Refunds take back what was refunded | `Store::refund_line` (exactly a request's months), `Store::refund_purchase` (pro rata on the running total otherwise, F26) | `refunds_take_months_back_pro_rata_and_never_more_than_bought`, `refunds_give_back_months_pro_rata_rounded_down` | HOLDS |
 | I16 | Every outbound URL a buyer controls reaches only public addresses | `OpenPayments::checked` + `PublicOnly` resolver | `only_public_addresses`, `the_resolver_refuses_names_of_private_addresses_at_connect_time` | HOLDS (F5) |
 | I17 | Requests and upstream answers are bounded in size, time and number | body limits; `bounded`; `read_limited`; decode limits | `bounds_tests::*`, `answers_are_read_up_to_a_limit`, `pictures_too_large_to_decode_safely_are_refused_before_decoding` | HOLDS (F1, F2, F4) |
 | I18 | The page server reads only public views and holds no key | read-only role and `Access::ReadOnly`; `hosted_env` | `the_page_server_never_reads_a_secret_file`, `…_payment_providers`, `the_pages_role_reads_only_the_public_views_and_writes_nothing` | HOLDS |
@@ -780,7 +813,7 @@ nothing by themselves (an operator decides).
 | I20 | Values are bound parameters; no string-built SQL with values | `store` | inspection | HOLDS (code-only) |
 | I21 | Database transport is `verify-full` only (or an explicit local switch); secrets never in `Debug` or errors | `DatabaseSettings::parse` | config tests incl. `the_password_never_appears_in_debug_or_errors` | HOLDS |
 | I22 | Reserved and look-alike handles cannot be taken | `check_handle`, `looks_reserved`, unique `handle_skeleton` | `skeletons`; store handle test | HOLDS |
-| I23 | The screening budget never passes its monthly cap | `take_from_counter`, monthly and per account per day (F28) | `crates/safety/tests/screen.rs`, `one_account_cannot_spend_everyones_screening` | HOLDS |
+| I23 | The screening budget never passes its monthly cap | `take_from_counter(s)`: every call monthly, `hashes.search` under its own cap; links an account can add per day (F28) | `layers_lists_caps_and_outage`, `an_account_has_change_budgets_but_can_always_remove_links` | HOLDS |
 | I24 | No panic on attacker input; no `unsafe` | `forbid(unsafe_code)`; no `unwrap` on request paths (OS RNG only); `overflow-checks`, `panic = "abort"` | clippy; parser property tests | HOLDS (code-only for the handlers) |
 
 ## Section B — Supply-chain, publish-authority & capability matrix
@@ -894,7 +927,7 @@ sign-in message.
 
 ## Section C — Test-coverage & hermetic/live split
 
-### C.1 Coverage grade — B+ (137 tests on stable, 25 of them against PostgreSQL over TLS)
+### C.1 Coverage grade — B+ (163 tests on stable, 28 of them against PostgreSQL over TLS)
 
 | Dimension | Assessment |
 | --- | --- |
@@ -950,7 +983,7 @@ Not covered by tests:
 
 - [x] notification amounts compared with the checkout (F27, FU-0140)
 - [x] the partial-refund rule built (F26, OQ1: pro rata, FU-0139)
-- [x] a per-account screening budget (F28, OQ2, FU-0141)
+- [x] screening cost bounded per account and over the month (F28, OQ2: Update API lists, confirmation cap, change limits; FU-0141)
 - [x] pictures keyed per account (F29, FU-0142)
 - [ ] sandbox runs of every provider and feed that will be switched on (FU-0118, FU-0119)
 - [ ] database in the backup set with an offsite copy; a dated restore drill (DB-M9)
@@ -1015,10 +1048,12 @@ Not covered by tests:
 ## Open questions (`OQ#`)
 
 - **OQ1** — How should a partial refund change the paid period: pro rata by amount (rounded down), only full refunds take
-  months back, or a console adjustment by hand? (F26, FU-0139) Built: pro rata, rounded down, on the running total.
-- **OQ2** — How many Web Risk calls may one account spend a day (for example 200), and what happens beyond it (links
-  recorded as unknown and rescreened by the worker, or the publish refused)? (F28, FU-0141) Built: 200 by default
-  (`WEB_RISK_ACCOUNT_DAILY_CAP`), links beyond it recorded as unknown and rescreened by the worker.
+  months back, or a console adjustment by hand? (F26, FU-0139) Decided 2026-11-18: refunds on request (cancel within
+  14 days less the days used and the fee share; unstarted months later, newest purchases first), taking back exactly
+  their months; other refunds pro rata, rounded down, on the running total.
+- **OQ2** — How many Web Risk calls may one account spend a day, and what happens beyond it? (F28, FU-0141) Decided
+  2026-11-18: none per account; the Update API checks links locally, `NEW_LINKS_PER_ACCOUNT_DAY` bounds what an account
+  can make the service check, and `WEB_RISK_CONFIRM_MONTHLY_CAP` (default 0, the only billed call) the confirmations.
 
 ## Risks (residual)
 

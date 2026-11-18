@@ -137,6 +137,7 @@ pub fn credits_from_transactions(list: &Value) -> (Vec<Credit>, Option<OffsetDat
                 currency: currency.to_string(),
                 booked: t["completed_at"].as_str().and_then(|c| c.get(..10)).map(String::from),
                 entry: format!("revolut-{id}-{}", leg["leg_id"].as_str().unwrap_or("")),
+                debtor: None,
             });
         }
     }

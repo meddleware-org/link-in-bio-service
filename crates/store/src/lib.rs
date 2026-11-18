@@ -213,25 +213,131 @@ pub struct BillingEventDetail {
     pub created_at: OffsetDateTime,
 }
 
-/// An account holder's request to refund an unapplied payment, with what the operator needs to send it.
+/// An account holder's refund request (`kind`: `cancel`, `unstarted` or `unapplied`). What each purchase gives back is
+/// a [`RefundLine`]; a request made before schema 6 has none and names its one payment (`event_id`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct RefundRequest {
     pub id: Uuid,
-    pub event_id: Uuid,
+    pub event_id: Option<Uuid>,
     pub account_id: Uuid,
     pub handle: String,
+    pub kind: String,
     pub reason: String,
     pub status: String,
+    pub details: Value,
     pub refund_reference: Option<String>,
     pub refund_event: Option<Uuid>,
     pub decided_by: Option<String>,
     pub decided_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
+    pub provider: Option<String>,
+    pub months: Option<i32>,
+    pub amount_pence: Option<i64>,
+    pub evidence: Option<Value>,
+    pub paid_at: Option<OffsetDateTime>,
+}
+
+/// What one purchase gives back on a refund request, exactly: the operator sends `amount_minor` of `unit` to
+/// `destination`, and the ledger takes back `months`.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct RefundLine {
+    pub request_id: Uuid,
+    pub purchase_id: Uuid,
+    pub checkout_id: Option<Uuid>,
     pub provider: String,
     pub months: i32,
+    pub amount_minor: i64,
+    pub unit: String,
+    pub scale: Option<i32>,
+    pub fee_minor: i64,
+    pub used_minor: i64,
+    pub days_used: i32,
+    pub amount_pence: i64,
+    pub destination: Value,
+    pub status: String,
+    pub refund_reference: Option<String>,
+    pub refund_event: Option<Uuid>,
+    pub refunded_at: Option<OffsetDateTime>,
+    /// The months its purchase still gives now.
+    pub held: i64,
+}
+
+/// A line to record with a new refund request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRefundLine {
+    pub purchase_id: Uuid,
+    pub checkout_id: Option<Uuid>,
+    pub provider: String,
+    pub months: i32,
+    pub amount_minor: i64,
+    pub unit: String,
+    pub scale: Option<i32>,
+    pub fee_minor: i64,
+    pub used_minor: i64,
+    pub days_used: i32,
+    pub amount_pence: i64,
+    pub destination: Value,
+}
+
+/// Why a refund request was not recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefundConflict {
+    /// The account already has an open request.
+    OpenRequest,
+    /// This payment was asked about before (a late payment is asked back once).
+    AlreadyAsked,
+}
+
+/// A line refunded: whose period changed, how many months it took back, and whether the request is now closed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineRefunded {
+    pub account_id: Uuid,
+    pub event_id: Uuid,
+    pub months_taken: u32,
+    pub paid_until: Option<OffsetDateTime>,
+    pub request_closed: bool,
+}
+
+/// A purchase or grant with the months it still gives (its months plus its refunds'), for refunds on request.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct Extension {
+    pub id: Uuid,
+    pub provider: String,
+    pub kind: String,
+    pub months: i32,
+    pub held: i64,
     pub amount_pence: i64,
     pub evidence: Value,
-    pub paid_at: OffsetDateTime,
+    pub created_at: OffsetDateTime,
+    pub paid_until_after: Option<OffsetDateTime>,
+    pub checkout_id: Option<Uuid>,
+    pub method: Option<String>,
+    pub provider_ref: Option<String>,
+}
+
+/// One Web Risk threat list as the worker keeps it (`prefixes`: sorted, each a length byte and its bytes).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct WebRiskList {
+    pub threat_type: String,
+    pub version_token: String,
+    pub entries: i32,
+    pub prefixes: Vec<u8>,
+    pub checksum: String,
+    pub next_diff_at: Option<OffsetDateTime>,
+    pub updated_at: OffsetDateTime,
+    pub last_error: Option<String>,
+}
+
+/// A Web Risk list's state without its prefixes (what the app compares to decide whether to reload, and the console
+/// shows).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct WebRiskListState {
+    pub threat_type: String,
+    pub version_token: String,
+    pub entries: i32,
+    pub next_diff_at: Option<OffsetDateTime>,
+    pub updated_at: OffsetDateTime,
+    pub last_error: Option<String>,
 }
 
 /// A recorded refund: whose period changed, to when, and the refund's own billing event.
@@ -256,6 +362,10 @@ pub struct PeriodChange<'a> {
     pub evidence: Value,
     /// The checkout this settles, if any (marked paid in the same transaction).
     pub checkout: Option<Uuid>,
+    /// The checkout a purchase paid (recorded on the event; a late payment names its checkout without settling it).
+    pub checkout_id: Option<Uuid>,
+    /// For a refund: the purchase it takes months back from.
+    pub refund_of: Option<Uuid>,
 }
 
 /// A refund of (part of) a purchase made through a checkout ([`Store::refund_purchase`]).
@@ -1257,8 +1367,9 @@ impl Store {
     ) -> Result<Option<(Uuid, OffsetDateTime)>, DbError> {
         let id = Uuid::new_v4();
         let inserted = sqlx::query(
-            "INSERT INTO lib.billing_events (id, account_id, provider, provider_event, kind, months, amount_pence, evidence)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (provider, provider_event) DO NOTHING",
+            "INSERT INTO lib.billing_events (id, account_id, provider, provider_event, kind, months, amount_pence, evidence,
+                                             checkout_id, refund_of)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (provider, provider_event) DO NOTHING",
         )
         .bind(id)
         .bind(c.account_id)
@@ -1268,6 +1379,8 @@ impl Store {
         .bind(c.months)
         .bind(c.amount_pence)
         .bind(&c.evidence)
+        .bind(c.checkout_id.or(if c.kind == "purchase" { c.checkout } else { None }))
+        .bind(c.refund_of)
         .execute(&mut **tx)
         .await?
         .rows_affected()
@@ -1302,12 +1415,71 @@ impl Store {
         Ok(Some((id, until)))
     }
 
-    /// Applies a provider's refund of a purchase once per provider event: the months it takes back are the difference
+    /// The purchase event that paid a checkout (not a late payment credited against it).
+    async fn purchase_of_checkout(tx: &mut Transaction<'_, Postgres>, checkout: Uuid) -> Result<Option<Uuid>, DbError> {
+        sqlx::query_scalar(
+            "SELECT id FROM lib.billing_events
+              WHERE checkout_id = $1 AND kind = 'purchase' AND NOT coalesce((evidence->>'unapplied')::boolean, false)
+              ORDER BY created_at LIMIT 1",
+        )
+        .bind(checkout)
+        .fetch_optional(&mut **tx)
+        .await
+    }
+
+    /// What refunds have given back of a purchase so far: `(minor units refunded, months taken back)`.
+    async fn refunded_so_far(tx: &mut Transaction<'_, Postgres>, purchase: Uuid) -> Result<(u64, u32), DbError> {
+        let row = sqlx::query(
+            "SELECT coalesce(sum((evidence->>'refundedMinor')::bigint), 0)::bigint AS refunded,
+                    coalesce(sum(-months), 0)::bigint AS taken
+               FROM lib.billing_events WHERE kind = 'refund' AND refund_of = $1",
+        )
+        .bind(purchase)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok((
+            u64::try_from(row.try_get::<i64, _>("refunded")?).unwrap_or(0),
+            u32::try_from(row.try_get::<i64, _>("taken")?).unwrap_or(0),
+        ))
+    }
+
+    /// A refund that takes no month back (nothing left, or a checkout never paid), recorded once all the same.
+    async fn record_zero_refund(
+        tx: &mut Transaction<'_, Postgres>,
+        c: &PeriodChange<'_>,
+    ) -> Result<Option<(Uuid, Option<OffsetDateTime>)>, DbError> {
+        let until: Option<OffsetDateTime> = sqlx::query_scalar("SELECT paid_until FROM lib.accounts WHERE id = $1")
+            .bind(c.account_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        let id = Uuid::new_v4();
+        let inserted = sqlx::query(
+            "INSERT INTO lib.billing_events (id, account_id, provider, provider_event, kind, months, amount_pence,
+                                             paid_until_after, evidence, refund_of)
+             VALUES ($1, $2, $3, $4, 'refund', 0, $5, $6, $7, $8) ON CONFLICT (provider, provider_event) DO NOTHING",
+        )
+        .bind(id)
+        .bind(c.account_id)
+        .bind(c.provider)
+        .bind(c.provider_event)
+        .bind(c.amount_pence)
+        .bind(until)
+        .bind(&c.evidence)
+        .bind(c.refund_of)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected()
+            == 1;
+        Ok(inserted.then_some((id, until)))
+    }
+
+    /// Applies a provider's refund of a purchase that no refund request names (an operator's ad-hoc refund, one the
+    /// provider made), once per provider event: the months it takes back are the difference
     /// `share(months, paid, refunded so far + this one) − months already taken back` (`share` is
-    /// `link_in_bio_billing::months_refunded`: pro rata, rounded down, all of them for the whole amount), so the refunds
-    /// of one purchase never take back more than it bought. The checkout row is locked, so two refunds of one purchase
-    /// are counted one after the other. A checkout that was never paid gives nothing back. `None` when this event was
-    /// applied before.
+    /// `link_in_bio_billing::months_refunded`: pro rata, rounded down, all of them for the whole amount), counted over
+    /// every refund of the purchase (requests' included), so the refunds of one purchase never take back more than it
+    /// bought. The checkout row is locked, so two refunds of one purchase are counted one after the other. A checkout
+    /// that was never paid gives nothing back. `None` when this event was applied before.
     pub async fn refund_purchase(
         &self,
         r: &RefundChange<'_>,
@@ -1329,19 +1501,12 @@ impl Store {
         if seen {
             return Ok(None);
         }
-        let row = sqlx::query(
-            "SELECT coalesce(sum((evidence->>'refundedMinor')::bigint), 0)::bigint AS refunded,
-                    coalesce(sum(-months), 0)::bigint AS taken
-               FROM lib.billing_events
-              WHERE account_id = $1 AND kind = 'refund' AND evidence->>'refundOfCheckout' = $2",
-        )
-        .bind(r.account_id)
-        .bind(r.checkout.to_string())
-        .fetch_one(&mut *tx)
-        .await?;
-        let before_refunded = u64::try_from(row.try_get::<i64, _>("refunded")?).unwrap_or(0);
-        let before_taken = u32::try_from(row.try_get::<i64, _>("taken")?).unwrap_or(0);
-        let total = if status.as_deref() == Some("paid") {
+        let purchase = Self::purchase_of_checkout(&mut tx, r.checkout).await?;
+        let (before_refunded, before_taken) = match purchase {
+            Some(p) => Self::refunded_so_far(&mut tx, p).await?,
+            None => (0, 0),
+        };
+        let total = if status.as_deref() == Some("paid") && purchase.is_some() {
             share(r.months, r.paid_minor, before_refunded.saturating_add(r.refunded_minor)).min(r.months)
         } else {
             0
@@ -1358,42 +1523,41 @@ impl Store {
         evidence["refundedMinor"] = serde_json::json!(r.refunded_minor);
         evidence["paidMinor"] = serde_json::json!(r.paid_minor);
         evidence["monthsTaken"] = serde_json::json!(take);
+        let change = PeriodChange {
+            account_id: r.account_id,
+            provider: r.provider,
+            provider_event: r.provider_event,
+            kind: "refund",
+            months: -(take as i32),
+            amount_pence: -pence,
+            evidence,
+            checkout: None,
+            checkout_id: None,
+            refund_of: purchase,
+        };
         let paid_until = if take > 0 {
-            let change = PeriodChange {
-                account_id: r.account_id,
-                provider: r.provider,
-                provider_event: r.provider_event,
-                kind: "refund",
-                months: -(take as i32),
-                amount_pence: -pence,
-                evidence,
-                checkout: None,
-            };
             Self::change_period_in(&mut tx, &change, now).await?.map(|(_, until)| until)
         } else {
-            // Nothing to take back (yet): the refund is still recorded, once, with what it counts towards.
-            let until: Option<OffsetDateTime> = sqlx::query_scalar("SELECT paid_until FROM lib.accounts WHERE id = $1")
-                .bind(r.account_id)
-                .fetch_one(&mut *tx)
-                .await?;
-            sqlx::query(
-                "INSERT INTO lib.billing_events (id, account_id, provider, provider_event, kind, months, amount_pence,
-                                                 paid_until_after, evidence)
-                 VALUES ($1, $2, $3, $4, 'refund', 0, $5, $6, $7)",
-            )
-            .bind(Uuid::new_v4())
-            .bind(r.account_id)
-            .bind(r.provider)
-            .bind(r.provider_event)
-            .bind(-pence)
-            .bind(until)
-            .bind(&evidence)
-            .execute(&mut *tx)
-            .await?;
-            until
+            Self::record_zero_refund(&mut tx, &change).await?.and_then(|(_, until)| until)
         };
         tx.commit().await?;
         Ok(Some(RefundApplied { months_taken: take, paid_until }))
+    }
+
+    /// An account's purchases and grants, newest first, with the months each still gives.
+    pub async fn extensions(&self, account: Uuid) -> Result<Vec<Extension>, DbError> {
+        sqlx::query_as(
+            "SELECT e.id, e.provider, e.kind, e.months, e.amount_pence, e.evidence, e.created_at, e.paid_until_after,
+                    e.checkout_id, c.method, c.provider_ref,
+                    (e.months + coalesce((SELECT sum(r.months) FROM lib.billing_events r WHERE r.refund_of = e.id), 0))::bigint
+                      AS held
+               FROM lib.billing_events e LEFT JOIN lib.checkouts c ON c.id = e.checkout_id
+              WHERE e.account_id = $1 AND e.kind IN ('purchase', 'grant') AND e.months > 0
+              ORDER BY e.created_at DESC",
+        )
+        .bind(account)
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn billing_events(&self, account: Uuid) -> Result<Vec<BillingEvent>, DbError> {
@@ -1419,31 +1583,96 @@ impl Store {
 
     // ── refund requests ────────────────────────────────────────────────────
 
-    /// Records an account holder's refund request for a billing event: its id, or `None` when that event already has
-    /// one.
+    /// Records an account holder's refund request for a late payment (schema 4's kind, without lines): its id, or
+    /// `None` when that event already has one or the account has an open request.
     pub async fn create_refund_request(
         &self,
         event: Uuid,
         account: Uuid,
         reason: &str,
     ) -> Result<Option<Uuid>, DbError> {
-        sqlx::query_scalar(
+        let r = sqlx::query_scalar(
             "INSERT INTO lib.refund_requests (id, event_id, account_id, reason) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (event_id) DO NOTHING RETURNING id",
+             ON CONFLICT DO NOTHING RETURNING id",
         )
         .bind(Uuid::new_v4())
         .bind(event)
         .bind(account)
         .bind(reason)
         .fetch_optional(&self.pool)
-        .await
+        .await?;
+        Ok(r)
+    }
+
+    /// Records a refund request with what each purchase gives back, in one transaction. `event` names the late payment
+    /// of an `unapplied` request (asked once). Refused when the account has an open request already.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_refund_request_lines(
+        &self,
+        account: Uuid,
+        kind: &str,
+        event: Option<Uuid>,
+        reason: &str,
+        details: &Value,
+        lines: &[NewRefundLine],
+        now: OffsetDateTime,
+    ) -> Result<Result<Uuid, RefundConflict>, DbError> {
+        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
+        let id = Uuid::new_v4();
+        let inserted = sqlx::query(
+            "INSERT INTO lib.refund_requests (id, event_id, account_id, kind, reason, details, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(id)
+        .bind(event)
+        .bind(account)
+        .bind(kind)
+        .bind(reason)
+        .bind(details)
+        .bind(now)
+        .execute(&mut *tx)
+        .await;
+        if let Err(sqlx::Error::Database(e)) = &inserted
+            && e.code().as_deref() == Some("23505")
+        {
+            return Ok(Err(if e.constraint() == Some("refund_requests_one_open") {
+                RefundConflict::OpenRequest
+            } else {
+                RefundConflict::AlreadyAsked
+            }));
+        }
+        inserted?;
+        for l in lines {
+            sqlx::query(
+                "INSERT INTO lib.refund_lines (request_id, purchase_id, checkout_id, provider, months, amount_minor, unit,
+                                               scale, fee_minor, used_minor, days_used, amount_pence, destination)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            )
+            .bind(id)
+            .bind(l.purchase_id)
+            .bind(l.checkout_id)
+            .bind(&l.provider)
+            .bind(l.months)
+            .bind(l.amount_minor)
+            .bind(&l.unit)
+            .bind(l.scale)
+            .bind(l.fee_minor)
+            .bind(l.used_minor)
+            .bind(l.days_used)
+            .bind(l.amount_pence)
+            .bind(&l.destination)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Ok(id))
     }
 
     const REFUND_SELECT: &'static str =
-        "SELECT r.id, r.event_id, r.account_id, a.handle, r.reason, r.status, r.refund_reference, r.refund_event,
-                r.decided_by, r.decided_at, r.created_at, e.provider, e.months, e.amount_pence, e.evidence,
-                e.created_at AS paid_at
-           FROM lib.refund_requests r JOIN lib.billing_events e ON e.id = r.event_id
+        "SELECT r.id, r.event_id, r.account_id, a.handle, r.kind, r.reason, r.status, r.details, r.refund_reference,
+                r.refund_event, r.decided_by, r.decided_at, r.created_at, e.provider, e.months, e.amount_pence,
+                e.evidence, e.created_at AS paid_at
+           FROM lib.refund_requests r LEFT JOIN lib.billing_events e ON e.id = r.event_id
            JOIN lib.accounts a ON a.id = r.account_id";
 
     /// Requests by status, oldest first (the console's queue).
@@ -1476,8 +1705,178 @@ impl Store {
             .await
     }
 
-    /// The operator sent the refund: records its reference and takes the payment's months back as a `refund` event,
-    /// in one transaction and once (`None` when the request is not open).
+    const LINE_SELECT: &'static str =
+        "SELECT l.request_id, l.purchase_id, l.checkout_id, l.provider, l.months, l.amount_minor, l.unit, l.scale,
+                l.fee_minor, l.used_minor, l.days_used, l.amount_pence, l.destination, l.status, l.refund_reference,
+                l.refund_event, l.refunded_at,
+                (p.months + coalesce((SELECT sum(x.months) FROM lib.billing_events x WHERE x.refund_of = p.id), 0))::bigint
+                  AS held
+           FROM lib.refund_lines l JOIN lib.billing_events p ON p.id = l.purchase_id";
+
+    /// The lines of these requests, newest purchase first within each.
+    pub async fn refund_lines(&self, requests: &[Uuid]) -> Result<Vec<RefundLine>, DbError> {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "{} WHERE l.request_id = ANY($1) ORDER BY l.request_id, p.created_at DESC",
+            Self::LINE_SELECT
+        )))
+        .bind(requests)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// The open line of an open request for this checkout's purchase, if one waits (a provider's refund notification
+    /// is matched against it).
+    pub async fn open_refund_line_for_checkout(&self, checkout: Uuid) -> Result<Option<RefundLine>, DbError> {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "{} JOIN lib.refund_requests q ON q.id = l.request_id
+              WHERE l.checkout_id = $1 AND l.status = 'open' AND q.status = 'open' LIMIT 1",
+            Self::LINE_SELECT
+        )))
+        .bind(checkout)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// One line was refunded (by the operator, who records its reference, or matched from the provider's refund
+    /// notification, whose event id is then `provider_event`): takes back exactly the line's months (never more than
+    /// the purchase still gives), once, and closes the request when no line is left open. `None` when the request or
+    /// the line is not open, or the provider event was applied before.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn refund_line(
+        &self,
+        request: Uuid,
+        purchase: Uuid,
+        reference: &str,
+        by: &str,
+        provider_event: Option<&str>,
+        evidence: Value,
+        now: OffsetDateTime,
+    ) -> Result<Option<LineRefunded>, DbError> {
+        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
+        let account: Option<Uuid> = sqlx::query_scalar(
+            "SELECT account_id FROM lib.refund_requests WHERE id = $1 AND status = 'open' FOR UPDATE",
+        )
+        .bind(request)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(account_id) = account else { return Ok(None) };
+        let line = sqlx::query(
+            "SELECT checkout_id, provider, months, amount_minor, unit, amount_pence FROM lib.refund_lines
+              WHERE request_id = $1 AND purchase_id = $2 AND status = 'open' FOR UPDATE",
+        )
+        .bind(request)
+        .bind(purchase)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(line) = line else { return Ok(None) };
+        let checkout: Option<Uuid> = line.try_get("checkout_id")?;
+        if let Some(c) = checkout {
+            // The same lock as a provider's refund of this checkout, so the two are counted one after the other.
+            sqlx::query("SELECT 1 FROM lib.checkouts WHERE id = $1 FOR UPDATE").bind(c).execute(&mut *tx).await?;
+        }
+        let provider: String = line.try_get("provider")?;
+        let months: i32 = line.try_get("months")?;
+        let amount_minor: i64 = line.try_get("amount_minor")?;
+        let pence: i64 = line.try_get("amount_pence")?;
+        let held: i64 = sqlx::query_scalar(
+            "SELECT (p.months + coalesce((SELECT sum(x.months) FROM lib.billing_events x WHERE x.refund_of = p.id), 0))::bigint
+               FROM lib.billing_events p WHERE p.id = $1",
+        )
+        .bind(purchase)
+        .fetch_one(&mut *tx)
+        .await?;
+        let take = u32::try_from(i64::from(months).min(held).max(0)).unwrap_or(0);
+        let key = provider_event.map(String::from).unwrap_or_else(|| format!("refund-line:{request}:{purchase}"));
+        let mut evidence = evidence;
+        evidence["refundRequest"] = serde_json::json!(request);
+        evidence["reference"] = serde_json::json!(reference);
+        evidence["operator"] = serde_json::json!(by);
+        evidence["refundedMinor"] = serde_json::json!(amount_minor);
+        evidence["unit"] = line.try_get::<String, _>("unit")?.into();
+        evidence["monthsTaken"] = serde_json::json!(take);
+        let change = PeriodChange {
+            account_id,
+            provider: &provider,
+            provider_event: &key,
+            kind: "refund",
+            months: -(take as i32),
+            amount_pence: -pence,
+            evidence,
+            checkout: None,
+            checkout_id: None,
+            refund_of: Some(purchase),
+        };
+        let applied = if take > 0 {
+            Self::change_period_in(&mut tx, &change, now).await?.map(|(id, until)| (id, Some(until)))
+        } else {
+            Self::record_zero_refund(&mut tx, &change).await?
+        };
+        let Some((event_id, paid_until)) = applied else { return Ok(None) };
+        sqlx::query(
+            "UPDATE lib.refund_lines SET status = 'refunded', refund_reference = $3, refund_event = $4, refunded_at = $5
+              WHERE request_id = $1 AND purchase_id = $2",
+        )
+        .bind(request)
+        .bind(purchase)
+        .bind(reference)
+        .bind(event_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let open_left: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM lib.refund_lines WHERE request_id = $1 AND status = 'open')",
+        )
+        .bind(request)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !open_left {
+            sqlx::query(
+                "UPDATE lib.refund_requests SET status = 'refunded', refund_reference = $2, refund_event = $3,
+                        decided_by = $4, decided_at = $5 WHERE id = $1",
+            )
+            .bind(request)
+            .bind(reference)
+            .bind(event_id)
+            .bind(by)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(LineRefunded { account_id, event_id, months_taken: take, paid_until, request_closed: !open_left }))
+    }
+
+    /// Closes an open request without a refund: `withdrawn` by its account holder (`account` must match) or `declined`
+    /// by the operator, with a note. `false` when it is not open.
+    pub async fn close_refund_request(
+        &self,
+        id: Uuid,
+        account: Option<Uuid>,
+        status: &str,
+        by: &str,
+        note: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let r = sqlx::query(
+            "UPDATE lib.refund_requests SET status = $2, decided_by = $3, decided_at = $4,
+                    details = details || jsonb_build_object('note', $5::text)
+              WHERE id = $1 AND status = 'open' AND ($6::uuid IS NULL OR account_id = $6)
+                AND $2 IN ('withdrawn', 'declined')",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(by)
+        .bind(now)
+        .bind(note)
+        .bind(account)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// The operator sent the refund of a request made before schema 6 (one late payment, no lines): records its
+    /// reference and takes the payment's months back as a `refund` event, in one transaction and once (`None` when the
+    /// request is not open or has lines, which [`Store::refund_line`] records).
     pub async fn record_refund(
         &self,
         request: Uuid,
@@ -1490,7 +1889,9 @@ impl Store {
         let row = sqlx::query(
             "SELECT r.account_id, r.event_id, e.provider, e.months, e.amount_pence
                FROM lib.refund_requests r JOIN lib.billing_events e ON e.id = r.event_id
-              WHERE r.id = $1 AND r.status = 'open' FOR UPDATE OF r",
+              WHERE r.id = $1 AND r.status = 'open'
+                AND NOT EXISTS (SELECT 1 FROM lib.refund_lines l WHERE l.request_id = r.id)
+                FOR UPDATE OF r",
         )
         .bind(request)
         .fetch_optional(&mut *tx)
@@ -1513,6 +1914,8 @@ impl Store {
                 "refundRequest": request, "refundOf": original, "reference": reference, "operator": by, "note": note,
             }),
             checkout: None,
+            checkout_id: None,
+            refund_of: Some(original),
         };
         let Some((event_id, paid_until)) = Self::change_period_in(&mut tx, &change, now).await? else {
             return Ok(None);
@@ -2096,6 +2499,100 @@ impl Store {
             .unwrap_or(0))
     }
 
+    /// Takes from several counters at once, all or none (in one transaction): `None` when every take fitted under its
+    /// cap, or the index of the first that did not (nothing is taken then). Each take is `(name, period, by, cap)`.
+    pub async fn take_from_counters(&self, takes: &[(String, String, i64, i64)]) -> Result<Option<usize>, DbError> {
+        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
+        for (i, (name, period, by, cap)) in takes.iter().enumerate() {
+            let v: Option<i64> = sqlx::query_scalar(
+                "INSERT INTO lib.counters (name, period, value) SELECT $1, $2, $3 WHERE $3 <= $4
+                 ON CONFLICT (name, period) DO UPDATE SET value = lib.counters.value + $3
+                  WHERE lib.counters.value + $3 <= $4
+                 RETURNING value",
+            )
+            .bind(name)
+            .bind(period)
+            .bind(by)
+            .bind(cap)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if v.is_none() {
+                tx.rollback().await?;
+                return Ok(Some(i));
+            }
+        }
+        tx.commit().await?;
+        Ok(None)
+    }
+
+    // ── Web Risk lists ─────────────────────────────────────────────────────
+
+    /// Every list's state, without its prefixes.
+    pub async fn web_risk_lists(&self) -> Result<Vec<WebRiskListState>, DbError> {
+        sqlx::query_as(
+            "SELECT threat_type, version_token, entries, next_diff_at, updated_at, last_error
+               FROM lib.web_risk_lists ORDER BY threat_type",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn web_risk_list(&self, threat_type: &str) -> Result<Option<WebRiskList>, DbError> {
+        sqlx::query_as(
+            "SELECT threat_type, version_token, entries, prefixes, checksum, next_diff_at, updated_at, last_error
+               FROM lib.web_risk_lists WHERE threat_type = $1",
+        )
+        .bind(threat_type)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Stores a list after a verified update (the worker only).
+    pub async fn put_web_risk_list(&self, l: &WebRiskList) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO lib.web_risk_lists (threat_type, version_token, entries, prefixes, checksum, next_diff_at,
+                                             updated_at, last_error)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (threat_type) DO UPDATE SET version_token = $2, entries = $3, prefixes = $4, checksum = $5,
+                    next_diff_at = $6, updated_at = $7, last_error = $8",
+        )
+        .bind(&l.threat_type)
+        .bind(&l.version_token)
+        .bind(l.entries)
+        .bind(&l.prefixes)
+        .bind(&l.checksum)
+        .bind(l.next_diff_at)
+        .bind(l.updated_at)
+        .bind(&l.last_error)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
+    /// An update failed: keeps the list as it was, records why and when to try again; `full` asks for the whole list
+    /// next time (a checksum mismatch). The list's `updated_at` is unchanged, so nobody reloads it.
+    pub async fn web_risk_list_failed(
+        &self,
+        threat_type: &str,
+        error: &str,
+        next: OffsetDateTime,
+        full: bool,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO lib.web_risk_lists (threat_type, next_diff_at, last_error, updated_at)
+             VALUES ($1, $3, $2, 'epoch')
+             ON CONFLICT (threat_type) DO UPDATE SET next_diff_at = $3, last_error = $2,
+                    version_token = CASE WHEN $4 THEN '' ELSE lib.web_risk_lists.version_token END",
+        )
+        .bind(threat_type)
+        .bind(error)
+        .bind(next)
+        .bind(full)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
     // ── housekeeping ───────────────────────────────────────────────────────
 
     /// Deletes expired sessions, challenges, invites (90 days after expiry), audit entries older than `audit_keep`,
@@ -2122,7 +2619,8 @@ impl Store {
         let pruned: i64 =
             sqlx::query_scalar("SELECT lib.prune_audit_log($1)").bind(now - audit_keep).fetch_one(&self.pool).await?;
         n += u64::try_from(pruned).unwrap_or(0);
-        // Per-account daily counters (`<name>:<account>`) from before yesterday.
+        // Per-account counters (`<name>:<account>`, by day or by hour) from before yesterday. Counters over every
+        // account are named without a colon (`webrisk`, `webrisk-confirm`), so their months are kept.
         n += sqlx::query("DELETE FROM lib.counters WHERE name LIKE '%:%' AND period < $1")
             .bind(day(now - Duration::days(1)))
             .execute(&self.pool)

@@ -56,6 +56,18 @@ async fn overview(State(app): State<Shared>) -> ApiResult<Json<Value>> {
         "bankFeeds": app.store.bank_feeds().await?.into_iter().map(|f| json!({
             "feed": f.feed, "polledAt": f.polled_at.map(ts), "lastError": f.last_error, "creditsSeen": f.credits_seen,
         })).collect::<Vec<_>>(),
+        // What one account may change (ACCOUNT_LIMITS and its overrides): the preset and the values in effect.
+        "accountLimits": c.account_limits,
+        "webRisk": {
+            "on": c.web_risk_on, "monthlyCap": c.web_risk_monthly_cap, "confirmMonthlyCap": c.web_risk_confirm_monthly_cap,
+            "maxEntries": c.web_risk_max_entries,
+            "calls": app.store.counter("webrisk", &link_in_bio_safety::period(now())).await?,
+            "confirms": app.store.counter("webrisk-confirm", &link_in_bio_safety::period(now())).await?,
+            "lists": app.store.web_risk_lists().await?.into_iter().map(|l| json!({
+                "threatType": l.threat_type, "entries": l.entries, "updatedAt": ts(l.updated_at),
+                "nextDiffAt": l.next_diff_at.map(ts), "lastError": l.last_error,
+            })).collect::<Vec<_>>(),
+        },
         "switches": {
             "signup": c.signup, "thirdPartyPages": c.third_party_pages, "billingProviders": c.billing_providers,
             "customHostnameCap": c.custom_hostname_cap, "webRisk": c.web_risk_on, "federation": c.federation,
@@ -237,6 +249,8 @@ async fn grant(
                 amount_pence: 0,
                 evidence: json!({ "operator": op.subject, "reason": b.reason }),
                 checkout: None,
+                checkout_id: None,
+                refund_of: None,
             },
             now(),
         )
@@ -615,39 +629,56 @@ async fn audit(State(app): State<Shared>, Query(q): Query<AuditQuery>) -> ApiRes
 
 // ── refunds ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
-fn refund_row(r: &link_in_bio_store::RefundRequest) -> Value {
-    let e = &r.evidence;
+fn refund_row(r: &link_in_bio_store::RefundRequest, lines: &[link_in_bio_store::RefundLine]) -> Value {
+    let e = r.evidence.clone().unwrap_or_default();
+    let lines: Vec<Value> = lines.iter().filter(|l| l.request_id == r.id).map(super::refunds::line_json).collect();
     json!({
-        "id": r.id, "account": r.account_id, "handle": r.handle, "event": r.event_id, "provider": r.provider,
-        "months": r.months, "amountPence": r.amount_pence, "paidAt": ts(r.paid_at), "reason": r.reason, "status": r.status,
-        "createdAt": ts(r.created_at), "refundReference": r.refund_reference, "refundEvent": r.refund_event,
+        "id": r.id, "account": r.account_id, "handle": r.handle, "kind": r.kind, "event": r.event_id,
+        "reason": r.reason, "status": r.status, "details": r.details, "createdAt": ts(r.created_at),
+        "refundReference": r.refund_reference, "refundEvent": r.refund_event,
         "decidedBy": r.decided_by, "decidedAt": r.decided_at.map(ts),
-        // What the refund must match: the same coin and amount, back to the paying address.
-        "payment": { "digest": e["digest"], "payer": e["payer"], "coinType": e["coinType"], "amount": e["amount"],
-                     "method": e["method"], "checkout": e["checkout"] },
+        // Exactly what to send, per purchase: amount and unit, the months it takes back, and where it goes.
+        "lines": lines,
+        // Unstarted months asked for: true once the first of them has begun (the request no longer matches what is
+        // unstarted; decline it and the account holder can ask again).
+        "monthStarted": r.status == "open" && r.kind == "unstarted"
+            && r.details["until"].as_str()
+                .and_then(|t| time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok())
+                .is_some_and(|t| t <= now()),
+        // A request from before schema 6 (one late payment, no lines): the payment to refund whole.
+        "payment": r.event_id.map(|_| json!({
+            "provider": r.provider, "months": r.months, "amountPence": r.amount_pence, "paidAt": r.paid_at.map(ts),
+            "digest": e["digest"], "payer": e["payer"], "coinType": e["coinType"], "amount": e["amount"],
+            "method": e["method"], "checkout": e["checkout"],
+        })),
     })
 }
 
-/// The refund requests (`?status=open`, the default, or `refunded`), oldest first.
+/// The refund requests (`?status=open`, the default, or `refunded`, `withdrawn`, `declined`), oldest first.
 async fn refund_requests(State(app): State<Shared>, Query(q): Query<StatusQuery>) -> ApiResult<Json<Value>> {
     let st = q.status.unwrap_or_else(|| "open".into());
-    if !["open", "refunded"].contains(&st.as_str()) {
-        return Err(ApiError::BadRequest("status is open or refunded".into()));
+    if !["open", "refunded", "withdrawn", "declined"].contains(&st.as_str()) {
+        return Err(ApiError::BadRequest("status is open, refunded, withdrawn or declined".into()));
     }
     let rows = app.store.refund_requests(&st, 200).await?;
-    Ok(Json(json!({ "requests": rows.iter().map(refund_row).collect::<Vec<_>>() })))
+    let lines = app.store.refund_lines(&rows.iter().map(|r| r.id).collect::<Vec<_>>()).await?;
+    Ok(Json(json!({ "requests": rows.iter().map(|r| refund_row(r, &lines)).collect::<Vec<_>>() })))
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Refunded {
-    /// The refund transaction's reference (for Chain Payments, its digest).
+    /// The refund's reference (the provider's refund id, the transaction digest, the bank transfer's reference).
     reference: String,
+    /// Which purchase's line was refunded, when the request has more than one open line.
+    #[serde(default)]
+    purchase: Option<Uuid>,
     #[serde(default)]
     note: String,
 }
 
-/// The operator sent the refund: records its reference and takes the months back (a `refund` billing event), once.
+/// The operator sent a refund by hand: records its reference and takes back exactly the line's months (a request
+/// from before schema 6: the payment's months), once.
 async fn refunded(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
@@ -665,21 +696,90 @@ async fn refunded(
         return Err(ApiError::Unprocessable("The note is at most 1000 characters.".into()));
     }
     let existing = app.store.refund_request(id).await?.ok_or(ApiError::NotFound)?;
-    let Some(done) = app.store.record_refund(id, reference, &actor(&op), note, now()).await? else {
+    let lines = app.store.refund_lines(&[id]).await?;
+    if lines.is_empty() {
+        let Some(done) = app.store.record_refund(id, reference, &actor(&op), note, now()).await? else {
+            return Err(ApiError::Conflict(format!("This request is already {}.", existing.status)));
+        };
+        app.store
+            .audit(
+                &actor(&op),
+                "refund-recorded",
+                &done.account_id.to_string(),
+                &json!({ "request": id, "event": existing.event_id, "refundEvent": done.event_id, "months": -done.months,
+                         "reference": reference, "note": note, "paidUntil": ts(done.paid_until) }),
+            )
+            .await?;
+        forget_account(&app, done.account_id).await;
+    } else {
+        let open: Vec<&link_in_bio_store::RefundLine> = lines.iter().filter(|l| l.status == "open").collect();
+        let line = match (b.purchase, open.as_slice()) {
+            (Some(p), _) => open.iter().find(|l| l.purchase_id == p).copied().ok_or(ApiError::NotFound)?,
+            (None, [one]) => *one,
+            (None, []) => return Err(ApiError::Conflict(format!("This request is already {}.", existing.status))),
+            (None, _) => {
+                return Err(ApiError::Unprocessable(
+                    "This request has several purchases to refund: name the purchase this refund was for.".into(),
+                ));
+            }
+        };
+        let done = app
+            .store
+            .refund_line(id, line.purchase_id, reference, &actor(&op), None, json!({ "note": note }), now())
+            .await?
+            .ok_or_else(|| ApiError::Conflict(format!("This request is already {}.", existing.status)))?;
+        app.store
+            .audit(
+                &actor(&op),
+                "refund-recorded",
+                &done.account_id.to_string(),
+                &json!({ "request": id, "purchase": line.purchase_id, "refundEvent": done.event_id,
+                         "months": done.months_taken, "amountMinor": line.amount_minor, "unit": line.unit,
+                         "reference": reference, "note": note, "requestClosed": done.request_closed,
+                         "paidUntil": done.paid_until.map(ts) }),
+            )
+            .await?;
+        forget_account(&app, done.account_id).await;
+    }
+    let after = app.store.refund_request(id).await?.ok_or(ApiError::NotFound)?;
+    let lines = app.store.refund_lines(&[id]).await?;
+    let paid_until = app.store.account(after.account_id).await?.and_then(|a| a.paid_until);
+    Ok(Json(json!({ "request": refund_row(&after, &lines), "paidUntil": paid_until.map(ts) })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Declined {
+    /// Why, for the account holder.
+    reason: String,
+}
+
+/// The operator declines an open request (nothing is refunded and no month is taken back).
+async fn declined(
+    State(app): State<Shared>,
+    Extension(op): Extension<Operator>,
+    Path(id): Path<Uuid>,
+    Json(b): Json<Declined>,
+) -> ApiResult<Json<Value>> {
+    let reason = b.reason.trim();
+    if reason.is_empty() || reason.chars().count() > 1000 {
+        return Err(ApiError::Unprocessable("Say why, in 1 to 1000 characters.".into()));
+    }
+    let existing = app.store.refund_request(id).await?.ok_or(ApiError::NotFound)?;
+    if !app.store.close_refund_request(id, None, "declined", &actor(&op), reason, now()).await? {
         return Err(ApiError::Conflict(format!("This request is already {}.", existing.status)));
-    };
+    }
     app.store
         .audit(
             &actor(&op),
-            "refund-recorded",
-            &done.account_id.to_string(),
-            &json!({ "request": id, "event": existing.event_id, "refundEvent": done.event_id, "months": -done.months,
-                     "reference": reference, "note": note, "paidUntil": ts(done.paid_until) }),
+            "refund-declined",
+            &existing.account_id.to_string(),
+            &json!({ "request": id, "reason": reason }),
         )
         .await?;
-    forget_account(&app, done.account_id).await;
     let after = app.store.refund_request(id).await?.ok_or(ApiError::NotFound)?;
-    Ok(Json(json!({ "request": refund_row(&after), "paidUntil": ts(done.paid_until) })))
+    let lines = app.store.refund_lines(&[id]).await?;
+    Ok(Json(json!({ "request": refund_row(&after, &lines) })))
 }
 
 /// An ISO 20022 statement from the receiving bank: each booked credit whose creditor reference names a bank-transfer
@@ -733,6 +833,7 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v1/admin/audit", get(audit))
         .route("/api/v1/admin/refund-requests", get(refund_requests))
         .route("/api/v1/admin/refund-requests/{id}/refunded", post(refunded))
+        .route("/api/v1/admin/refund-requests/{id}/declined", post(declined))
         .route(
             "/api/v1/admin/bank-statements",
             post(bank_statement).layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),

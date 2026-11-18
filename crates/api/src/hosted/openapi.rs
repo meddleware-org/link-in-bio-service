@@ -88,3 +88,24 @@ pub fn admin_document() -> Value {
         ADMIN_ROUTES,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    /// `openapi/app.json` and `openapi/admin.json` are what the route tables generate (`UPDATE_OPENAPI=1` rewrites them).
+    #[test]
+    fn the_committed_documents_match() {
+        for (file, doc) in [("app.json", super::app_document()), ("admin.json", super::admin_document())] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../openapi").join(file);
+            let text = serde_json::to_string_pretty(&doc).unwrap() + "\n";
+            if std::env::var("UPDATE_OPENAPI").as_deref() == Ok("1") {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, &text).unwrap();
+            }
+            let committed = std::fs::read_to_string(&path).unwrap_or_default();
+            assert_eq!(
+                committed, text,
+                "openapi/{file} is out of date: UPDATE_OPENAPI=1 cargo test -p link-in-bio-api"
+            );
+        }
+    }
+}

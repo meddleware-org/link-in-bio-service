@@ -37,9 +37,13 @@ in the environment. Every switch starts at its safest value, and each one can on
 | `PRICE_PENCE` | `300` | the price of one month in pence (GBP) |
 | `GRACE_DAYS` | `7` | how long a page stays online after its paid period ends |
 | `CUSTOM_HOSTNAME_CAP` | `0` | custom domains allowed in total; `0` means off, with a hard stop at 100 |
-| `WEB_RISK_KEY_FILE` | unset | Google Web Risk API key; without it, screening uses the built-in checks and the lists only |
-| `WEB_RISK_MONTHLY_CAP` | `90000` | a hard cap on Web Risk calls per month, counted across every process (at most 100 000, the free tier) |
-| `WEB_RISK_ACCOUNT_DAILY_CAP` | `200` | Web Risk calls one account's publishes may spend in a day (UTC), counted in `lib.counters`; `0` means no per-account limit. Past it, a link is recorded as unknown (shown, not yet checked by Web Risk) and the worker screens it again within the hour under the monthly cap |
+| `WEB_RISK_KEY_FILE` | unset | Google Web Risk API key; without it, screening uses the built-in checks and the lists only. Use a key for this service alone: once a project calls `computeDiff`, any `uris.search` call on it is billed (see "Screening") |
+| `WEB_RISK_MONTHLY_CAP` | `90000` | a hard cap on Web Risk calls per month over every process, `threatLists.computeDiff` and `hashes.search` together (at most 100 000) |
+| `WEB_RISK_CONFIRM_MONTHLY_CAP` | `0` | `hashes.search` calls a month, part of the cap above. It is the only billed call ($50 per 1 000, no free tier), so the default spends nothing: a link that matches a local prefix is then hidden until an operator reviews it. Each call allowed can cost $0.05 |
+| `WEB_RISK_MAX_ENTRIES` | `262144` | the most hash prefixes kept per list (`constraints.maxDatabaseEntries`, a power of two from 1024 to 1048576); about 1 MB of memory per list in the app and the worker at the default |
+| `ACCOUNT_LIMITS` | `standard` | how much one account may change its page: `standard` (30 publishes an hour, 120 new links a day) or `generous` (300 and 1 200). Each value below overrides the preset on its own; `0` means no limit |
+| `PUBLISHES_PER_ACCOUNT_HOUR` | preset | publishes per UTC hour, picture uploads counted with them. A publish that only removes or hides links is never counted or refused |
+| `NEW_LINKS_PER_ACCOUNT_DAY` | preset | links an account's published page did not have before, per UTC day (what an account can make the service screen) |
 | `THREATFOX_KEY_FILE` | unset | abuse.ch Auth-Key; when set, the worker syncs the last 7 days of ThreatFox indicators every 6 hours |
 | `FEDERATION` | `on` | WebFinger, the read-only ActivityPub actor and NIP-05 on tenant pages |
 | `SUI_NETWORK` | `testnet` | the chain id in the wallet sign-in message (`sui:<network>`) |
@@ -100,10 +104,11 @@ in the environment. Every switch starts at its safest value, and each one can on
   applied: the checkout stays open, the console's audit log records it once (`payment-not-covering`) and the metric
   `link_in_bio_payment_mismatches_total` counts it. Chain Payments, Open Payments and bank transfers check the amount
   themselves.
-- **Refunds take months back pro rata.** A refund takes back `floor(months × refunded ÷ paid)` months, counted on the
-  running total of the purchase's refunds: the refunds of one purchase never take back more than it bought, and partial
-  refunds that add up to the whole amount take back every month. A failed or charged-back payment (GoCardless) takes
-  back the whole purchase. A refund of a checkout that was never paid is recorded and takes nothing.
+- **Refunds no request names take months back pro rata.** Such a refund takes back `floor(months × refunded ÷ paid)`
+  months, counted on the running total of the purchase's refunds (requests' refunds included): the refunds of one
+  purchase never take back more than it bought, and partial refunds that add up to the whole amount take back every
+  month. A failed or charged-back payment (GoCardless) takes back the whole purchase. A refund of a checkout that was
+  never paid is recorded and takes nothing. A refund on request takes back exactly its months (below).
 - **Card and bank providers.** Square (UK cards), GoCardless (UK bank payments over Open Banking), and Paddle (merchant
   of record, so offered anywhere) each send the buyer to the provider's hosted page. The app loads no provider script.
   Their signed notifications arrive at `/api/v1/webhooks/<provider>` on the app host.
@@ -132,13 +137,41 @@ in the environment. Every switch starts at its safest value, and each one can on
 - **Chain Payments.** Chain Payments sessions carry `units` (the months) and the account's opaque billing reference
   (never the handle). Its notifications are ed25519-signed (`Chain-Payments-Signature`) and arrive on the internal
   port.
-- **Refunds of unapplied payments.** A Chain Payments payment that arrives after its checkout was paid or closed is
-  credited as the months its quote was for. Within 30 days its account holder may ask for the money back instead,
-  once per payment (`POST /api/v1/billing/events/{id}/refund-request`). Nothing is sent automatically: the operator
-  sends the refund by hand from the recipient (the same coin and amount, to the paying address, both shown in the
-  console's queue, `GET /api/v1/admin/refund-requests`) and records it with the refund transaction's reference
-  (`POST /api/v1/admin/refund-requests/{id}/refunded`). That takes the months back as a `refund` billing event, once.
-  Each step is in the audit log.
+- **Refunds on request.** A refund costs the platform nothing beyond the operator's time
+  (`crates/billing/src/refunds.rs`):
+  - **Cancel within 14 days of a purchase:** the whole purchase comes back, less the days already used (what the
+    purchase paid per month ÷ 30, per day begun since its first month started; none if it has not started) and less
+    its share of the provider's fee. Every month it still gives is taken back. This also covers the UK 14-day right to
+    cancel a service.
+  - **Later:** only whole months that have not begun. They are taken from the newest purchases first (months stack, so
+    the newest purchase's months are the last of the paid period); the month in progress is kept; granted months are
+    not refunded. Each month is valued at what its own purchase paid per month.
+  - **A late Chain Payments payment** (one that arrived after its checkout was paid or closed, credited as months):
+    whole, within 30 days.
+  - **The fee share** of a refund of `k` of a purchase's `m` months is `(fixed + percent × paid) × k ÷ m`, with the
+    method's fees (`<PROVIDER>_FIXED_PENCE`, `<PROVIDER>_PERCENT_BPS`): providers keep their fee when a payment is
+    refunded. It is charged as a share of what was paid, so a purchase paid in another currency or a coin pays the
+    same share without an exchange rate. Money is counted in the unit paid; the amount is rounded down to its smallest
+    unit (each deduction up). A refund that would be 0 or less is refused, saying why.
+  - **Where it goes:** Square, GoCardless and Paddle are refunded in their dashboards (Paddle in the buyer's currency);
+    Chain Payments in the same coin, pro rata of what was received, from the recipient to the payer; a bank transfer
+    to the paying account, named from the statement when it says (`Dbtr`, `DbtrAcct`, `DbtrAgt`; bunq's counterparty);
+    Open Payments to the buyer's wallet address.
+  - **The flow.** `GET /api/v1/billing/refunds` shows what may be asked now, worked out exactly;
+    `POST /api/v1/billing/refund-requests` asks (`kind`: `cancel` with the purchase, `unstarted` with an optional
+    number of months, or `unapplied`), and the account holder may withdraw it
+    (`POST /api/v1/billing/refund-requests/{id}/withdraw`). One open request per account. The console's queue
+    (`GET /api/v1/admin/refund-requests`) shows each purchase's exact amount, unit, months and destination, and flags an
+    unstarted-months request whose first month has begun since. Nothing is sent automatically and no process holds a key
+    that can refund: the operator refunds by hand. A provider's refund notification of exactly a line's amount closes
+    that line and takes back exactly its months; otherwise the operator records the reference
+    (`POST /api/v1/admin/refund-requests/{id}/refunded`, naming the purchase when the request has several) or declines
+    the request with a reason (`…/declined`). Each step is in the audit log (`refund-requested`, `refund-withdrawn`,
+    `refund-matched`, `refund-recorded`, `refund-declined`, `refund-not-matching-request`).
+  - **The ledger.** A request's refund takes back exactly the months on it (never more than the purchase still gives):
+    with the fee netted off, the pro-rata rule would leave the account holder a month they were refunded for. A refund
+    that matches no request (one the provider or the operator made on their own, or of another amount) takes months
+    back pro rata over everything refunded of that purchase, requests' refunds included.
 
 ## Pages, screening and safety
 
@@ -147,10 +180,34 @@ in the environment. Every switch starts at its safest value, and each one can on
 - **Screening, in layers.**
   1. Built-in checks: IP-address hosts, unusual ports, link shorteners.
   2. The operator's blocklist and ThreatFox.
-  3. Web Risk, under its monthly cap.
+  3. Web Risk's Update API, checked locally (below).
 
   A flagged link is hidden until an operator decides. A link that could not be checked is shown and checked again
-  within the hour. Clean links are checked daily.
+  within the hour. Clean links are checked again daily, locally and at no cost; unused screens are pruned as before.
+- **Web Risk, Update API** (`crates/safety/src/webrisk.rs`). The worker alone keeps the MALWARE, SOCIAL_ENGINEERING and
+  UNWANTED_SOFTWARE lists of hash prefixes in `lib.web_risk_lists` with `threatLists.computeDiff` (uncompressed answers;
+  a `RESET` replaces a list, a `DIFF` removes then adds, and the SHA-256 of the sorted result must equal the answer's
+  checksum or the diff is discarded and the next update asks for the whole list), asking again at
+  `recommendedNextDiff` (30 minutes when none is given; failures back off from 15 minutes to 8 hours). The app and the
+  worker hold the lists in memory and reload them within a minute of a change. A link is canonicalised and its host
+  and path expressions hashed as "URLs and hashing" specifies
+  (<https://cloud.google.com/web-risk/docs/urls-hashing>; its test vectors are in the tests). Only when a hash matches
+  a local prefix is that prefix sent to `hashes.search`; full hashes are cached until their `expireTime`, and a
+  prefix's absence until its `negativeExpireTime`. A match that may not be confirmed (the confirmation cap reached; 0
+  by default) is hidden until an operator reviews it and checked again daily, so a list update clears it.
+  - **Cost** (<https://cloud.google.com/web-risk/pricing>, read 2026-11-18): "Update API threatLists.computeDiff:
+    unlimited free use"; `hashes.search` "to confirm threats" is "$50.00 / 1,000 count", with no free tier; and
+    "Calling threatLists.computeDiff changes the pricing of uris.search calls to the pricing of hashes.search calls".
+    The lists and the local checks cost nothing however many links are held; only confirmations do, and
+    `WEB_RISK_CONFIRM_MONTHLY_CAP` (default 0) bounds them, inside `WEB_RISK_MONTHLY_CAP` over every call.
+  - **Privacy:** full URLs are no longer sent to Google. Only a hash prefix (typically 4 bytes) of a link that matches a
+    local list entry is, and Google answers with every full hash on its lists that starts with it.
+- **Change limits per account** (`ACCOUNT_LIMITS`, `crates/api/src/hosted/limits.rs`). Publishes (and picture uploads)
+  an hour and new links a day are counted in `lib.counters`; over a limit the answer is 429 with the limit, when it
+  resets and `Retry-After`, and the draft is kept. Removing or hiding links and unpublishing are never limited: a
+  publish whose only differences from the published page are links removed or hidden is always accepted.
+  `NEW_LINKS_PER_ACCOUNT_DAY` is also what bounds how many links an account can make the service screen. The console's
+  Overview shows the preset and the values in effect.
 - **What a tenant host answers.**
 
   | Situation | Status |
@@ -175,7 +232,8 @@ in the environment. Every switch starts at its safest value, and each one can on
 | Checkouts and billing events (with the countries seen at purchase) | `lib.checkouts`, `lib.billing_events` | accounting and tax records, kept after an account is deleted |
 | Open Payments grants: the buyer's wallet address, the outgoing payment, and (only until it is continued) the grant's continuation | `lib.open_payments_grants` | the payment's evidence; deleted with the checkout |
 | Where each bank feed left off, and its own state (bunq's installation token and server key, a rotated Revolut refresh token) | `lib.bank_feeds` | reconciliation; never shown |
-| Refund requests: the reason given, the refund's transaction reference, who recorded it and when | `lib.refund_requests` | accounting records, kept with the billing events |
+| Refund requests and their lines: the reason given, each purchase's amount, unit and destination (a payer address, a bank account named by the statement), the refund's reference, who recorded it and when | `lib.refund_requests`, `lib.refund_lines` | accounting records, kept with the billing events |
+| Web Risk's hash prefixes | `lib.web_risk_lists` | screening; no personal data |
 | Reports (an optional contact), appeals, the audit log | `lib.reports`, `lib.appeals`, `lib.audit_log` | trust and safety |
 
 - **Erasure.** Deleting an account (`DELETE /api/v1/me`) removes its sign-in methods, sessions, pictures, domains and
@@ -206,7 +264,8 @@ The migrate Job runs as the owner.
 | `invites` | S U | S I U | S D | — |
 | `checkouts` | S I U | S U | S U | — |
 | `billing_events` | S I U | S I U | S I U | — |
-| `refund_requests` | S I | S U | — | — |
+| `refund_requests` | S I U | S U | — | — |
+| `refund_lines` | S I U | S U | — | — |
 | `open_payments_grants` | S I U | — | — | — |
 | `domains` | S I D | S | S U | — |
 | `reports` | S I | S U | S D | — |
@@ -215,38 +274,44 @@ The migrate Job runs as the owner.
 | `link_screens` | S I U | S I U | S I U D | — |
 | `blocklist` | S | S I U D | S | — |
 | `threat_iocs` | S | — | S I D | — |
-| `counters` | S I U | — | S I U D | — |
+| `counters` | S I U | S | S I U D | — |
 | `bank_feeds` | — | S | S I U | — |
+| `web_risk_lists` | S | S | S I U | — |
 
 **The audit log is insert-only for every process** (`insert_only_tables=audit_log`): no process updates or deletes it,
 and the worker's two-year retention goes through `lib.prune_audit_log`.
 
 **Tables each process may have read-only** (`read_only_tables`, SELECT only), without breaking it:
 
-- **api:** `selections`, `blocklist`, `threat_iocs`, `bank_feeds`.
+- **api:** `selections`, `blocklist`, `threat_iocs`, `bank_feeds`, `web_risk_lists`.
 - **admin:** `passkeys`, `wallets`, `recovery_codes`, `challenges`, `pages`, `page_versions`, `assets`,
-  `open_payments_grants`, `domains`, `threat_iocs`, `counters`, `bank_feeds`.
-- **worker:** `passkeys`, `wallets`, `recovery_codes`, `pages`, `selections`, `refund_requests`, `open_payments_grants`,
-  `blocklist`.
+  `open_payments_grants`, `domains`, `threat_iocs`, `counters`, `bank_feeds`, `web_risk_lists`.
+- **worker:** `passkeys`, `wallets`, `recovery_codes`, `pages`, `selections`, `refund_requests`, `refund_lines`,
+  `open_payments_grants`, `blocklist`.
 - **jobs:** every table but `accounts`, `pages`, `wallets` and `audit_log`: `passkeys`, `recovery_codes`, `sessions`,
   `challenges`, `page_versions`, `assets`, `selections`, `invites`, `checkouts`, `billing_events`, `refund_requests`,
-  `open_payments_grants`, `domains`, `reports`, `appeals`, `link_screens`, `blocklist`, `threat_iocs`, `counters`,
-  `bank_feeds`.
+  `refund_lines`, `open_payments_grants`, `domains`, `reports`, `appeals`, `link_screens`, `blocklist`, `threat_iocs`,
+  `counters`, `bank_feeds`, `web_risk_lists`.
+
+`lib.web_risk_lists` is written by the worker only (it keeps the lists); the app reads it to load them, the console to
+show their state.
 
 **Writes made only for a narrow reason** (a finer grant than the table would need a column grant or a function):
 
 - **api:** `accounts` U only for the declared country, erasure (`status = 'deleted'`) and `paid_until` through the ledger;
   `invites` U only to mark a code redeemed at sign-up; `checkouts` U only to mark one paid or expired (and its row lock
-  for refunds, which needs U); `billing_events` U only `paid_until_after` of the row it just inserted.
+  for refunds, which needs U); `billing_events` U only `paid_until_after` of the row it just inserted;
+  `refund_requests` U only when its account holder withdraws one or a provider's refund notification closes it, and
+  `refund_lines` U only for that notification.
 - **admin:** `accounts` U for flags, suspension and `paid_until` (operator grants, bank statements); `sessions` D only to
   end a suspended account's sessions; `checkouts` and `billing_events` U only when an imported statement pays a checkout or
-  a refund is recorded.
+  a refund is recorded; `refund_requests` and `refund_lines` U only to record or decline a refund.
 - **worker:** `sessions`, `challenges`, `invites`, `reports`, `appeals`, `page_versions`, `assets` and `counters` D only for
   expiry and retention; `accounts` U only to lift suspensions whose time is up and for `paid_until` through the ledger.
 - **jobs:** `accounts` I and U only to create the operator's own accounts and set their flags.
 
-No process needs more than table-level grants: the row locks taken (`FOR UPDATE` on `checkouts`, `invites` and
-`refund_requests`) are on tables where the process already has U.
+No process needs more than table-level grants: the row locks taken (`FOR UPDATE` on `checkouts`, `invites`,
+`refund_requests` and `refund_lines`) are on tables where the process already has U.
 
 ## API
 

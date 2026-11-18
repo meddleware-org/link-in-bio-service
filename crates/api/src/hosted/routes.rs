@@ -95,6 +95,19 @@ pub const APP_ROUTES: &[Route] = &[
         "Ask for a refund of an unapplied Chain Payments payment instead of its months (within 30 days, once)",
     ),
     r(
+        Get,
+        "/api/v1/billing/refunds",
+        Session,
+        "What may be refunded now, worked out exactly: cancellations (14 days), unstarted months, late payments",
+    ),
+    r(
+        Post,
+        "/api/v1/billing/refund-requests",
+        Session,
+        "Ask for a refund (cancel, unstarted or unapplied); one open request per account, sent by the operator by hand",
+    ),
+    r(Post, "/api/v1/billing/refund-requests/{id}/withdraw", Session, "Withdraw the account's open refund request"),
+    r(
         Post,
         "/api/v1/billing/checkouts/{id}/open-payments",
         Session,
@@ -150,13 +163,19 @@ pub const ADMIN_ROUTES: &[Route] = &[
     r(Delete, "/api/v1/admin/blocklist", Operator, "Unblock (?pattern=)"),
     r(Put, "/api/v1/admin/links", Operator, "An operator verdict on a link (clean, flagged, or automatic)"),
     r(Get, "/api/v1/admin/audit", Operator, "The audit log (?subject=)"),
-    r(Get, "/api/v1/admin/refund-requests", Operator, "Refund requests for unapplied payments (?status=open|refunded)"),
+    r(
+        Get,
+        "/api/v1/admin/refund-requests",
+        Operator,
+        "Refund requests with exactly what to send per purchase (?status=open|refunded|withdrawn|declined)",
+    ),
     r(
         Post,
         "/api/v1/admin/refund-requests/{id}/refunded",
         Operator,
-        "Record a refund sent by hand (its transaction reference); takes the months back once",
+        "Record a refund sent by hand (its reference, and the purchase when several); takes its months back once",
     ),
+    r(Post, "/api/v1/admin/refund-requests/{id}/declined", Operator, "Decline an open refund request, saying why"),
     r(
         Post,
         "/api/v1/admin/bank-statements",

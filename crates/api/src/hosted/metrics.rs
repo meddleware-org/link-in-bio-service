@@ -6,6 +6,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use link_in_bio_store::Stats;
 
+/// This month's Web Risk calls against their caps, and the prefixes this process holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebRiskFigures {
+    pub calls: i64,
+    pub cap: i64,
+    pub confirms: i64,
+    pub confirm_cap: i64,
+    pub prefixes: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub signups: AtomicU64,
@@ -16,6 +26,8 @@ pub struct Metrics {
     pub checkouts: AtomicU64,
     pub payments: AtomicU64,
     pub payment_mismatches: AtomicU64,
+    /// Publishes and picture uploads refused by an account's limits (429).
+    pub limited: AtomicU64,
     pub notification_failures: AtomicU64,
     pub screenings: AtomicU64,
     pub pages_served: AtomicU64,
@@ -27,7 +39,7 @@ impl Metrics {
         c.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn render(&self, stats: Option<&Stats>, web_risk_calls: Option<(i64, i64)>) -> String {
+    pub fn render(&self, stats: Option<&Stats>, web_risk: Option<WebRiskFigures>) -> String {
         let mut s = String::new();
         for (name, help, c) in [
             ("link_in_bio_signups_total", "Accounts created", &self.signups),
@@ -41,6 +53,11 @@ impl Metrics {
                 "link_in_bio_payment_mismatches_total",
                 "Payment notifications that did not cover their checkout (not applied)",
                 &self.payment_mismatches,
+            ),
+            (
+                "link_in_bio_limited_total",
+                "Publishes and picture uploads refused by an account's limits",
+                &self.limited,
             ),
             ("link_in_bio_notification_failures_total", "Provider notifications refused", &self.notification_failures),
             ("link_in_bio_screenings_total", "Links screened", &self.screenings),
@@ -71,13 +88,16 @@ impl Metrics {
                 let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
             }
         }
-        if let Some((used, cap)) = web_risk_calls {
-            let _ = writeln!(
-                s,
-                "# HELP link_in_bio_web_risk_calls Web Risk calls this month\n# TYPE link_in_bio_web_risk_calls gauge\n\
-                 link_in_bio_web_risk_calls {used}\n# HELP link_in_bio_web_risk_cap The monthly hard cap\n\
-                 # TYPE link_in_bio_web_risk_cap gauge\nlink_in_bio_web_risk_cap {cap}"
-            );
+        if let Some(w) = web_risk {
+            for (name, help, v) in [
+                ("link_in_bio_web_risk_calls", "Web Risk calls this month (computeDiff and hashes.search)", w.calls),
+                ("link_in_bio_web_risk_cap", "The monthly hard cap on Web Risk calls", w.cap),
+                ("link_in_bio_web_risk_confirms", "Billed hashes.search calls this month", w.confirms),
+                ("link_in_bio_web_risk_confirm_cap", "The monthly cap on hashes.search calls", w.confirm_cap),
+                ("link_in_bio_web_risk_prefixes", "Web Risk hash prefixes this process holds", w.prefixes as i64),
+            ] {
+                let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
+            }
         }
         s
     }

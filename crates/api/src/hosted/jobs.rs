@@ -1,7 +1,9 @@
 //! The worker: one process (a PostgreSQL advisory lock makes it the single writer of these duties) that, on a schedule,
 //!
 //! - lifts suspensions whose time is up;
-//! - screens again the links that are due (unknown within the hour, clean daily, flagged weekly);
+//! - keeps Web Risk's threat lists current (`threatLists.computeDiff`, when its key is configured), the only writer of
+//!   `lib.web_risk_lists`;
+//! - screens again the links that are due (unknown within the hour, clean daily, flagged weekly; locally);
 //! - asks payment providers how checkouts no notification closed have ended (and applies a payment once);
 //! - polls the bank feeds (Wise, bunq, Revolut Business; when configured) and pays bank-transfer checkouts from their
 //!   credits by the same rules as an imported statement;
@@ -42,6 +44,8 @@ pub struct Schedule {
     hourly: Option<Instant>,
     six_hourly: Option<Instant>,
     daily: Option<Instant>,
+    /// Web Risk list updates that failed in a row (the retry waits longer each time).
+    web_risk_failures: u32,
 }
 
 fn due(last: &mut Option<Instant>, every: StdDuration) -> bool {
@@ -66,6 +70,36 @@ pub async fn lift_suspensions(app: &Shared) {
             }
         }
         Err(e) => failed(app, "suspensions", e),
+    }
+}
+
+/// Updates each Web Risk list that is due, then reloads this process's copy. A failure waits 15 minutes, doubling up to
+/// 8 hours (Web Risk's back-off), and keeps the lists as they were.
+pub async fn update_web_risk(app: &Shared, s: &mut Schedule) {
+    let Some(w) = &app.screener.web_risk else { return };
+    let n = now();
+    let retry = Duration::minutes(15) * 2i32.pow(s.web_risk_failures.min(5));
+    let mut changed = false;
+    for threat in link_in_bio_safety::webrisk::THREAT_TYPES {
+        match link_in_bio_safety::update_list(w, &app.store, threat, n, retry.min(Duration::hours(8))).await {
+            Ok(link_in_bio_safety::UpdateOutcome::Updated(entries)) => {
+                s.web_risk_failures = 0;
+                changed = true;
+                tracing::info!(threat, entries, "web risk list updated");
+            }
+            Ok(link_in_bio_safety::UpdateOutcome::Failed(e)) => {
+                s.web_risk_failures = s.web_risk_failures.saturating_add(1);
+                failed(app, "web-risk-lists", format!("{threat}: {e}"));
+            }
+            Ok(link_in_bio_safety::UpdateOutcome::CapReached) => {
+                tracing::warn!(threat, "web risk monthly cap reached; the list is not updated");
+            }
+            Ok(link_in_bio_safety::UpdateOutcome::NotDue) => {}
+            Err(e) => failed(app, "web-risk-lists", e),
+        }
+    }
+    if changed && let Err(e) = w.refresh(&app.store, true).await {
+        failed(app, "web-risk-lists", e);
     }
 }
 
@@ -295,6 +329,7 @@ pub async fn prune(app: &Shared) {
 /// One pass of every duty that is due.
 pub async fn tick(app: &Shared, http: &reqwest::Client, s: &mut Schedule, feeds: &[Box<dyn BankFeed>]) {
     lift_suspensions(app).await;
+    update_web_risk(app, s).await;
     rescreen(app, 100).await;
     reconcile(app).await;
     if !feeds.is_empty() && due(&mut s.feeds, StdDuration::from_secs(app.config.bank_feed_poll_secs)) {

@@ -607,7 +607,7 @@ async fn wallet_signup_recovery_and_chain_payments_checkout() {
 }
 
 #[tokio::test]
-async fn every_route_in_the_tables_exists_and_the_openapi_documents_match() {
+async fn every_route_in_the_tables_exists() {
     let Some(s) = store().await else { return };
     let a = app(s, config(&[]));
     let app_r = super::app::router(a.clone());
@@ -630,18 +630,7 @@ async fn every_route_in_the_tables_exists_and_the_openapi_documents_match() {
         assert_ne!(resp.json()["code"], "no_route", "{} {}", r.method.as_str(), r.path);
     }
     assert_eq!(send(&app_r, call("GET", "/api/v1/nope", None, None)).await.json()["code"], "no_route");
-
-    for (file, doc) in [("app.json", super::openapi::app_document()), ("admin.json", super::openapi::admin_document())]
-    {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../openapi").join(file);
-        let text = serde_json::to_string_pretty(&doc).unwrap() + "\n";
-        if std::env::var("UPDATE_OPENAPI").as_deref() == Ok("1") {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, &text).unwrap();
-        }
-        let committed = std::fs::read_to_string(&path).unwrap_or_default();
-        assert_eq!(committed, text, "openapi/{file} is out of date: UPDATE_OPENAPI=1 cargo test -p link-in-bio-api");
-    }
+    // The OpenAPI documents are checked without a database: `openapi::tests::the_committed_documents_match`.
 }
 
 #[tokio::test]
@@ -1050,6 +1039,8 @@ async fn refund_requests_for_unapplied_payments() {
         amount_pence: 900,
         evidence: json!({ "unapplied": unapplied, "digest": format!("D-{event}"), "payer": "0x2", "coinType": "0x2::sui::SUI", "amount": "5500000000" }),
         checkout: None,
+        checkout_id: None,
+        refund_of: None,
     };
     s.change_period(&credit("paid:s1", false), now).await.unwrap();
     s.change_period(&credit("unapplied:w1", true), now).await.unwrap().unwrap();
@@ -1086,7 +1077,7 @@ async fn refund_requests_for_unapplied_payments() {
     let made = send(&app_r, req(late, Some(json!({ "reason": "I paid twice in two tabs" })), &cookie)).await;
     assert_eq!(made.status, StatusCode::CREATED, "{}", made.text());
     let request = made.json()["refundRequest"].as_str().unwrap().to_string();
-    assert_eq!(send(&app_r, req(late, None, &cookie)).await.status, StatusCode::CONFLICT, "one request per payment");
+    assert_eq!(send(&app_r, req(late, None, &cookie)).await.status, StatusCode::CONFLICT, "one open request");
     let b = send(&app_r, call("GET", "/api/v1/billing", None, Some(&cookie))).await.json();
     assert_eq!(ev(&b, late)["refundRequest"]["status"], "open");
     assert!(ev(&b, late)["refundableUntil"].is_null());
@@ -1095,9 +1086,15 @@ async fn refund_requests_for_unapplied_payments() {
     let q = send(&admin, admin_call("GET", "/api/v1/admin/refund-requests", None)).await.json();
     let rows = q["requests"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!((rows[0]["handle"].as_str(), rows[0]["months"].as_i64()), (Some("kate"), Some(3)));
+    let line = &rows[0]["lines"][0];
     assert_eq!(
-        (rows[0]["payment"]["digest"].as_str(), rows[0]["payment"]["payer"].as_str()),
+        (rows[0]["handle"].as_str(), rows[0]["kind"].as_str(), line["months"].as_i64()),
+        (Some("kate"), Some("unapplied"), Some(3))
+    );
+    // The same coin and the whole amount, back to the payer.
+    assert_eq!((line["amountMinor"].as_i64(), line["unit"].as_str()), (Some(5_500_000_000), Some("0x2::sui::SUI")));
+    assert_eq!(
+        (line["destination"]["digest"].as_str(), line["destination"]["payer"].as_str()),
         (Some("D-unapplied:w1"), Some("0x2"))
     );
     let path = format!("/api/v1/admin/refund-requests/{request}/refunded");
@@ -1250,59 +1247,240 @@ async fn card_payments_apply_only_when_they_cover_the_checkout_and_refunds_take_
 }
 
 #[tokio::test]
-async fn one_account_cannot_spend_everyones_screening() {
+async fn an_account_has_change_budgets_but_can_always_remove_links() {
     let Some(s) = store().await else { return };
-    // A Web Risk stand-in that knows no threat.
-    let stub = Router::new().route("/v1/uris:search", axum::routing::get(|| async { axum::Json(json!({})) }));
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(l, stub).await.unwrap() });
-    let mut a =
-        App::new(s.clone(), config(&[("WEB_RISK_ACCOUNT_DAILY_CAP", "2".into())]), Duration::from_millis(200)).unwrap();
-    assert_eq!(a.screener.account_daily_cap, 2);
-    let mut w = link_in_bio_safety::WebRisk::new("key".into(), 1000);
-    w.endpoint = format!("http://{addr}/v1/uris:search");
-    a.screener.web_risk = Some(w);
-    let a: Shared = Arc::new(a);
+    let a = app(
+        s.clone(),
+        config(&[("PUBLISHES_PER_ACCOUNT_HOUR", "3".into()), ("NEW_LINKS_PER_ACCOUNT_DAY", "4".into())]),
+    );
     let app_r = super::app::router(a.clone());
-    let publish = |handle: &'static str, urls: Vec<&'static str>| {
-        let s = s.clone();
+    let (id, cookie) = account_with_session(&s, "erin").await;
+    s.set_flags(id, false, true, true, &[]).await.unwrap();
+    let publish = |urls: &[&str], title: &str| {
+        let items: Vec<Value> = urls
+            .iter()
+            .map(|u| json!({ "kind": "link", "id": u.trim_start_matches("https://").trim_end_matches(".example/"), "title": title, "url": u }))
+            .collect();
+        let doc = json!({ "schema": 1, "identity": { "displayName": "erin", "handle": "erin" }, "items": items });
         let app_r = app_r.clone();
+        let cookie = cookie.clone();
         async move {
-            let (id, cookie) = account_with_session(&s, handle).await;
-            s.set_flags(id, false, true, true, &[]).await.unwrap();
-            let items: Vec<Value> = urls
-                .iter()
-                .enumerate()
-                .map(|(i, u)| json!({ "kind": "link", "id": format!("l{i}"), "title": format!("Link {i}"), "url": u }))
-                .collect();
-            let doc = json!({ "schema": 1, "identity": { "displayName": handle, "handle": handle }, "items": items });
             assert_eq!(
                 send(&app_r, call("PUT", "/api/v1/page", Some(doc), Some(&cookie))).await.status,
                 StatusCode::OK
             );
-            let r = send(&app_r, call("POST", "/api/v1/page/publish", None, Some(&cookie))).await;
-            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            send(&app_r, call("POST", "/api/v1/page/publish", None, Some(&cookie))).await
         }
     };
-    publish("erin", vec!["https://one.example/", "https://two.example/", "https://three.example/"]).await;
-    let verdicts = |urls: &[&str]| {
+    let (one, two, three, four, five) = (
+        "https://one.example/",
+        "https://two.example/",
+        "https://three.example/",
+        "https://four.example/",
+        "https://five.example/",
+    );
+    // Three new links: within the day's four, one publish of the hour's three.
+    assert_eq!(publish(&[one, two, three], "L").await.status, StatusCode::OK);
+    // Two more would make five new links today: refused with the limit and when it resets; the draft is kept.
+    let r = publish(&[one, two, three, four, five], "L").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.text());
+    assert!(r.json()["error"].as_str().unwrap().contains("NEW_LINKS_PER_ACCOUNT_DAY"), "{}", r.text());
+    assert!(r.headers.get(header::RETRY_AFTER).is_some());
+    let page = send(&app_r, call("GET", "/api/v1/page", None, Some(&cookie))).await.json();
+    assert_eq!(page["changed"], true, "the draft is kept");
+    assert_eq!(page["draft"]["items"].as_array().unwrap().len(), 5);
+    // Removing a link is always possible (and is not counted).
+    assert_eq!(publish(&[one, three], "L").await.status, StatusCode::OK);
+    // One new link: the fourth of the day, the second publish of the hour.
+    assert_eq!(publish(&[one, three, four], "L").await.status, StatusCode::OK);
+    // A changed title adds no link: the third publish.
+    assert_eq!(publish(&[one, three, four], "M").await.status, StatusCode::OK);
+    // A fourth publish this hour is refused; picture uploads count with publishes.
+    let r = publish(&[one, three, four], "N").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(r.json()["error"].as_str().unwrap().contains("PUBLISHES_PER_ACCOUNT_HOUR"), "{}", r.text());
+    let up = Request::post("/api/v1/page/avatar")
+        .header(header::HOST, "app.example.link")
+        .header(header::ORIGIN, APP)
+        .header("x-link-in-bio-request", "1")
+        .header(header::COOKIE, &cookie)
+        .body(Body::from(vec![0u8; 16]))
+        .unwrap();
+    let r = send(&app_r, up).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.text());
+    assert!(r.json()["error"].as_str().unwrap().contains("Picture uploads count with publishes"));
+    // Hiding a link, and then unpublishing, still work past every budget.
+    let hidden = json!({ "schema": 1, "identity": { "displayName": "erin", "handle": "erin" }, "items": [
+        { "kind": "link", "id": "one", "title": "M", "url": one },
+        { "kind": "link", "id": "three", "title": "M", "url": three, "hidden": true },
+        { "kind": "link", "id": "four", "title": "M", "url": four },
+    ] });
+    assert_eq!(send(&app_r, call("PUT", "/api/v1/page", Some(hidden), Some(&cookie))).await.status, StatusCode::OK);
+    let r = send(&app_r, call("POST", "/api/v1/page/publish", None, Some(&cookie))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        send(&app_r, call("POST", "/api/v1/page/unpublish", None, Some(&cookie))).await.status,
+        StatusCode::NO_CONTENT
+    );
+    // The console shows the preset and the values in effect.
+    let o = send(&super::admin::router(a), admin_call("GET", "/api/v1/admin/overview", None)).await.json();
+    assert_eq!(o["accountLimits"], json!({ "preset": "standard", "publishesPerHour": 3, "newLinksPerDay": 4 }));
+}
+
+#[tokio::test]
+async fn refunds_on_request_net_of_fees_matched_or_recorded_exactly() {
+    let Some(s) = store().await else { return };
+    let dir = std::env::temp_dir().join(format!("lib-square-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("token"), "t").unwrap();
+    std::fs::write(dir.join("sig"), "sk").unwrap();
+    let a = app(
+        s.clone(),
+        config(&[
+            ("BILLING_PROVIDERS", "square".into()),
+            ("SQUARE_LOCATION_ID", "L1".into()),
+            ("SQUARE_ACCESS_TOKEN_FILE", dir.join("token").display().to_string()),
+            ("SQUARE_SIGNATURE_KEY_FILE", dir.join("sig").display().to_string()),
+        ]),
+    );
+    let app_r = super::app::router(a.clone());
+    let admin = super::admin::router(a.clone());
+    let (id, cookie) = account_with_session(&s, "gwen").await;
+    let checkout = |order: &'static str| {
         let s = s.clone();
-        let hashes: Vec<Vec<u8>> = urls.iter().map(|u| link_in_bio_store::sha256(u.as_bytes())).collect();
-        async move { s.screens(&hashes).await.unwrap() }
+        async move {
+            let c = uuid::Uuid::new_v4();
+            s.create_checkout(&link_in_bio_store::Checkout {
+                id: c,
+                account_id: id,
+                provider: "square".into(),
+                provider_ref: order.into(),
+                method: "square:card".into(),
+                months: 12,
+                amount_pence: 3600,
+                status: "open".into(),
+                country_declared: Some("GB".into()),
+                country_request: Some("GB".into()),
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            })
+            .await
+            .unwrap();
+            c
+        }
     };
-    let erin = verdicts(&["https://one.example/", "https://two.example/", "https://three.example/"]).await;
-    let clean = erin.iter().filter(|v| v.verdict == "clean" && v.source == "webrisk").count();
-    let over: Vec<_> = erin.iter().filter(|v| v.verdict == "unknown").collect();
-    assert_eq!((clean, over.len()), (2, 1), "two within the budget, the third left for the worker");
-    assert!(over[0].detail.contains("daily screening budget"), "{}", over[0].detail);
-    assert!(over[0].next_check_at <= time::OffsetDateTime::now_utc() + time::Duration::hours(1));
-    // Another account has its own budget.
-    publish("fred", vec!["https://four.example/"]).await;
-    assert_eq!(verdicts(&["https://four.example/"]).await[0].verdict, "clean");
-    // The shared monthly count saw only the calls made: 2 + 1.
-    let month = link_in_bio_safety::period(time::OffsetDateTime::now_utc());
-    assert_eq!(s.counter("webrisk", &month).await.unwrap(), 3);
+    let months_left = |s: Store| async move {
+        let until = s.account(id).await.unwrap().unwrap().paid_until.unwrap();
+        ((until - time::OffsetDateTime::now_utc()).whole_milliseconds() as f64 / 2_629_800_000.0).round() as i64
+    };
+    let actions = |s: Store| async move {
+        s.audit_log(None, 200).await.unwrap().into_iter().map(|e| e.action).collect::<Vec<_>>()
+    };
+
+    // (a) Cancel within 14 days: £36 back less the day begun (10p) and Square's fee share (25p + 1.4 %: 76p).
+    checkout("ORD20").await;
+    send(&app_r, square_hook("sk", &square_payment("P20", "ORD20", 3600))).await;
+    assert_eq!(months_left(s.clone()).await, 12);
+    let r = send(&app_r, call("GET", "/api/v1/billing/refunds", None, Some(&cookie))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let offer = &r.json()["cancel"][0];
+    let line = &offer["offer"]["lines"][0];
+    assert_eq!(
+        (line["months"].as_u64(), line["daysUsed"].as_u64(), line["feeMinor"].as_u64()),
+        (Some(12), Some(1), Some(76))
+    );
+    assert_eq!(
+        (line["amountMinor"].as_u64(), line["amount"].as_str(), line["unit"].as_str()),
+        (Some(3514), Some("35.14"), Some("GBP"))
+    );
+    let purchase = offer["purchase"].clone();
+    let ask = |body: Value| {
+        let app_r = app_r.clone();
+        let cookie = cookie.clone();
+        async move { send(&app_r, call("POST", "/api/v1/billing/refund-requests", Some(body), Some(&cookie))).await }
+    };
+    let r = ask(json!({ "kind": "cancel", "purchase": purchase, "reason": "changed my mind" })).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let first = r.json()["refundRequest"].as_str().unwrap().to_string();
+    assert_eq!(
+        ask(json!({ "kind": "cancel", "purchase": purchase })).await.status,
+        StatusCode::CONFLICT,
+        "one open request"
+    );
+    // The console shows exactly what to send and where; nothing is taken back yet.
+    let q = send(&admin, admin_call("GET", "/api/v1/admin/refund-requests", None)).await.json();
+    let row = &q["requests"][0];
+    assert_eq!((row["kind"].as_str(), row["lines"][0]["amountMinor"].as_i64()), (Some("cancel"), Some(3514)));
+    assert!(row["lines"][0]["destination"]["how"].as_str().unwrap().contains("Square"));
+    assert_eq!(months_left(s.clone()).await, 12);
+    // The operator refunds exactly that in Square: the notification closes the request and takes back the 12 months.
+    send(&app_r, square_hook("sk", &square_refund("R20", "ORD20", 3514))).await;
+    let rr = s.refund_request(first.parse().unwrap()).await.unwrap().unwrap();
+    assert_eq!(rr.status, "refunded");
+    assert!(
+        s.account(id).await.unwrap().unwrap().paid_until.unwrap()
+            <= time::OffsetDateTime::now_utc() + time::Duration::minutes(1)
+    );
+    assert!(actions(s.clone()).await.contains(&"refund-matched".to_string()));
+
+    // (b) Later, unstarted months: a new 12-month purchase has 11 that have not begun; 2 of them come back at what
+    // it paid per month (£6) less their fee share (13p), and the operator records the refund by hand.
+    checkout("ORD21").await;
+    send(&app_r, square_hook("sk", &square_payment("P21", "ORD21", 3600))).await;
+    let r = send(&app_r, call("GET", "/api/v1/billing/refunds", None, Some(&cookie))).await.json();
+    assert_eq!(r["unstarted"]["months"], 11);
+    let r = ask(json!({ "kind": "unstarted", "months": 2 })).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["offer"]["lines"][0]["amountMinor"], 587);
+    let second = r.json()["refundRequest"].as_str().unwrap().to_string();
+    let rec = send(
+        &admin,
+        admin_call(
+            "POST",
+            &format!("/api/v1/admin/refund-requests/{second}/refunded"),
+            Some(json!({ "reference": "sq-refund-9" })),
+        ),
+    )
+    .await;
+    assert_eq!(rec.status, StatusCode::OK, "{}", rec.text());
+    assert_eq!(rec.json()["request"]["status"], "refunded");
+    assert_eq!(months_left(s.clone()).await, 10, "exactly the two months on the request");
+
+    // A refund no request names (the operator's own £18 in Square): pro rata over everything refunded of the
+    // purchase so far, 587 + 1800 of 3600 → 7 months in all, 2 already taken: 5 more.
+    send(&app_r, square_hook("sk", &square_refund("R22", "ORD21", 1800))).await;
+    assert_eq!(months_left(s.clone()).await, 5);
+    // With a request open, a refund of another amount does not close it: it is audited and taken pro rata.
+    let r = ask(json!({ "kind": "unstarted", "months": 1 })).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let third = r.json()["refundRequest"].as_str().unwrap().to_string();
+    send(&app_r, square_hook("sk", &square_refund("R23", "ORD21", 100))).await;
+    assert!(actions(s.clone()).await.contains(&"refund-not-matching-request".to_string()));
+    assert_eq!(s.refund_request(third.parse().unwrap()).await.unwrap().unwrap().status, "open");
+    assert_eq!(months_left(s.clone()).await, 4, "2487 of 3600 is 8 months in all: one more");
+    // The account holder withdraws it; the operator may decline another.
+    let w =
+        send(&app_r, call("POST", &format!("/api/v1/billing/refund-requests/{third}/withdraw"), None, Some(&cookie)))
+            .await;
+    assert_eq!(w.status, StatusCode::NO_CONTENT, "{}", w.text());
+    let r = ask(json!({ "kind": "unstarted", "months": 1 })).await;
+    let fourth = r.json()["refundRequest"].as_str().unwrap().to_string();
+    let d = send(
+        &admin,
+        admin_call(
+            "POST",
+            &format!("/api/v1/admin/refund-requests/{fourth}/declined"),
+            Some(json!({ "reason": "test" })),
+        ),
+    )
+    .await;
+    assert_eq!(d.status, StatusCode::OK, "{}", d.text());
+    assert_eq!(months_left(s.clone()).await, 4, "nothing taken back for a request withdrawn or declined");
+    let all = actions(s.clone()).await;
+    for step in ["refund-requested", "refund-recorded", "refund-withdrawn", "refund-declined"] {
+        assert!(all.contains(&step.to_string()), "{step} is audited");
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
@@ -1330,5 +1508,6 @@ async fn the_console_starts_without_any_key_and_shows_the_switches() {
     assert_eq!(o.status, StatusCode::OK, "{}", o.text());
     let sw = &o.json()["switches"];
     assert_eq!(sw["webRisk"], true);
+    assert_eq!(o.json()["webRisk"]["confirmMonthlyCap"], 0, "no billed Web Risk call by default");
     assert_eq!(sw["billingProviders"], json!(["chain-payments", "manual", "square"]));
 }

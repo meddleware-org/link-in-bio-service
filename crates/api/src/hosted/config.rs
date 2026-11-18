@@ -58,9 +58,15 @@ pub struct HostedConfig {
     /// Custom domains allowed in total (0 = custom domains off). Hard stop at 100.
     pub custom_hostname_cap: i64,
     pub web_risk_key_file: Option<String>,
+    /// Web Risk calls a month over every process, `threatLists.computeDiff` and `hashes.search` together.
     pub web_risk_monthly_cap: i64,
-    /// Web Risk calls one account's publishes may spend a day (0: no per-account limit).
-    pub web_risk_account_daily_cap: i64,
+    /// `hashes.search` calls a month (the billed call: $50 per 1 000, no free tier); 0 means none, so a local prefix
+    /// match is hidden until an operator reviews it.
+    pub web_risk_confirm_monthly_cap: i64,
+    /// The most prefixes kept per Web Risk list (`constraints.maxDatabaseEntries`).
+    pub web_risk_max_entries: u32,
+    /// How much one account may change its page ([`AccountLimits`]).
+    pub account_limits: AccountLimits,
     pub threatfox_key_file: Option<String>,
     pub sui_network: String,
     /// Bytes of pictures one account may store.
@@ -77,6 +83,35 @@ pub struct HostedConfig {
     pub bank_feeds: Vec<BankFeedEnv>,
     pub bank_feed_poll_secs: u64,
     pub access: Option<AccessEnv>,
+}
+
+/// How much one account may change its page, from a preset (`ACCOUNT_LIMITS=standard|generous`) with each value
+/// overridable on its own; 0 means no limit. Removing or hiding links and unpublishing are never limited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLimits {
+    pub preset: LimitsPreset,
+    /// Publishes an hour (`PUBLISHES_PER_ACCOUNT_HOUR`), picture uploads counted with them.
+    pub publishes_per_hour: i64,
+    /// Links a published page did not have before, a day (`NEW_LINKS_PER_ACCOUNT_DAY`).
+    pub new_links_per_day: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LimitsPreset {
+    Standard,
+    Generous,
+}
+
+impl LimitsPreset {
+    /// `(publishes an hour, new links a day)`: standard is 30 and 120 (two full pages), generous ten times that.
+    pub fn values(self) -> (i64, i64) {
+        match self {
+            LimitsPreset::Standard => (30, 120),
+            LimitsPreset::Generous => (300, 1200),
+        }
+    }
 }
 
 /// Provider credentials are files (mounted from Secrets); the API bases default to each provider's sandbox.
@@ -437,6 +472,33 @@ impl HostedConfig {
                 .map_err(|e| HostedConfigError::Invalid("SITE_CONFIG", e.to_string()))?,
         };
         let web_risk_monthly_cap = number(&get, "WEB_RISK_MONTHLY_CAP", 90_000i64, 0, 100_000)?;
+        let web_risk_confirm_monthly_cap = number(&get, "WEB_RISK_CONFIRM_MONTHLY_CAP", 0i64, 0, 100_000)?;
+        if web_risk_confirm_monthly_cap > web_risk_monthly_cap {
+            return Err(HostedConfigError::Invalid(
+                "WEB_RISK_CONFIRM_MONTHLY_CAP",
+                "is part of WEB_RISK_MONTHLY_CAP, so at most that".into(),
+            ));
+        }
+        let web_risk_max_entries = number(&get, "WEB_RISK_MAX_ENTRIES", 262_144u32, 1024, 1_048_576)?;
+        if !web_risk_max_entries.is_power_of_two() {
+            return Err(HostedConfigError::Invalid(
+                "WEB_RISK_MAX_ENTRIES",
+                "a power of two from 1024 to 1048576".into(),
+            ));
+        }
+        let preset = match get("ACCOUNT_LIMITS").as_deref().map(str::trim) {
+            None | Some("") | Some("standard") => LimitsPreset::Standard,
+            Some("generous") => LimitsPreset::Generous,
+            Some(o) => {
+                return Err(HostedConfigError::Invalid("ACCOUNT_LIMITS", format!("{o} is not standard or generous")));
+            }
+        };
+        let (publishes, new_links) = preset.values();
+        let account_limits = AccountLimits {
+            preset,
+            publishes_per_hour: number(&get, "PUBLISHES_PER_ACCOUNT_HOUR", publishes, 0, 100_000)?,
+            new_links_per_day: number(&get, "NEW_LINKS_PER_ACCOUNT_DAY", new_links, 0, 1_000_000)?,
+        };
         let custom_hostname_cap = number(&get, "CUSTOM_HOSTNAME_CAP", 0i64, 0, 100)?;
         Ok(Self {
             keys,
@@ -454,7 +516,9 @@ impl HostedConfig {
             custom_hostname_cap,
             web_risk_key_file: key_opt("WEB_RISK_KEY_FILE"),
             web_risk_monthly_cap,
-            web_risk_account_daily_cap: number(&get, "WEB_RISK_ACCOUNT_DAILY_CAP", 200i64, 0, 100_000)?,
+            web_risk_confirm_monthly_cap,
+            web_risk_max_entries,
+            account_limits,
             threatfox_key_file: key_opt("THREATFOX_KEY_FILE"),
             sui_network: get("SUI_NETWORK").unwrap_or_else(|| "testnet".into()),
             asset_quota_bytes: number(&get, "ASSET_QUOTA_BYTES", 512 * 1024i64, 64 * 1024, 16 * 1024 * 1024)?,
@@ -511,6 +575,11 @@ mod tests {
         assert_eq!(c.billing_providers, BTreeSet::from(["manual".to_string()]));
         assert_eq!(c.custom_hostname_cap, 0);
         assert!(c.bank_feeds.is_empty() && c.open_payments.is_none());
+        assert_eq!(c.web_risk_confirm_monthly_cap, 0, "no billed Web Risk call unless asked for");
+        assert_eq!(
+            c.account_limits,
+            AccountLimits { preset: LimitsPreset::Standard, publishes_per_hour: 30, new_links_per_day: 120 }
+        );
         assert!(!c.signup_open_to_public());
         assert_eq!(c.handle_of_host("alice.example.link"), Some("alice"));
         assert_eq!(c.handle_of_host("a.b.example.link"), None);
@@ -579,7 +648,11 @@ mod tests {
         }
         assert!(with(("BANK_FEEDS", "wise")).is_err(), "bank feeds need bank transfer");
         assert!(with(("CUSTOM_HOSTNAME_CAP", "101")).is_err(), "hard stop at 100");
-        assert!(with(("WEB_RISK_MONTHLY_CAP", "100001")).is_err(), "never past the free tier");
+        assert!(with(("WEB_RISK_MONTHLY_CAP", "100001")).is_err(), "a hard stop at 100 000");
+        assert!(with(("WEB_RISK_CONFIRM_MONTHLY_CAP", "100")).is_ok());
+        assert!(with(("WEB_RISK_MONTHLY_CAP", "50")).is_ok());
+        assert!(with(("WEB_RISK_MAX_ENTRIES", "300000")).is_err(), "a power of two");
+        assert!(with(("ACCOUNT_LIMITS", "unlimited")).is_err());
         let access = |team: &'static str| {
             let mut v = base.to_vec();
             v.extend([
@@ -594,5 +667,23 @@ mod tests {
         let ok = access("https://team.cloudflareaccess.com/").unwrap().access.unwrap();
         assert_eq!(ok.team_domain, "https://team.cloudflareaccess.com");
         assert!(HostedConfig::from_env(env(&[("PAGES_DOMAIN", "x"), ("APP_HOST", "app.example.link")])).is_err());
+    }
+
+    #[test]
+    fn account_limits_are_a_preset_with_each_value_overridable() {
+        let base = [("PAGES_DOMAIN", "example.link"), ("APP_HOST", "app.example.link")];
+        let limits = |extra: &[(&'static str, &'static str)]| {
+            let mut v = base.to_vec();
+            v.extend_from_slice(extra);
+            HostedConfig::from_env(env(&v)).unwrap().account_limits
+        };
+        let g = limits(&[("ACCOUNT_LIMITS", "generous")]);
+        assert_eq!((g.publishes_per_hour, g.new_links_per_day), (300, 1200));
+        let o = limits(&[("ACCOUNT_LIMITS", "generous"), ("NEW_LINKS_PER_ACCOUNT_DAY", "0")]);
+        assert_eq!((o.preset, o.publishes_per_hour, o.new_links_per_day), (LimitsPreset::Generous, 300, 0));
+        assert_eq!(limits(&[("PUBLISHES_PER_ACCOUNT_HOUR", "5")]).publishes_per_hour, 5);
+        let mut both = base.to_vec();
+        both.extend([("WEB_RISK_MONTHLY_CAP", "10"), ("WEB_RISK_CONFIRM_MONTHLY_CAP", "11")]);
+        assert!(HostedConfig::from_env(env(&both)).is_err(), "confirmations are part of the monthly cap");
     }
 }

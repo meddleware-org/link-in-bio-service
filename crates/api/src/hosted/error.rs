@@ -28,6 +28,9 @@ pub enum ApiError {
     Issues(Vec<link_in_bio_core::Issue>),
     #[error("{0}")]
     Unavailable(&'static str),
+    /// A per-account limit is reached: which one and when it resets, in plain words, and the seconds until then.
+    #[error("{message}")]
+    TooMany { message: String, retry_after: u64 },
     #[error("something went wrong; try again")]
     Internal,
 }
@@ -44,6 +47,7 @@ impl ApiError {
             ApiError::Unprocessable(_) => (StatusCode::UNPROCESSABLE_ENTITY, "unprocessable"),
             ApiError::Issues(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_page"),
             ApiError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+            ApiError::TooMany { .. } => (StatusCode::TOO_MANY_REQUESTS, "limited"),
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
     }
@@ -56,8 +60,14 @@ impl IntoResponse for ApiError {
         if let ApiError::Issues(issues) = &self {
             body["issues"] = serde_json::to_value(issues).unwrap_or_default();
         }
+        if let ApiError::TooMany { retry_after, .. } = &self {
+            body["retryAfter"] = json!(retry_after);
+        }
         let mut r = (status, Json(body)).into_response();
         r.headers_mut().insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+        if let ApiError::TooMany { retry_after, .. } = &self {
+            r.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(*retry_after));
+        }
         r
     }
 }
