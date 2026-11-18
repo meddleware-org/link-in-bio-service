@@ -10,8 +10,11 @@ use sha2::{Digest, Sha256};
 
 /// Longest upload accepted, before decoding.
 pub const MAX_INPUT_BYTES: usize = 5 * 1024 * 1024;
-/// Largest picture dimension accepted, before decoding.
-pub const MAX_INPUT_SIDE: u32 = 8192;
+/// Largest picture dimension accepted, before decoding (ten times the output side is plenty for a 400 × 400 picture).
+pub const MAX_INPUT_SIDE: u32 = 4096;
+/// The most memory one decode may allocate. Decoding and the square crop each hold a copy, so one picture costs at most
+/// twice this: the app's pods (192 MiB) process one picture at a time (`link-in-bio-api`'s upload limit).
+pub const MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
 /// Output side length.
 pub const SIDE: u32 = 400;
 /// Largest stored picture.
@@ -25,7 +28,7 @@ pub enum AvatarError {
     Unsupported,
     #[error("The picture could not be read.")]
     Corrupt,
-    #[error("The picture is too large in pixels: at most 8192 on each side.")]
+    #[error("The picture is too large in pixels: at most 4096 on each side.")]
     TooManyPixels,
     #[error("The picture could not be made small enough.")]
     CannotShrink,
@@ -56,7 +59,7 @@ pub fn normalise_raster(input: &[u8]) -> Result<Avatar, AvatarError> {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_INPUT_SIDE);
     limits.max_image_height = Some(MAX_INPUT_SIDE);
-    limits.max_alloc = Some(256 * 1024 * 1024);
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
     reader.limits(limits);
     let img = reader.decode().map_err(|e| match e {
         image::ImageError::Limits(_) => AvatarError::TooManyPixels,
@@ -170,6 +173,51 @@ mod tests {
         poly.extend_from_slice(b"<html><script>alert(1)</script>");
         let a = normalise_raster(&poly).unwrap();
         assert!(!a.bytes.windows(8).any(|w| w == b"<script>"));
+    }
+
+    /// A PNG whose header claims `w` × `h` pixels of RGBA at `depth` bits (its image data is an empty zlib stream: only
+    /// the header matters here).
+    fn png_header(w: u32, h: u32, depth: u8) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut c = 0xFFFF_FFFFu32;
+            for b in data {
+                c ^= u32::from(*b);
+                for _ in 0..8 {
+                    c = if c & 1 == 1 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = w.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[depth, 6, 0, 0, 0]);
+        chunk(&mut out, b"IHDR", &ihdr);
+        chunk(&mut out, b"IDAT", &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn pictures_too_large_to_decode_safely_are_refused_before_decoding() {
+        // Over the side limit: refused from the header, before any pixel buffer exists.
+        assert_eq!(normalise_raster(&png_header(MAX_INPUT_SIDE + 1, 10, 8)).unwrap_err(), AvatarError::TooManyPixels);
+        assert_eq!(normalise_raster(&png_header(10, 8192, 8)).unwrap_err(), AvatarError::TooManyPixels);
+        // Within each side but over the decode budget (4096 × 4096 RGBA at 16 bits is 128 MiB).
+        let deep = png_header(MAX_INPUT_SIDE, MAX_INPUT_SIDE, 16);
+        assert_eq!(normalise_raster(&deep).unwrap_err(), AvatarError::TooManyPixels);
+        // The budget holds two copies of the largest 8-bit picture well inside the app pod's 192 MiB.
+        const {
+            assert!(MAX_INPUT_SIDE as u64 * MAX_INPUT_SIDE as u64 * 4 <= MAX_DECODE_BYTES);
+            assert!(2 * MAX_DECODE_BYTES < 192 * 1024 * 1024);
+        }
     }
 
     #[test]

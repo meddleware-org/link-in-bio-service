@@ -77,7 +77,8 @@ impl Wise {
             resp = send(Some((&ott, &sig))).await.map_err(unavailable)?;
         }
         let status = resp.status();
-        let text = resp.text().await.map_err(unavailable)?;
+        let text = String::from_utf8(crate::read_limited(resp, crate::MAX_STATEMENT_BYTES).await?)
+            .map_err(|_| BillingError::Malformed("Wise answered something that is not UTF-8 text".into()))?;
         if status.is_success() {
             Ok(text)
         } else if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {

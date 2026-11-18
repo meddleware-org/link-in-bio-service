@@ -226,7 +226,7 @@ fn run(cli: Cli) -> Result<(), String> {
             for w in &site.warnings {
                 tracing::warn!(path = %w.path, code = w.code, "{}", w.message);
             }
-            let app = static_mode::router(Arc::new(site));
+            let app = hosted::bounded(static_mode::router(Arc::new(site)), hosted::REQUEST_TIMEOUT, 128);
             runtime()?.block_on(serve(app, listen))
         }
         Command::Serve { mode: m @ (Mode::Pages | Mode::App | Mode::Admin), listen, .. } => {
@@ -441,12 +441,15 @@ fn store(pool: u32, read_only: bool) -> Result<link_in_bio_store::Store, String>
     Ok(link_in_bio_store::Store::new(settings.lazy_pool(pool, access).map_err(|e| e.to_string())?))
 }
 
-/// The hosted settings a process reads. The page server (read-only) never takes payments and holds no provider key,
-/// so for it `BILLING_PROVIDERS` is always `manual` and `BANK_FEEDS` empty, whatever the shared configuration says.
+/// The hosted settings a process reads. The page server (read-only) never takes payments, screens no link and mounts no
+/// secret, so for it `BILLING_PROVIDERS` is always `manual`, `BANK_FEEDS` empty and every `*_FILE` setting (provider and
+/// bank keys, the Web Risk and ThreatFox keys) unset, whatever the shared configuration says: a key path in the shared
+/// ConfigMap can never make it read, or fail on, a file it does not have.
 fn hosted_env(read_only: bool, get: impl Fn(&str) -> Option<String>) -> impl Fn(&str) -> Option<String> {
     move |k: &str| match k {
         "BILLING_PROVIDERS" if read_only => Some("manual".into()),
         "BANK_FEEDS" if read_only => None,
+        _ if read_only && k.ends_with("_FILE") => None,
         _ => get(k),
     }
 }
@@ -489,5 +492,27 @@ mod hosted_env_tests {
         assert_eq!(super::hosted_env(true, feeds)("BANK_FEEDS"), None);
         assert_eq!(super::hosted_env(false, feeds)("BANK_FEEDS").as_deref(), Some("wise"));
         assert_eq!(super::hosted_env(true, shared)("PAGES_DOMAIN"), None);
+    }
+
+    #[test]
+    fn the_page_server_never_reads_a_secret_file() {
+        let shared = |k: &str| match k {
+            "PAGES_DOMAIN" => Some("example.link".to_string()),
+            "APP_HOST" => Some("app.example.link".to_string()),
+            "WEB_RISK_MONTHLY_CAP" => Some("1000".to_string()),
+            k if k.ends_with("_FILE") => Some(format!("/nonexistent/{k}")),
+            _ => None,
+        };
+        for k in ["WEB_RISK_KEY_FILE", "THREATFOX_KEY_FILE", "CHAIN_PAYMENTS_KEY_FILE", "SQUARE_ACCESS_TOKEN_FILE"] {
+            assert_eq!(super::hosted_env(true, shared)(k), None, "{k}");
+            assert_eq!(super::hosted_env(false, shared)(k), Some(format!("/nonexistent/{k}")), "{k}");
+        }
+        assert_eq!(super::hosted_env(true, shared)("PAGES_DOMAIN").as_deref(), Some("example.link"));
+        // The page server's configuration names no key at all, so building it reads no file.
+        let pages = link_in_bio_api::hosted::HostedConfig::from_env(super::hosted_env(true, shared)).unwrap();
+        assert!(pages.web_risk_key_file.is_none() && pages.threatfox_key_file.is_none());
+        assert!(pages.chain_payments.is_none() && pages.bank_feeds.is_empty());
+        let app = link_in_bio_api::hosted::HostedConfig::from_env(super::hosted_env(false, shared)).unwrap();
+        assert_eq!(app.web_risk_key_file.as_deref(), Some("/nonexistent/WEB_RISK_KEY_FILE"));
     }
 }

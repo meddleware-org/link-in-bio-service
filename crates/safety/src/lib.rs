@@ -19,6 +19,27 @@ pub const RESCAN_CLEAN: Duration = Duration::hours(24);
 pub const RESCAN_UNKNOWN: Duration = Duration::hours(1);
 pub const RESCAN_FLAGGED: Duration = Duration::days(7);
 
+/// The longest Web Risk answer read (a lookup answer is a few hundred bytes).
+const MAX_WEB_RISK_BYTES: usize = 64 * 1024;
+/// The longest ThreatFox answer read (seven days of indicators are a few megabytes).
+const MAX_THREATFOX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Reads a response body of at most `max` bytes (checked on the declared length, then while reading); `None` when it is
+/// longer or the connection broke off.
+async fn read_limited(mut resp: reqwest::Response, max: usize) -> Option<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        return None;
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if out.len() + chunk.len() > max {
+            return None;
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Some(out)
+}
+
 /// Hosts whose only job is to redirect somewhere else.
 pub const SHORTENERS: &[&str] = &[
     "bit.ly",
@@ -149,7 +170,9 @@ impl WebRisk {
         if !r.status().is_success() {
             return Err(format!("Web Risk answered HTTP {}", r.status().as_u16()));
         }
-        let v: Value = r.json().await.map_err(|_| "Web Risk answered something unreadable".to_string())?;
+        let body = read_limited(r, MAX_WEB_RISK_BYTES).await.ok_or("Web Risk answered too much or broke off")?;
+        let v: Value =
+            serde_json::from_slice(&body).map_err(|_| "Web Risk answered something unreadable".to_string())?;
         Ok(v["threat"]["threatTypes"]
             .as_array()
             .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
@@ -247,7 +270,8 @@ pub async fn fetch_threatfox(
     if !r.status().is_success() {
         return Err(format!("ThreatFox answered HTTP {}", r.status().as_u16()));
     }
-    let v: Value = r.json().await.map_err(|_| "ThreatFox answered something unreadable".to_string())?;
+    let body = read_limited(r, MAX_THREATFOX_BYTES).await.ok_or("ThreatFox answered too much or broke off")?;
+    let v: Value = serde_json::from_slice(&body).map_err(|_| "ThreatFox answered something unreadable".to_string())?;
     if v["query_status"].as_str() != Some("ok") {
         return Err(format!("ThreatFox: {}", v["query_status"].as_str().unwrap_or("error")));
     }

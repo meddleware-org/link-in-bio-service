@@ -28,6 +28,7 @@ const JWKS_MAX_AGE: Duration = Duration::from_secs(3600);
 const ROLE_ALLOWED_TTL: Duration = Duration::from_secs(30);
 const ROLE_DENIED_TTL: Duration = Duration::from_secs(5);
 const MAX_JWKS_BYTES: usize = 64 * 1024;
+const MAX_KETO_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum JwksSource {
@@ -108,10 +109,7 @@ impl Admins {
         if !resp.status().is_success() {
             return Err(unavailable());
         }
-        let body = resp.bytes().await.map_err(|_| unavailable())?;
-        if body.len() > MAX_JWKS_BYTES {
-            return Err(unavailable());
-        }
+        let body = link_in_bio_billing::read_limited(resp, MAX_JWKS_BYTES).await.map_err(|_| unavailable())?;
         let set: JwkSet = serde_json::from_slice(&body).map_err(|_| unavailable())?;
         *self.keys.write().await = (set, Some(Instant::now()));
         Ok(())
@@ -164,7 +162,8 @@ impl Admins {
                 if !resp.status().is_success() {
                     return Err(unavailable());
                 }
-                resp.json::<KetoCheck>().await.map_err(|_| unavailable())?.allowed
+                let body = link_in_bio_billing::read_limited(resp, MAX_KETO_BYTES).await.map_err(|_| unavailable())?;
+                serde_json::from_slice::<KetoCheck>(&body).map_err(|_| unavailable())?.allowed
             }
         };
         self.roles.lock().await.insert(subject.to_owned(), (allowed, Instant::now()));

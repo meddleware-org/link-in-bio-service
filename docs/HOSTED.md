@@ -9,7 +9,7 @@ part trusts.
 | Command | What it serves | Database role | Typical port |
 | --- | --- | --- | --- |
 | `link-in-bio migrate` | applies the schema, then exits | owner (DDL) | none |
-| `link-in-bio serve --mode pages` | every tenant host: `<handle>.<PAGES_DOMAIN>`, and verified custom domains when they are on | read-only (it can read only the `public.*_v1` views) | 8080 |
+| `link-in-bio serve --mode pages` | every tenant host: `<handle>.<PAGES_DOMAIN>`, and verified custom domains when they are on. It takes no payment and reads no key: `BILLING_PROVIDERS` counts as `manual`, `BANK_FEEDS` as empty and every `*_FILE` setting as unset | read-only (it can read only the `public.*_v1` views) | 8080 |
 | `link-in-bio serve --mode app` | the account API on `APP_HOST` (`/api/v1/…`, the page assets under `/_/`), plus the internal port (provider notifications, `/metrics`) | writer (schema `lib`) | 8080 and `INTERNAL_LISTEN_ADDR` (8081) |
 | `link-in-bio serve --mode admin` | the operator console's API (`/api/v1/admin/…`) behind Cloudflare Access and the `LinkInBio:admin#member` Keto role | writer | 8080 |
 | `link-in-bio worker` | its own `/metrics` and `/healthz`; one process at a time holds an advisory lock and does the scheduled duties | writer | `WORKER_LISTEN_ADDR` (8081) |

@@ -807,8 +807,10 @@ async fn page_preview(State(app): State<Shared>, headers: HeaderMap) -> ApiResul
     crate::headers::secure(h, false, true);
     // The preview may be framed by the app itself, and only by it.
     h.remove(header::X_FRAME_OPTIONS);
+    // `sandbox`: the draft runs with an opaque origin and no script even if it is opened outside the editor's frame
+    // (which is sandboxed the same way), so a tenant's document never runs as the app's origin.
     let csp = crate::headers::page_csp()
-        .replace("frame-ancestors 'none'", &format!("frame-ancestors {}", app.config.app_origin));
+        .replace("frame-ancestors 'none'", &format!("frame-ancestors {}; sandbox", app.config.app_origin));
     h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&csp).map_err(|_| ApiError::Internal)?);
     Ok(r)
 }
@@ -870,7 +872,13 @@ async fn page_restore(
 
 async fn avatar_upload(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
     let a = account(&app, &headers).await?;
-    let pic = link_in_bio_assets::normalise_raster(&body).map_err(|e| ApiError::Unprocessable(e.to_string()))?;
+    let pic = {
+        let _turn = app.pictures.acquire().await.map_err(|_| ApiError::Internal)?;
+        tokio::task::spawn_blocking(move || link_in_bio_assets::normalise_raster(&body))
+            .await
+            .map_err(|_| ApiError::Internal)?
+            .map_err(|e| ApiError::Unprocessable(e.to_string()))?
+    };
     if app.store.asset_bytes(a.id).await? + pic.bytes.len() as i64 > app.config.asset_quota_bytes {
         return Err(ApiError::Conflict(
             "You have stored as many pictures as an account may; remove an old one first.".into(),
@@ -1443,22 +1451,27 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v1/appeals", post(appeal))
         .route("/api/v1/assets/{file}", get(asset))
         .layer(DefaultBodyLimit::max(64 * 1024));
-    // Pictures are uploaded as their bytes (up to 5 MiB; re-encoded to at most 64 KiB).
+    // Pictures are uploaded as their bytes (up to 5 MiB; re-encoded to at most 64 KiB), two at once per process (and
+    // decoded one at a time, `App::pictures`).
     let upload = Router::new()
         .route("/api/v1/page/avatar", post(avatar_upload))
-        .layer(DefaultBodyLimit::max(link_in_bio_assets::MAX_INPUT_BYTES));
+        .layer(DefaultBodyLimit::max(link_in_bio_assets::MAX_INPUT_BYTES))
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(2));
     // Payment providers' notifications come from the providers' servers (no Origin, no app header): outside the CSRF
     // guard, authenticated by each adapter's signature check instead.
     let hooks = Router::new()
         .route("/api/v1/webhooks/{provider}", post(provider_notification))
         .layer(DefaultBodyLimit::max(64 * 1024));
-    api.merge(upload)
+    let router = api
+        .merge(upload)
         .route("/_/{file}", get(bundle))
         .route("/healthz", get(|| async { "ok\n" }))
         .fallback(|| async { ApiError::NoRoute.into_response() })
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .merge(hooks)
-        .with_state(app)
+        .with_state(app);
+    // 64 requests of at most 64 KiB, plus two pictures of 5 MiB, within the pod's 192 MiB.
+    super::bounded(router, super::SLOW_REQUEST_TIMEOUT, 64)
 }
 
 /// A notification from a fiat provider over the internet. Chain Payments notifies on the internal port only, and the

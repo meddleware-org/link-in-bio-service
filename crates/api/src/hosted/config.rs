@@ -378,8 +378,13 @@ impl HostedConfig {
         }
         let bank_feed_poll_secs = number(&get, "BANK_FEED_POLL_SECS", 900u64, 300, 86_400)?;
         let access = match (get("ACCESS_TEAM_DOMAIN"), get("ACCESS_AUD")) {
+            // The team domain is both the token issuer and where its signing keys are fetched: https only, or the keys
+            // could be swapped on the way.
+            (Some(team), Some(_)) if !team.trim().starts_with("https://") => {
+                return Err(HostedConfigError::Invalid("ACCESS_TEAM_DOMAIN", "must be https".into()));
+            }
             (Some(team), Some(aud)) if !aud.trim().is_empty() => Some(AccessEnv {
-                team_domain: team.trim_end_matches('/').to_string(),
+                team_domain: team.trim().trim_end_matches('/').to_string(),
                 audience: aud.trim().to_string(),
                 keto_read_url: get("KETO_READ_URL").ok_or(HostedConfigError::Missing("KETO_READ_URL"))?,
                 admin_origin: get("ADMIN_ORIGIN").ok_or(HostedConfigError::Missing("ADMIN_ORIGIN"))?,
@@ -535,6 +540,19 @@ mod tests {
         assert!(with(("BANK_FEEDS", "wise")).is_err(), "bank feeds need bank transfer");
         assert!(with(("CUSTOM_HOSTNAME_CAP", "101")).is_err(), "hard stop at 100");
         assert!(with(("WEB_RISK_MONTHLY_CAP", "100001")).is_err(), "never past the free tier");
+        let access = |team: &'static str| {
+            let mut v = base.to_vec();
+            v.extend([
+                ("ACCESS_TEAM_DOMAIN", team),
+                ("ACCESS_AUD", "aud"),
+                ("KETO_READ_URL", "http://keto.auth.svc.cluster.local:4466"),
+                ("ADMIN_ORIGIN", "https://admin.example.org"),
+            ]);
+            HostedConfig::from_env(env(&v))
+        };
+        assert!(access("http://team.cloudflareaccess.com").is_err(), "the identity keys come over https only");
+        let ok = access("https://team.cloudflareaccess.com/").unwrap().access.unwrap();
+        assert_eq!(ok.team_domain, "https://team.cloudflareaccess.com");
         assert!(HostedConfig::from_env(env(&[("PAGES_DOMAIN", "x"), ("APP_HOST", "app.example.link")])).is_err());
     }
 }

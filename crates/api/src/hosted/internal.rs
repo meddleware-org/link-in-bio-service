@@ -205,16 +205,19 @@ async fn readyz(State(app): State<Shared>) -> Response {
 }
 
 pub fn router(app: Shared) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/internal/v1/payments/{provider}", post(notification))
         .route("/metrics", get(metrics))
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(readyz))
         .layer(DefaultBodyLimit::max(64 * 1024))
-        .with_state(app)
+        .with_state(app);
+    super::bounded(router, super::REQUEST_TIMEOUT, 32)
 }
 
 /// The worker's port: metrics and health only.
 pub fn worker_router(app: Shared) -> Router {
-    Router::new().route("/metrics", get(metrics)).route("/healthz", get(|| async { "ok\n" })).with_state(app)
+    let router =
+        Router::new().route("/metrics", get(metrics)).route("/healthz", get(|| async { "ok\n" })).with_state(app);
+    super::bounded(router, super::REQUEST_TIMEOUT, 8)
 }

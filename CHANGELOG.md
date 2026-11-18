@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+Security audit first pass (`docs/audit/link-in-bio-service-audit.md`):
+
+- The page server never reads a secret file: in `serve --mode pages` every `*_FILE` setting (the Web Risk and ThreatFox
+  keys, every provider and bank key) is ignored, as `BILLING_PROVIDERS` and `BANK_FEEDS` already were. A Web Risk key
+  path in the shared configuration used to make it fail at start.
+- Pictures: at most 4096 pixels a side (was 8192) and 64 MiB per decode (was 256 MiB, more than the app pod holds);
+  decoded off the async workers, one at a time per process, with two uploads at once.
+- Answers from providers, banks, wallets, Web Risk, ThreatFox, Keto, the Access keys and DNS-over-HTTPS are read up to a
+  fixed size (1 MiB for API answers, 16 MiB for bank statements).
+- Open Payments: names are resolved by a resolver that refuses non-public addresses when the connection is made (no DNS
+  rebinding between the check and the request); NAT64, 6to4 and site-local IPv6 addresses are judged by what they reach.
+- Every router that listens beyond loopback has a time bound (30 s; 60 s for the app and the console) and a limit on
+  requests at once shared by all its routes.
+- The console's answers are `no-store`, `nosniff` and `no-referrer`; the draft preview's CSP adds `sandbox`.
+- `ACCESS_TEAM_DOMAIN` must be https. Reserved handles include the names mail, DNS and browsers look up under a domain
+  (`autoconfig`, `autodiscover`, `mta-sts`, `wpad`, `smtp`, `ns1`, …).
+- The page cache stays at most 10 000 hosts under a flood of made-up host names; `unsafe_code` is `forbid`.
+
 ## 0.0.4 — 2026-11-18
 
 - Open Payments (Interledger), off unless `BILLING_PROVIDERS` lists `open-payments`: an incoming payment on the

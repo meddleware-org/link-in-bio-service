@@ -49,7 +49,23 @@ impl PageCache {
     pub async fn forget(&self, host: &str) {
         self.entries.lock().await.remove(host);
     }
+
+    /// Remembers what a host shows. The cache holds at most [`MAX_HOSTS`] hosts: past that, expired entries go, and if
+    /// every entry is still fresh (a flood of made-up host names) the cache starts again, so memory stays bounded.
+    async fn insert(&self, host: &str, built: Built) {
+        let mut entries = self.entries.lock().await;
+        if entries.len() >= MAX_HOSTS {
+            entries.retain(|_, (at, _)| at.elapsed() < self.ttl);
+            if entries.len() >= MAX_HOSTS {
+                entries.clear();
+            }
+        }
+        entries.insert(host.to_string(), (Instant::now(), built));
+    }
 }
+
+/// The most hosts the page cache remembers at once.
+pub const MAX_HOSTS: usize = 10_000;
 
 fn status(code: StatusCode, text: &'static str) -> Response {
     let mut r = Response::new(Body::from(format!("{text}\n")));
@@ -169,11 +185,7 @@ async fn resolve(app: &Shared, host: &str) -> Built {
         // The database is down: say so, and do not remember it.
         Err(_) => return Built::Status(StatusCode::SERVICE_UNAVAILABLE, "This page is unavailable right now."),
     };
-    let mut entries = app.pages.entries.lock().await;
-    if entries.len() > 10_000 {
-        entries.retain(|_, (at, _)| at.elapsed() < app.pages.ttl);
-    }
-    entries.insert(host.to_string(), (Instant::now(), built.clone()));
+    app.pages.insert(host, built.clone()).await;
     built
 }
 
@@ -204,5 +216,22 @@ async fn serve(State(app): State<Shared>, req: Request<Body>) -> Response {
 
 /// The page process's router: every path of every tenant host.
 pub fn router(app: Shared) -> Router {
-    Router::new().fallback(serve).with_state(app)
+    // Bodies are at most 64 KiB (the inbox, which reads none) and 16 KiB at the ingress.
+    super::bounded(Router::new().fallback(serve).with_state(app), super::REQUEST_TIMEOUT, 128)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_cache_stays_bounded_under_a_flood_of_fresh_hosts() {
+        let cache = PageCache::new(Duration::from_secs(600));
+        for i in 0..(MAX_HOSTS * 3) {
+            cache.insert(&format!("h{i}.example.link"), Built::Status(StatusCode::NOT_FOUND, "none")).await;
+            assert!(cache.entries.lock().await.len() <= MAX_HOSTS);
+        }
+        // The newest host is always remembered.
+        assert!(cache.entries.lock().await.contains_key(&format!("h{}.example.link", MAX_HOSTS * 3 - 1)));
+    }
 }

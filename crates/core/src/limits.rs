@@ -17,8 +17,10 @@ pub const MAX_SUPPORT: usize = 3;
 pub const MAX_LABEL: usize = 40;
 pub use crate::safe_url::MAX_URL_BYTES;
 
-/// Handles a tenant cannot take: hosts the service uses, roles people expect to be official, and words that invite
-/// impersonation. The operator's own page is exempt (its handle is set in its own configuration).
+/// Handles a tenant cannot take: hosts the service uses, roles people expect to be official, words that invite
+/// impersonation, and the labels that mail clients, mail servers, DNS and browsers look up by name under a domain
+/// (`autoconfig`, `autodiscover`, `mta-sts`, `wpad`, `smtp`, `ns1`, …), since every handle is a host name under the pages
+/// domain. The operator's own page is exempt (its handle is set in its own configuration).
 pub const RESERVED_HANDLES: &[&str] = &[
     "about",
     "abuse",
@@ -31,6 +33,8 @@ pub const RESERVED_HANDLES: &[&str] = &[
     "apps",
     "assets",
     "auth",
+    "autoconfig",
+    "autodiscover",
     "billing",
     "blog",
     "cdn",
@@ -41,23 +45,35 @@ pub const RESERVED_HANDLES: &[&str] = &[
     "docs",
     "edit",
     "editor",
+    "email",
+    "ftp",
     "help",
     "home",
     "hostmaster",
+    "imap",
     "info",
     "invite",
     "invites",
+    "isatap",
     "legal",
+    "localhost",
     "login",
     "logout",
     "mail",
     "meddleware",
     "moderator",
+    "mta-sts",
+    "mx",
     "news",
     "noc",
+    "ns",
+    "ns1",
+    "ns2",
     "official",
     "pay",
     "payments",
+    "pop",
+    "pop3",
     "postmaster",
     "privacy",
     "report",
@@ -67,14 +83,17 @@ pub const RESERVED_HANDLES: &[&str] = &[
     "shop",
     "signin",
     "signup",
+    "smtp",
     "spec",
     "static",
     "status",
     "support",
     "system",
     "terms",
+    "webmail",
     "webmaster",
     "well-known",
+    "wpad",
     "www",
 ];
 
@@ -139,5 +158,11 @@ mod skeleton_tests {
         assert!(looks_reserved("adrnin"));
         assert!(looks_reserved("supp0rt"));
         assert!(!looks_reserved("alice"));
+        // The names other software looks up under the pages domain are not handles anyone can take.
+        for h in ["autoconfig", "autodiscover", "mta-sts", "wpad", "smtp", "imap", "ns1", "webmail", "localhost"] {
+            assert!(looks_reserved(h), "{h}");
+            assert!(crate::manifest::check_handle(h, true).is_err(), "{h}");
+        }
+        assert!(RESERVED_HANDLES.windows(2).all(|w| w[0] < w[1]), "sorted, no duplicates");
     }
 }

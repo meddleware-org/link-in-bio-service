@@ -54,7 +54,7 @@ webauthn-rs = { version = "=0.6.2", features = ["danger-allow-state-serialisatio
 access-gate-gateway-core = "=0.0.33"
 
 [workspace.lints.rust]
-unsafe_code = "deny"
+unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 dbg_macro = "deny"

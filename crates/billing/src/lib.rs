@@ -339,11 +339,39 @@ fn unavailable(e: impl std::fmt::Display) -> BillingError {
     BillingError::Unavailable(e.to_string())
 }
 
+/// The longest answer read from a provider, bank or wallet API (their JSON documents are a few kilobytes; a buyer's
+/// Open Payments wallet is a server the buyer chooses, so this is what stops one from streaming without end).
+pub const MAX_ANSWER_BYTES: usize = 1024 * 1024;
+/// The longest bank statement read from a bank feed (a camt.053 of a busy month).
+pub const MAX_STATEMENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Reads a response body of at most `max` bytes: refused on the declared length before reading, and while reading
+/// (a chunked answer has none), so an upstream can never make this process buffer without bound.
+pub async fn read_limited(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>, BillingError> {
+    let too_long = || BillingError::Malformed(format!("the answer is longer than {max} bytes"));
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        return Err(too_long());
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(unavailable)? {
+        if out.len() + chunk.len() > max {
+            return Err(too_long());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// A JSON answer of at most `max` bytes, or `Null` when it is not JSON (an error page); too long is an error.
+pub async fn read_json_or_null(resp: reqwest::Response, max: usize) -> Result<Value, BillingError> {
+    Ok(serde_json::from_slice(&read_limited(resp, max).await?).unwrap_or(Value::Null))
+}
+
 /// Sends a request and reads a JSON answer; a non-success status is `Refused` with the provider's message.
 pub(crate) async fn send_json(r: reqwest::RequestBuilder) -> Result<Value, BillingError> {
     let resp = r.send().await.map_err(unavailable)?;
     let status = resp.status();
-    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    let v: Value = read_json_or_null(resp, MAX_ANSWER_BYTES).await?;
     if status.is_success() {
         Ok(v)
     } else if status.is_server_error() {
@@ -393,6 +421,52 @@ pub fn parse_rfc3339(s: &str) -> Option<OffsetDateTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-request HTTP server that answers with `head` then `body` (written by hand, so the test chooses the framing).
+    async fn answer_once(head: &'static str, body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut c, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = c.read(&mut buf).await;
+            let _ = c.write_all(head.as_bytes()).await;
+            let _ = c.write_all(&body).await;
+        });
+        url
+    }
+
+    fn chunked(parts: usize, size: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..parts {
+            out.extend_from_slice(format!("{size:x}\r\n").as_bytes());
+            out.extend(std::iter::repeat_n(b'a', size));
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    #[tokio::test]
+    async fn answers_are_read_up_to_a_limit() {
+        let http = http_client();
+        // Declared too long: refused before reading.
+        let url = answer_once("HTTP/1.1 200 OK\r\ncontent-length: 5000\r\n\r\n", vec![b'a'; 5000]).await;
+        let r = http.get(&url).send().await.unwrap();
+        assert!(matches!(read_limited(r, 4096).await, Err(BillingError::Malformed(_))));
+        // No declared length (chunked): refused while reading, once past the limit.
+        let url = answer_once("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n", chunked(8, 1000)).await;
+        let r = http.get(&url).send().await.unwrap();
+        assert!(matches!(read_limited(r, 4096).await, Err(BillingError::Malformed(_))));
+        // Within the limit: read whole.
+        let url = answer_once("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n", chunked(4, 1000)).await;
+        let r = http.get(&url).send().await.unwrap();
+        assert_eq!(read_limited(r, 4096).await.unwrap().len(), 4000);
+        let url = answer_once("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n", b"{}".to_vec()).await;
+        let r = http.get(&url).send().await.unwrap();
+        assert_eq!(read_json_or_null(r, 4096).await.unwrap(), serde_json::json!({}));
+    }
 
     #[test]
     fn rfc3339_with_milliseconds() {

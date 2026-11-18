@@ -81,8 +81,9 @@ impl ChainPayments {
         self.key
             .get_or_try_init(|| async {
                 let url = format!("{}/v1/webhook-key", self.config.public_api.trim_end_matches('/'));
-                let v: Value =
-                    self.http.get(&url).send().await.map_err(unavailable)?.json().await.map_err(unavailable)?;
+                let resp = self.http.get(&url).send().await.map_err(unavailable)?;
+                let v: Value = serde_json::from_slice(&crate::read_limited(resp, crate::MAX_ANSWER_BYTES).await?)
+                    .map_err(unavailable)?;
                 v["publicKey"]
                     .as_str()
                     .and_then(|k| hex::decode(k).ok())
@@ -167,7 +168,8 @@ impl BillingProvider for ChainPayments {
             .await
             .map_err(unavailable)?;
         let status = r.status();
-        let v: Value = r.json().await.map_err(unavailable)?;
+        let v: Value =
+            serde_json::from_slice(&crate::read_limited(r, crate::MAX_ANSWER_BYTES).await?).map_err(unavailable)?;
         if !status.is_success() {
             return Err(BillingError::Refused(v["error"].as_str().unwrap_or("refused").to_string()));
         }
@@ -228,7 +230,8 @@ impl BillingProvider for ChainPayments {
         if r.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(Outcome::Expired);
         }
-        let v: Value = r.json().await.map_err(unavailable)?;
+        let v: Value =
+            serde_json::from_slice(&crate::read_limited(r, crate::MAX_ANSWER_BYTES).await?).map_err(unavailable)?;
         Ok(match v["status"].as_str() {
             Some("paid") => Outcome::Paid,
             Some("expired") | Some("cancelled") => Outcome::Expired,

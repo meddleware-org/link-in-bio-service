@@ -154,17 +154,69 @@ pub fn is_public(ip: IpAddr) -> bool {
                 return is_public(IpAddr::V4(v4));
             }
             let s = a.segments();
+            // An address that embeds an IPv4 one (NAT64, 6to4) reaches that IPv4 address: judge it by that.
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                let [a, b] = s[6].to_be_bytes();
+                let [c, d] = s[7].to_be_bytes();
+                return is_public(IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)));
+            }
+            if s[0] == 0x2002 {
+                let [a, b] = s[1].to_be_bytes();
+                let [c, d] = s[2].to_be_bytes();
+                return is_public(IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)));
+            }
             !(a.is_loopback()
                 || a.is_unspecified()
                 || a.is_multicast()
                 || (s[0] & 0xfe00) == 0xfc00
                 || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xffc0) == 0xfec0
+                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
                 || (s[0] == 0x2001 && s[1] == 0x0db8))
         }
     }
 }
 
+/// The resolver of the Open Payments client: a name that resolves to any address that is not public is refused when
+/// the connection is made, not only when [`OpenPayments::checked`] looked it up first. A buyer's wallet is a server the
+/// buyer chooses, and a name can answer differently the second time (DNS rebinding); this closes that gap. Addresses
+/// written as IP literals never reach a resolver, and `checked` refuses them (except 127.0.0.1 on a test set-up).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PublicOnly;
+
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            if addrs.is_empty() || !addrs.iter().all(|a| is_public(a.ip())) {
+                let refused = std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{host} resolves to an address that is not public"),
+                );
+                return Err(Box::new(refused) as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 impl OpenPayments {
+    /// The HTTP client for Open Payments: the shared provider client's rules (no redirects, short timeouts) and the
+    /// [`PublicOnly`] resolver.
+    pub fn http_client() -> reqwest::Client {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        reqwest::Client::builder()
+            .user_agent(concat!("link-in-bio/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .dns_resolver(PublicOnly)
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_default()
+    }
+
     pub fn new(config: Config, http: reqwest::Client) -> Result<Self, BillingError> {
         let key = keys::ed25519_from_pem(&config.private_key_pem)?;
         if config.key_id.trim().is_empty() || config.key_id.len() > 200 {
@@ -233,7 +285,8 @@ impl OpenPayments {
         if !r.status().is_success() {
             return Err(BillingError::Refused(format!("the wallet address answered HTTP {}", r.status().as_u16())));
         }
-        let w: WalletAddress = r.json().await.map_err(|_| bad("not a wallet address document"))?;
+        let body = crate::read_limited(r, crate::MAX_ANSWER_BYTES).await?;
+        let w: WalletAddress = serde_json::from_slice(&body).map_err(|_| bad("not a wallet address document"))?;
         for s in [&w.auth_server, &w.resource_server] {
             self.checked(s).await?;
         }
@@ -286,7 +339,7 @@ impl OpenPayments {
         }
         let resp = r.send().await.map_err(unavailable)?;
         let status = resp.status().as_u16();
-        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        let v: Value = crate::read_json_or_null(resp, crate::MAX_ANSWER_BYTES).await?;
         Ok((status, v))
     }
 
@@ -610,8 +663,33 @@ mod tests {
         ] {
             assert!(!is_public(a.parse().unwrap()), "{a}");
         }
-        for a in ["1.1.1.1", "2606:4700:4700::1111"] {
+        for a in ["1.1.1.1", "2606:4700:4700::1111", "64:ff9b::101:101", "2002:101:101::1"] {
             assert!(is_public(a.parse().unwrap()), "{a}");
         }
+        // Addresses that carry a private IPv4 address inside them, and the old site-local range.
+        for a in
+            ["64:ff9b::a00:1", "64:ff9b::7f00:1", "2002:a9fe:a9fe::1", "2002:c0a8:101::", "fec0::1", "64:ff9b:1::1"]
+        {
+            assert!(!is_public(a.parse().unwrap()), "{a}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_resolver_refuses_names_of_private_addresses_at_connect_time() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+        // `localhost` resolves to loopback on every system: refused by the resolver itself, whatever `checked` said.
+        let r = PublicOnly.resolve(reqwest::dns::Name::from_str("localhost").unwrap()).await;
+        assert!(r.is_err());
+        // And a client built with it never connects there.
+        let e = OpenPayments::http_client().get("http://localhost:9/").send().await.unwrap_err();
+        assert!(e.is_connect() || e.is_request(), "{e}");
+        let mut source: Option<&dyn std::error::Error> = Some(&e);
+        let mut said = false;
+        while let Some(s) = source {
+            said |= s.to_string().contains("not public");
+            source = s.source();
+        }
+        assert!(said, "the refusal is the resolver's: {e}");
     }
 }

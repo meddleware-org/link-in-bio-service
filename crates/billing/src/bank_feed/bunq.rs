@@ -133,7 +133,7 @@ impl Bunq {
         let resp = r.send().await.map_err(unavailable)?;
         let status = resp.status();
         let sig = resp.headers().get("x-bunq-server-signature").and_then(|v| v.to_str().ok()).map(String::from);
-        let bytes = resp.bytes().await.map_err(unavailable)?;
+        let bytes = crate::read_limited(resp, crate::MAX_STATEMENT_BYTES).await?;
         if status == reqwest::StatusCode::UNAUTHORIZED {
             *self.session.lock().await = None;
         }

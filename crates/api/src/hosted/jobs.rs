@@ -28,6 +28,8 @@ use super::{Shared, now};
 pub const KEEP_VERSIONS: i64 = 20;
 pub const AUDIT_KEEP: Duration = Duration::days(730);
 pub const CASES_KEEP: Duration = Duration::days(730);
+/// The longest DNS-over-HTTPS answer read (a TXT lookup is well under a kilobyte).
+const DOH_MAX_BYTES: usize = 64 * 1024;
 /// A checkout open this long is asked about.
 pub const RECONCILE_AFTER: Duration = Duration::minutes(30);
 /// And given up after this long.
@@ -230,7 +232,10 @@ pub async fn check_domains(app: &Shared, http: &reqwest::Client) {
         let Ok(mut url) = url::Url::parse("https://cloudflare-dns.com/dns-query") else { return };
         url.query_pairs_mut().append_pair("name", &name).append_pair("type", "TXT");
         let answer = match http.get(url).header("accept", "application/dns-json").send().await {
-            Ok(r) => r.json::<Value>().await.ok(),
+            Ok(r) => link_in_bio_billing::read_limited(r, DOH_MAX_BYTES)
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
             Err(_) => None,
         };
         let Some(answer) = answer else { continue };

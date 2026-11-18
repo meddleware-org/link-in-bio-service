@@ -48,6 +48,9 @@ pub struct App {
     pub access: Option<Arc<access::Admins>>,
     /// The Open Payments adapter (also in `billing`), for the steps of its checkout beyond the port.
     pub open_payments: Option<Arc<link_in_bio_billing::open_payments::OpenPayments>>,
+    /// Pictures are decoded one at a time per process, off the async workers: one decode may use up to twice
+    /// `link_in_bio_assets::MAX_DECODE_BYTES`, which the pod's memory holds once.
+    pub pictures: tokio::sync::Semaphore,
 }
 
 pub type Shared = Arc<App>;
@@ -140,7 +143,7 @@ impl App {
                         asset_scale: c.asset_scale,
                         minor_per_month: c.minor_per_month,
                     },
-                    link_in_bio_billing::http_client(),
+                    link_in_bio_billing::open_payments::OpenPayments::http_client(),
                 )
                 .map_err(|e| e.to_string())?,
             );
@@ -180,8 +183,22 @@ impl App {
             pages: pages::PageCache::new(page_cache),
             access,
             open_payments,
+            pictures: tokio::sync::Semaphore::new(1),
         })
     }
+}
+
+/// How long one request may take: the app's publish screens up to 60 links first, so its routes get the longer bound.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const SLOW_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bounds a router in time (`408` past `timeout`, waiting for a turn included) and in requests at once, across all of
+/// its routes (axum layers each route separately, so the limit is a shared one). Memory per process is then about
+/// `concurrent` × the router's body limit.
+pub fn bounded(router: axum::Router, timeout: Duration, concurrent: usize) -> axum::Router {
+    router
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(concurrent))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(axum::http::StatusCode::REQUEST_TIMEOUT, timeout))
 }
 
 /// The current time (one place, so tests can reason about it).
@@ -195,4 +212,40 @@ pub fn now() -> time::OffsetDateTime {
 /// operator's own, created by the operator), and the app requires the document to carry exactly that handle.
 pub fn account_page_options() -> link_in_bio_core::ParseOptions {
     link_in_bio_core::ParseOptions { owner: link_in_bio_core::Owner::Tenant, check_reserved: false }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use std::time::{Duration, Instant};
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    fn slow(hold: Duration) -> axum::Router {
+        axum::Router::new()
+            .route("/a", get(move || async move { tokio::time::sleep(hold).await }))
+            .route("/b", get(move || async move { tokio::time::sleep(hold).await }))
+    }
+
+    #[tokio::test]
+    async fn a_slow_request_ends_in_408() {
+        let r = super::bounded(slow(Duration::from_secs(5)), Duration::from_millis(50), 4);
+        let resp = r.oneshot(Request::get("/a").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn the_limit_is_shared_by_every_route() {
+        let r = super::bounded(slow(Duration::from_millis(200)), Duration::from_secs(5), 1);
+        let started = Instant::now();
+        let (a, b) = tokio::join!(
+            r.clone().oneshot(Request::get("/a").body(Body::empty()).unwrap()),
+            r.clone().oneshot(Request::get("/b").body(Body::empty()).unwrap()),
+        );
+        assert_eq!(a.unwrap().status(), StatusCode::OK);
+        assert_eq!(b.unwrap().status(), StatusCode::OK);
+        assert!(started.elapsed() >= Duration::from_millis(400), "two routes, one turn: they ran one after the other");
+    }
 }

@@ -213,7 +213,16 @@ async fn switches_fail_closed() {
     let admin = super::admin::router(a);
     let bare = Request::get("/api/v1/admin/overview").body(Body::empty()).unwrap();
     assert_eq!(send(&admin, bare).await.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(send(&admin, admin_call("GET", "/api/v1/admin/overview", None)).await.status, StatusCode::OK);
+    let overview = send(&admin, admin_call("GET", "/api/v1/admin/overview", None)).await;
+    assert_eq!(overview.status, StatusCode::OK);
+    // Console answers hold personal data: never cached, never sniffed (refusals included).
+    for h in
+        [&overview.headers, &send(&admin, Request::get("/api/v1/admin/me").body(Body::empty()).unwrap()).await.headers]
+    {
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+    }
     // An unknown method is configured nowhere.
     assert!(
         HostedConfig::from_env(|k| match k {
@@ -314,9 +323,10 @@ async fn invite_signup_publish_serve_suspend_report() {
     let preview = send(&app_r, call("GET", "/api/v1/page/preview", None, Some(&cookie))).await;
     assert_eq!(preview.status, StatusCode::OK);
     assert!(preview.text().contains("Alice"));
-    assert!(
-        preview.headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains(&format!("frame-ancestors {APP}"))
-    );
+    let csp = preview.headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+    assert!(csp.contains(&format!("frame-ancestors {APP}")));
+    // The draft never runs as the app's origin, even opened outside the editor's sandboxed frame.
+    assert!(csp.split(';').any(|d| d.trim() == "sandbox"), "{csp}");
     let published = send(&app_r, call("POST", "/api/v1/page/publish", None, Some(&cookie))).await;
     assert_eq!(published.status, StatusCode::OK, "{}", published.text());
     assert_eq!(published.json()["hidden"].as_array().unwrap().len(), 1, "the shortener is hidden");

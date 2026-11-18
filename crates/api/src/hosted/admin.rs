@@ -709,7 +709,7 @@ async fn bank_statement(
 }
 
 pub fn router(app: Shared) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/api/v1/admin/me", get(me))
         .route("/api/v1/admin/overview", get(overview))
         .route("/api/v1/admin/accounts", get(accounts))
@@ -740,6 +740,21 @@ pub fn router(app: Shared) -> Router {
         .layer(middleware::from_fn_with_state(app.clone(), require_admin))
         .route("/healthz", get(|| async { "ok\n" }))
         .fallback(|| async { ApiError::NoRoute.into_response() })
+        .layer(middleware::from_fn(no_store))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
-        .with_state(app)
+        .with_state(app);
+    // Eight requests at once: a 4 MiB statement each at most, within the pod's 128 MiB.
+    super::bounded(router, super::SLOW_REQUEST_TIMEOUT, 8)
+}
+
+/// Console answers hold personal data (reports' contacts, the audit log): never stored by a cache, never sniffed, never
+/// sent on as a referrer.
+async fn no_store(req: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    let mut r = next.run(req).await;
+    let h = r.headers_mut();
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    r
 }

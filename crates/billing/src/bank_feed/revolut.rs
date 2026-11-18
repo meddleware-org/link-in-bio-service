@@ -73,7 +73,7 @@ async fn token_request(http: &reqwest::Client, api_base: &str, body: String) -> 
         .await
         .map_err(unavailable)?;
     let status = resp.status();
-    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    let v: Value = crate::read_json_or_null(resp, crate::MAX_STATEMENT_BYTES).await?;
     if status.is_success() {
         Ok(v)
     } else if status.is_server_error() {
@@ -206,7 +206,7 @@ impl BankFeed for Revolut {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 *self.access.lock().await = None;
             }
-            let v: Value = resp.json().await.unwrap_or(Value::Null);
+            let v: Value = crate::read_json_or_null(resp, crate::MAX_STATEMENT_BYTES).await?;
             if !status.is_success() {
                 return Err(if status.is_server_error() || status.as_u16() == 429 {
                     BillingError::Unavailable(format!("Revolut answered HTTP {}", status.as_u16()))
