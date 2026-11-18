@@ -9,8 +9,8 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 
 use crate::{
     BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, ProviderEvent, Seller,
@@ -102,7 +102,7 @@ impl BillingProvider for GoCardless {
         &self,
         headers: &BTreeMap<String, String>,
         body: &[u8],
-        _now: DateTime<Utc>,
+        _now: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         let got = headers.get(SIGNATURE_HEADER).ok_or(BillingError::Unauthentic)?;
         if !same(got.trim().as_bytes(), signature(&self.config.webhook_secret, body).as_bytes()) {

@@ -15,8 +15,8 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 
 use crate::{
     BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, ProviderEvent, Seller,
@@ -184,7 +184,7 @@ impl BillingProvider for BankTransfer {
         &self,
         _: &BTreeMap<String, String>,
         _: &[u8],
-        _: DateTime<Utc>,
+        _: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         // Bank transfers arrive as statements the operator imports (`credits_from_camt`), never as notifications.
         Err(BillingError::Unauthentic)

@@ -348,7 +348,7 @@ fn run(cli: Cli) -> Result<(), String> {
                         draft: &draft,
                         invite_hash: None,
                     },
-                    chrono::Utc::now(),
+                    time::OffsetDateTime::now_utc(),
                 )
                 .await
                 .map_err(|e| e.to_string())?;

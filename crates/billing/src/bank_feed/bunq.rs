@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
 use super::{BankFeed, Credit, FeedBatch, FeedState, positive_minor};
@@ -223,7 +223,7 @@ impl BankFeed for Bunq {
         ID
     }
 
-    async fn fetch(&self, from: &FeedState, _now: DateTime<Utc>) -> Result<FeedBatch, BillingError> {
+    async fn fetch(&self, from: &FeedState, _now: OffsetDateTime) -> Result<FeedBatch, BillingError> {
         let mut state = if from.state.is_object() { from.state.clone() } else { json!({}) };
         let (installation, server_key) = self.installation(&mut state).await?;
         let session = self.session(&installation, &server_key).await?;

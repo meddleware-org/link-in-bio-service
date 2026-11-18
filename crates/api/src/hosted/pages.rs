@@ -109,7 +109,7 @@ async fn build(app: &Shared, host: &str) -> Result<Built, link_in_bio_store::DbE
         _ => {}
     }
     let now = super::now();
-    let entitled = p.free || p.operator || p.paid_until.is_some_and(|u| u + chrono::Duration::days(c.grace_days) > now);
+    let entitled = p.free || p.operator || p.paid_until.is_some_and(|u| u + time::Duration::days(c.grace_days) > now);
     if (!c.third_party_pages && !p.operator) || !entitled {
         return Ok(Built::Status(StatusCode::NOT_FOUND, "There is no page here."));
     }
@@ -150,7 +150,8 @@ async fn build(app: &Shared, host: &str) -> Result<Built, link_in_bio_store::DbE
             return Ok(Built::Status(StatusCode::SERVICE_UNAVAILABLE, "This page is unavailable right now."));
         }
     };
-    let site = Site::from_parts(site_config, manifest, parsed.warnings, picture, None, now.timestamp().max(0) as u64);
+    let site =
+        Site::from_parts(site_config, manifest, parsed.warnings, picture, None, now.unix_timestamp().max(0) as u64);
     Ok(Built::Page(static_mode::router(Arc::new(site))))
 }
 

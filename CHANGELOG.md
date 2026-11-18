@@ -20,6 +20,9 @@
   (`POST /api/v1/admin/refund-requests/{id}/refunded`), which takes the months back as a `refund` event, once. Every
   step is audited. `GET /api/v1/billing` events now carry `id`, `unapplied`, `refundableUntil` and `refundRequest`.
   Schema 4 (`lib.refund_requests`).
+- Dates and times through `time` instead of `chrono` (RUSTSEC-2026-0543, chrono unmaintained; FU-0134), sqlx
+  included; the deny.toml exception is gone. The JSON is unchanged: RFC 3339 in UTC with `Z`, full precision in the
+  API and audit entries, milliseconds for the banks and Open Payments; stored wallet challenges still read.
 
 ## 0.0.3 — 2026-11-17
 

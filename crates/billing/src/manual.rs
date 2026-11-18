@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use time::OffsetDateTime;
 
 use crate::{BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Method, Outcome, ProviderEvent};
 
@@ -30,7 +30,7 @@ impl BillingProvider for Manual {
         &self,
         _: &BTreeMap<String, String>,
         _: &[u8],
-        _: DateTime<Utc>,
+        _: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         Err(BillingError::Unauthentic)
     }

@@ -1,4 +1,4 @@
-//! Formatting a Unix time as an RFC 3339 UTC timestamp, without a date library.
+//! Formatting times as RFC 3339 UTC timestamps.
 
 /// `2027-11-16T00:00:00Z` for a Unix time in seconds.
 pub fn rfc3339(unix: u64) -> String {
@@ -6,6 +6,22 @@ pub fn rfc3339(unix: u64) -> String {
     let secs = unix % 86_400;
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, (secs / 60) % 60, secs % 60)
+}
+
+/// A timestamp as the JSON APIs send it: RFC 3339 in UTC with `Z` and as many fractional digits as it has (none, 3, 6
+/// or 9: `2026-11-17T09:41:07.123456Z`), the form chrono's serde wrote before the move to `time`.
+pub fn rfc3339_full(t: ::time::OffsetDateTime) -> String {
+    let t = t.to_offset(::time::UtcOffset::UTC);
+    let secs = t
+        .format(::time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]"))
+        .unwrap_or_default();
+    let fraction = match t.nanosecond() {
+        0 => String::new(),
+        n if n % 1_000_000 == 0 => format!(".{:03}", n / 1_000_000),
+        n if n % 1_000 == 0 => format!(".{:06}", n / 1_000),
+        n => format!(".{n:09}"),
+    };
+    format!("{secs}{fraction}Z")
 }
 
 /// Howard Hinnant's days-to-civil algorithm (proleptic Gregorian).
@@ -29,5 +45,15 @@ mod tests {
         assert_eq!(super::rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(super::rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(super::rfc3339(1_794_787_200), "2026-11-16T00:00:00Z");
+    }
+
+    #[test]
+    fn full_precision() {
+        use ::time::macros::datetime;
+        assert_eq!(super::rfc3339_full(datetime!(2026-11-17 09:41:07 UTC)), "2026-11-17T09:41:07Z");
+        assert_eq!(super::rfc3339_full(datetime!(2026-11-17 09:41:07.1 UTC)), "2026-11-17T09:41:07.100Z");
+        assert_eq!(super::rfc3339_full(datetime!(2026-11-17 09:41:07.12345 UTC)), "2026-11-17T09:41:07.123450Z");
+        assert_eq!(super::rfc3339_full(datetime!(2026-11-17 09:41:07.123456789 UTC)), "2026-11-17T09:41:07.123456789Z");
+        assert_eq!(super::rfc3339_full(datetime!(2026-11-17 10:41:07 +01:00)), "2026-11-17T09:41:07Z");
     }
 }

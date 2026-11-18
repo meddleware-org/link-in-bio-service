@@ -40,8 +40,8 @@ clap = { version = "=4.6.7", default-features = false, features = ["std", "deriv
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "json", "env-filter", "ansi"] }
 proptest = "=1.12.0"
-sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "chrono", "uuid"] }
-chrono = { version = "=0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "time", "uuid"] }
+time = { version = "=0.3.55", default-features = false, features = ["std", "formatting", "parsing", "macros"] }
 uuid = { version = "=1.29.0", default-features = false, features = ["std", "v4", "serde"] }
 base64 = "=0.23.1"
 ring = "=0.17.14"

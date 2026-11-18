@@ -9,8 +9,8 @@
 //! Wise's documentation (2026) says personal API tokens of UK and EEA business accounts may not read balance statements
 //! at all; such an account needs Wise's partner access. The sandbox is where this adapter was checked against.
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 
 use super::{BankFeed, FeedBatch, FeedState, rfc3339, window_start};
 use crate::keys::RsaKey;
@@ -99,8 +99,8 @@ impl BankFeed for Wise {
         ID
     }
 
-    async fn fetch(&self, from: &FeedState, now: DateTime<Utc>) -> Result<FeedBatch, BillingError> {
-        let start = window_start(from.cursor.as_deref(), now).max(now - chrono::Duration::days(MAX_INTERVAL_DAYS));
+    async fn fetch(&self, from: &FeedState, now: OffsetDateTime) -> Result<FeedBatch, BillingError> {
+        let start = window_start(from.cursor.as_deref(), now).max(now - time::Duration::days(MAX_INTERVAL_DAYS));
         let balances: Value = serde_json::from_str(
             &self.get(&self.url(&format!("/profiles/{}/balances?types=STANDARD", self.config.profile_id))).await?,
         )

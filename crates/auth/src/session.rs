@@ -3,8 +3,8 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::Duration;
 use sha2::{Digest, Sha256};
+use time::Duration;
 
 /// The cookie name. `__Host-` makes the browser refuse it unless it is `Secure`, has `Path=/` and no `Domain`: it is
 /// sent only to the app host, never to a tenant page on a sibling host.

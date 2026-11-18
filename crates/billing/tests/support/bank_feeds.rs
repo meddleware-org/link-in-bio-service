@@ -344,7 +344,7 @@ fn assertion_valid(jwt: &str) -> bool {
     claims["iss"] == REVOLUT_ISSUER
         && claims["sub"] == REVOLUT_CLIENT
         && claims["aud"] == "https://revolut.com"
-        && claims["exp"].as_i64().is_some_and(|e| e > chrono::Utc::now().timestamp())
+        && claims["exp"].as_i64().is_some_and(|e| e > time::OffsetDateTime::now_utc().unix_timestamp())
 }
 
 async fn revolut_token(State(b): State<RevolutBank>, body: Bytes) -> Response {

@@ -14,8 +14,8 @@ pub mod bunq;
 pub mod revolut;
 pub mod wise;
 
-use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
+use time::{Duration, OffsetDateTime};
 
 use crate::BillingError;
 pub use crate::bank_transfer::Credit;
@@ -40,7 +40,7 @@ pub trait BankFeed: Send + Sync {
     /// `wise`, `bunq` or `revolut`.
     fn id(&self) -> &'static str;
     /// The incoming credits since the cursor (with some overlap), and the new cursor and state.
-    async fn fetch(&self, from: &FeedState, now: DateTime<Utc>) -> Result<FeedBatch, BillingError>;
+    async fn fetch(&self, from: &FeedState, now: OffsetDateTime) -> Result<FeedBatch, BillingError>;
 }
 
 /// How far back a feed looks again on every poll (bookings can arrive late), and how far back its first poll looks.
@@ -48,18 +48,11 @@ pub const OVERLAP: Duration = Duration::days(2);
 pub const FIRST_LOOK_BACK: Duration = Duration::days(7);
 
 /// The start of the next window: the cursor (an RFC 3339 time) less the overlap, or the first look-back.
-pub fn window_start(cursor: Option<&str>, now: DateTime<Utc>) -> DateTime<Utc> {
-    cursor
-        .and_then(|c| DateTime::parse_from_rfc3339(c).ok())
-        .map(|t| t.with_timezone(&Utc) - OVERLAP)
-        .unwrap_or(now - FIRST_LOOK_BACK)
-        .min(now)
+pub fn window_start(cursor: Option<&str>, now: OffsetDateTime) -> OffsetDateTime {
+    cursor.and_then(crate::parse_rfc3339).map(|t| t - OVERLAP).unwrap_or(now - FIRST_LOOK_BACK).min(now)
 }
 
-/// An RFC 3339 time with milliseconds and `Z`, as the banks' APIs take it.
-pub fn rfc3339(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
+pub use crate::rfc3339;
 
 /// A JSON number or string amount (`3`, `3.5`, `"3.50"`) in minor units, if it is positive.
 pub fn positive_minor(v: &Value) -> Option<u64> {
@@ -78,7 +71,7 @@ mod tests {
 
     #[test]
     fn windows_and_amounts() {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         assert_eq!(window_start(None, now), now - FIRST_LOOK_BACK);
         let c = rfc3339(now - Duration::days(1));
         assert!(window_start(Some(&c), now) < now - Duration::days(2));

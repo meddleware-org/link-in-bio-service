@@ -30,9 +30,9 @@ pub mod square;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// Months one purchase may buy at most, and how far ahead an account may be paid.
@@ -155,7 +155,7 @@ pub trait BillingProvider: Send + Sync {
         &self,
         headers: &BTreeMap<String, String>,
         body: &[u8],
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError>;
     /// Asks the provider how a checkout stands (the worker's reconciliation of checkouts no notification closed).
     async fn checkout_outcome(&self, provider_ref: &str) -> Result<Outcome, BillingError>;
@@ -182,7 +182,7 @@ impl<T: BillingProvider + ?Sized> BillingProvider for std::sync::Arc<T> {
         &self,
         headers: &BTreeMap<String, String>,
         body: &[u8],
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         (**self).verify_notification(headers, body, now).await
     }
@@ -364,18 +364,47 @@ pub(crate) fn provider_message(v: &Value) -> String {
 }
 
 /// Whole months strictly ahead of now that an account is already paid for.
-pub fn months_ahead(paid_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> u32 {
+pub fn months_ahead(paid_until: Option<OffsetDateTime>, now: OffsetDateTime) -> u32 {
     let Some(p) = paid_until else { return 0 };
     if p <= now {
         return 0;
     }
-    let month_ms = 2_629_800_000i64;
-    ((p - now).num_milliseconds() / month_ms) as u32
+    let month_ms = 2_629_800_000i128;
+    ((p - now).whole_milliseconds() / month_ms) as u32
+}
+
+/// An RFC 3339 time in UTC with milliseconds and `Z` (`2026-11-17T09:41:07.123Z`), as the banks' and Open Payments'
+/// APIs take it.
+pub fn rfc3339(t: OffsetDateTime) -> String {
+    t.to_offset(time::UtcOffset::UTC)
+        .format(time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        ))
+        .unwrap_or_default()
+}
+
+/// An RFC 3339 time (any offset) as UTC, or `None`.
+pub fn parse_rfc3339(s: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|t| t.to_offset(time::UtcOffset::UTC))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc3339_with_milliseconds() {
+        use time::macros::datetime;
+        assert_eq!(rfc3339(datetime!(2026-11-17 09:41:07 UTC)), "2026-11-17T09:41:07.000Z");
+        assert_eq!(rfc3339(datetime!(2026-11-17 09:41:07.123987 UTC)), "2026-11-17T09:41:07.123Z", "truncated");
+        assert_eq!(rfc3339(datetime!(2026-11-17 10:41:07.5 +01:00)), "2026-11-17T09:41:07.500Z");
+        let t = parse_rfc3339("2026-11-17T10:41:07.123456+01:00").unwrap();
+        assert_eq!(t, datetime!(2026-11-17 09:41:07.123456 UTC));
+        assert_eq!(t.offset(), time::UtcOffset::UTC);
+        assert_eq!(parse_rfc3339("2026-11-17"), None);
+    }
 
     #[test]
     fn minimum_months_follow_the_three_percent_rule() {
@@ -414,7 +443,7 @@ mod tests {
             &self,
             _: &BTreeMap<String, String>,
             _: &[u8],
-            _: DateTime<Utc>,
+            _: OffsetDateTime,
         ) -> Result<Vec<ProviderEvent>, BillingError> {
             Err(BillingError::Unauthentic)
         }
@@ -471,9 +500,9 @@ mod tests {
 
     #[test]
     fn whole_months_ahead() {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         assert_eq!(months_ahead(None, now), 0);
-        assert_eq!(months_ahead(Some(now - chrono::Duration::days(1)), now), 0);
-        assert_eq!(months_ahead(Some(now + chrono::Duration::days(95)), now), 3);
+        assert_eq!(months_ahead(Some(now - time::Duration::days(1)), now), 0);
+        assert_eq!(months_ahead(Some(now + time::Duration::days(95)), now), 3);
     }
 }

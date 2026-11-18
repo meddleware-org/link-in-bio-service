@@ -72,7 +72,7 @@ fn app(store: Store, c: HostedConfig) -> Shared {
 }
 
 fn operator_token() -> String {
-    let now = chrono::Utc::now().timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     super::jwt::testing::sign(
         &json!({ "alg": "RS256", "kid": "k1", "typ": "JWT" }),
         &json!({ "iss": ISS, "aud": [AUD], "sub": "op-1", "email": "op@example.org", "exp": now + 600, "nbf": now - 10 }),
@@ -549,7 +549,7 @@ async fn wallet_signup_recovery_and_chain_payments_checkout() {
     // The signed webhook pays it; a second delivery changes nothing; a forged one is refused.
     let body = serde_json::to_vec(&json!({ "id": uuid::Uuid::new_v4().to_string(), "event": "session.paid",
         "data": { "sessionId": "ab".repeat(16), "units": 3, "amountPence": 900, "method": "sui-testnet:SUI", "digest": "D1", "payer": "0x1" } })).unwrap();
-    let t = chrono::Utc::now().timestamp();
+    let t = time::OffsetDateTime::now_utc().unix_timestamp();
     let mut m = format!("{t}.").into_bytes();
     m.extend_from_slice(&body);
     let sig = format!("t={t},ed25519={}", STANDARD.encode(kp.sign(&m)));
@@ -580,7 +580,7 @@ async fn wallet_signup_recovery_and_chain_payments_checkout() {
     assert_eq!(send(&internal, hook(late_sig.clone(), late.clone())).await.status, StatusCode::NO_CONTENT);
     assert_eq!(send(&internal, hook(late_sig, late)).await.status, StatusCode::NO_CONTENT);
     let credited = s.account_by_handle("carol").await.unwrap().unwrap().paid_until.unwrap();
-    let months = (credited - after).num_days();
+    let months = (credited - after).whole_days();
     assert!((88..=93).contains(&months), "three more months, once: {months} days");
     let events = s.billing_events(s.account_by_handle("carol").await.unwrap().unwrap().id).await.unwrap();
     assert_eq!(events.len(), 2);
@@ -663,12 +663,12 @@ async fn bank_transfer_paid_by_an_imported_statement() {
             draft: r#"{"schema":1,"identity":{"displayName":"Dora","handle":"dora"},"items":[]}"#,
             invite_hash: None,
         },
-        chrono::Utc::now(),
+        time::OffsetDateTime::now_utc(),
     )
     .await
     .unwrap();
     let (value, hash) = link_in_bio_auth::session::new_token();
-    s.create_session(&hash, id, chrono::Utc::now() + chrono::Duration::days(1)).await.unwrap();
+    s.create_session(&hash, id, time::OffsetDateTime::now_utc() + time::Duration::days(1)).await.unwrap();
     let cookie = format!("{}={value}", link_in_bio_auth::session::COOKIE);
 
     let b = send(&app_r, call("GET", "/api/v1/billing", None, Some(&cookie))).await.json();
@@ -743,12 +743,12 @@ async fn an_operator_account_with_a_reserved_handle_is_served() {
             draft: r#"{"schema":1,"identity":{"displayName":"meddleware","handle":"meddleware"},"items":[]}"#,
             invite_hash: None,
         },
-        chrono::Utc::now(),
+        time::OffsetDateTime::now_utc(),
     )
     .await
     .unwrap();
     let (value, hash) = link_in_bio_auth::session::new_token();
-    s.create_session(&hash, id, chrono::Utc::now() + chrono::Duration::days(1)).await.unwrap();
+    s.create_session(&hash, id, time::OffsetDateTime::now_utc() + time::Duration::days(1)).await.unwrap();
     let cookie = format!("{}={value}", link_in_bio_auth::session::COOKIE);
     let published = send(&app_r, call("POST", "/api/v1/page/publish", None, Some(&cookie))).await;
     assert_eq!(published.status, StatusCode::OK, "{}", published.text());
@@ -774,12 +774,12 @@ async fn account_with_session(s: &Store, handle: &str) -> (uuid::Uuid, String) {
             draft: &draft,
             invite_hash: None,
         },
-        chrono::Utc::now(),
+        time::OffsetDateTime::now_utc(),
     )
     .await
     .unwrap();
     let (value, hash) = link_in_bio_auth::session::new_token();
-    s.create_session(&hash, id, chrono::Utc::now() + chrono::Duration::days(1)).await.unwrap();
+    s.create_session(&hash, id, time::OffsetDateTime::now_utc() + time::Duration::days(1)).await.unwrap();
     (id, format!("{}={value}", link_in_bio_auth::session::COOKIE))
 }
 
@@ -870,7 +870,7 @@ async fn open_payments_checkout_paid_from_a_wallet() {
     assert_eq!(done.status, StatusCode::OK, "{}", done.text());
     assert_eq!(done.json()["status"], "paid");
     let until = s.account(id).await.unwrap().unwrap().paid_until.unwrap();
-    let days = (until - chrono::Utc::now()).num_days();
+    let days = (until - time::OffsetDateTime::now_utc()).whole_days();
     assert!((59..=61).contains(&days), "two months: {days} days");
     let again = send(
         &app_r,
@@ -1030,7 +1030,7 @@ async fn refund_requests_for_unapplied_payments() {
     let app_r = super::app::router(a.clone());
     let admin = super::admin::router(a.clone());
     let (id, cookie) = account_with_session(&s, "kate").await;
-    let now = chrono::Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let credit = |event: &'static str, unapplied: bool| link_in_bio_store::PeriodChange {
         account_id: id,
         provider: "chain-payments",

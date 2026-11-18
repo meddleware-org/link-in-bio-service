@@ -23,10 +23,10 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use ring::signature::Ed25519KeyPair;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::httpsig::{self, Message, Param};
@@ -38,7 +38,7 @@ use crate::{
 pub const ID: &str = "open-payments";
 pub const METHOD: &str = "open-payments:wallet";
 /// How long the operator's incoming payment for a checkout stays open.
-pub const INCOMING_PAYMENT_LIFETIME: chrono::Duration = chrono::Duration::days(2);
+pub const INCOMING_PAYMENT_LIFETIME: time::Duration = time::Duration::days(2);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -271,7 +271,7 @@ impl OpenPayments {
         let params = [
             Param::Str("alg", "ed25519".into()),
             Param::Str("keyid", self.config.key_id.clone()),
-            Param::Int("created", Utc::now().timestamp()),
+            Param::Int("created", OffsetDateTime::now_utc().unix_timestamp()),
         ];
         let msg = Message { method: method.as_str(), target_uri: &target, headers: &headers };
         let (input, sig) =
@@ -501,7 +501,7 @@ impl BillingProvider for OpenPayments {
             "incomingAmount": {
                 "value": minor.to_string(), "assetCode": self.config.asset_code, "assetScale": self.config.asset_scale,
             },
-            "expiresAt": (Utc::now() + INCOMING_PAYMENT_LIFETIME).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "expiresAt": crate::rfc3339(OffsetDateTime::now_utc() + INCOMING_PAYMENT_LIFETIME),
             "metadata": { "description": req.description, "externalRef": req.checkout_id },
         });
         let url = format!("{}/incoming-payments", op.resource_server.trim_end_matches('/'));
@@ -534,7 +534,7 @@ impl BillingProvider for OpenPayments {
         &self,
         _: &BTreeMap<String, String>,
         _: &[u8],
-        _: DateTime<Utc>,
+        _: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         // Open Payments has no notifications for a client: the incoming payment is read instead.
         Err(BillingError::Unauthentic)
@@ -572,7 +572,7 @@ impl BillingProvider for OpenPayments {
             return Ok(Outcome::Paid);
         }
         let expired =
-            v["expiresAt"].as_str().and_then(|t| DateTime::parse_from_rfc3339(t).ok()).is_some_and(|t| t < Utc::now());
+            v["expiresAt"].as_str().and_then(crate::parse_rfc3339).is_some_and(|t| t < OffsetDateTime::now_utc());
         Ok(if expired { Outcome::Expired } else { Outcome::Open })
     }
 }

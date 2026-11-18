@@ -19,7 +19,7 @@ link-in-bio-api.workspace = true
 link-in-bio-store.workspace = true
 link-in-bio-auth.workspace = true
 link-in-bio-billing.workspace = true
-chrono.workspace = true
+time.workspace = true
 uuid.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "time", "macros", "sync"] }

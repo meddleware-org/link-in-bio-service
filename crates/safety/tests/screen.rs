@@ -4,12 +4,12 @@
 use axum::Router;
 use axum::extract::Query;
 use axum::routing::get;
-use chrono::Utc;
 use link_in_bio_safety::{Screener, Verdict, WebRisk, period};
 use link_in_bio_store::Store;
 use link_in_bio_store::config::{Access, DatabaseSettings};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use time::OffsetDateTime;
 
 async fn store() -> Option<Store> {
     let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
@@ -66,7 +66,7 @@ async fn web_risk() -> String {
 #[tokio::test]
 async fn layers_cap_and_outage() {
     let Some(s) = store().await else { return };
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let mut w = WebRisk::new("test-key".into(), 3);
     w.endpoint = web_risk().await;
     let screener = Screener { web_risk: Some(w) };
@@ -88,7 +88,7 @@ async fn layers_cap_and_outage() {
     // An outage is "unknown": shown, and checked again within the hour.
     let v = screener.screen_and_record(&s, "https://down.example/", now).await.unwrap();
     assert!(matches!(v, Verdict::Unknown { .. }));
-    let due = s.screens_due(now + chrono::Duration::minutes(61), 10).await.unwrap();
+    let due = s.screens_due(now + time::Duration::minutes(61), 10).await.unwrap();
     assert!(due.iter().any(|d| d.url == "https://down.example/"));
     // Three calls spent: the cap holds and the next link is unknown, not clean.
     assert!(

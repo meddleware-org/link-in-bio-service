@@ -185,8 +185,8 @@ impl App {
 }
 
 /// The current time (one place, so tests can reason about it).
-pub fn now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now()
+pub fn now() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc()
 }
 
 /// The rules an account's page document is parsed with, by the app when it is saved and published and by the page

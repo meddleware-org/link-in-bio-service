@@ -2,10 +2,10 @@
 //! test makes its own database. Without TEST_DATABASE_URL the tests skip (CI sets REQUIRE_TEST_DATABASE=1, so there they
 //! fail instead).
 
-use chrono::{Duration, TimeZone, Utc};
 use link_in_bio_store::config::{Access, DatabaseSettings};
 use link_in_bio_store::{CreateError, Criteria, NewAccount, PeriodChange, Store, sha256};
 use serde_json::json;
+use time::{Duration, OffsetDateTime};
 
 async fn store() -> Option<Store> {
     let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
@@ -42,7 +42,7 @@ fn new<'a>(handle: &'a str, skeleton: &'a str, billing_ref: &'a str, invite: Opt
 #[tokio::test]
 async fn accounts_invites_and_handles() {
     let Some(s) = store().await else { return };
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
     assert!(!a.free && a.invited_by.is_none());
     assert!(matches!(
@@ -110,7 +110,7 @@ async fn accounts_invites_and_handles() {
 #[tokio::test]
 async fn sign_in_material_sessions_and_challenges() {
     let Some(s) = store().await else { return };
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
     s.add_passkey(a.id, &[7u8; 16], &json!({"cred": 1}), "Laptop").await.unwrap();
     assert_eq!(s.passkey_owner(&[7u8; 16]).await.unwrap().unwrap().0, a.id);
@@ -154,7 +154,7 @@ async fn sign_in_material_sessions_and_challenges() {
 #[tokio::test]
 async fn pages_versions_views_and_screening() {
     let Some(s) = store().await else { return };
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
     assert!(s.view_page("alice").await.unwrap().unwrap().published.is_none());
     for i in 0..3 {
@@ -196,7 +196,7 @@ async fn pages_versions_views_and_screening() {
 #[tokio::test]
 async fn billing_periods_are_idempotent() {
     let Some(s) = store().await else { return };
-    let now = Utc.with_ymd_and_hms(2026, 11, 16, 12, 0, 0).unwrap();
+    let now = time::macros::datetime!(2026-11-16 12:00 UTC);
     let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
     let change = |event: &'static str, kind: &'static str, months: i32| PeriodChange {
         account_id: a.id,
@@ -224,7 +224,7 @@ async fn billing_periods_are_idempotent() {
 #[tokio::test]
 async fn open_payments_grants_are_used_once() {
     let Some(s) = store().await else { return };
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
     let c = link_in_bio_store::Checkout {
         id: uuid::Uuid::new_v4(),
@@ -259,7 +259,7 @@ async fn open_payments_grants_are_used_once() {
 #[tokio::test]
 async fn bank_feed_cursors() {
     let Some(s) = store().await else { return };
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     assert!(s.bank_feed("bunq").await.unwrap().is_none());
     s.bank_feed_failed("bunq", "bunq answered HTTP 503", now).await.unwrap();
     let r = s.bank_feed("bunq").await.unwrap().unwrap();
@@ -277,7 +277,7 @@ async fn bank_feed_cursors() {
 #[tokio::test]
 async fn refund_requests_take_months_back_once() {
     let Some(s) = store().await else { return };
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
     let change = |event: &'static str, unapplied: bool| PeriodChange {
         account_id: a.id,
@@ -321,7 +321,7 @@ async fn refund_requests_take_months_back_once() {
 #[tokio::test]
 async fn selections_reports_appeals_and_housekeeping() {
     let Some(s) = store().await else { return };
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let a =
         s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now - Duration::days(40)).await.unwrap();
     let b = s.create_account(&new("bob", "bob", "ref-bob-00000000001", None), now).await.unwrap();

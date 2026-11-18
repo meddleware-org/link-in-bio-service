@@ -54,7 +54,7 @@ pub async fn apply_event(app: &Shared, provider: &str, e: &ProviderEvent) -> Api
                         &format!("provider:{provider}"),
                         "paid",
                         &c.account_id.to_string(),
-                        &json!({ "checkout": c.id, "months": c.months, "paidUntil": until }),
+                        &json!({ "checkout": c.id, "months": c.months, "paidUntil": crate::time::rfc3339_full(until) }),
                     )
                     .await?;
                 if let Some(a) = app.store.account(c.account_id).await? {
@@ -92,7 +92,7 @@ pub async fn apply_event(app: &Shared, provider: &str, e: &ProviderEvent) -> Api
                         &format!("provider:{provider}"),
                         "late-payment-credited",
                         &c.account_id.to_string(),
-                        &json!({ "checkout": c.id, "months": c.months, "paidUntil": until, "digest": e.evidence["digest"] }),
+                        &json!({ "checkout": c.id, "months": c.months, "paidUntil": crate::time::rfc3339_full(until), "digest": e.evidence["digest"] }),
                     )
                     .await?;
                 if let Some(a) = app.store.account(c.account_id).await? {

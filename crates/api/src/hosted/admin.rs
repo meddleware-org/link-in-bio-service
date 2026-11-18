@@ -8,9 +8,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router, middleware};
-use chrono::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use time::Duration;
 use uuid::Uuid;
 
 use link_in_bio_auth::recovery;
@@ -19,6 +19,7 @@ use link_in_bio_store::{Account, Criteria, PeriodChange};
 use super::access::{Operator, require_admin};
 use super::error::{ApiError, ApiResult};
 use super::{Shared, now};
+use crate::time::rfc3339_full as ts;
 
 /// Codes one request may issue.
 pub const MAX_CODES_PER_REQUEST: usize = 100;
@@ -30,9 +31,9 @@ fn actor(op: &Operator) -> String {
 fn account_row(a: &Account) -> Value {
     json!({
         "id": a.id, "handle": a.handle, "status": a.status, "suspensionKind": a.suspension_kind,
-        "suspensionReason": a.suspension_reason, "suspendedUntil": a.suspended_until, "free": a.free,
+        "suspensionReason": a.suspension_reason, "suspendedUntil": a.suspended_until.map(ts), "free": a.free,
         "operator": a.operator, "mayShareInvites": a.may_share_invites, "invitedBy": a.invited_by, "tags": a.tags,
-        "country": a.country_declared, "paidUntil": a.paid_until, "createdAt": a.created_at,
+        "country": a.country_declared, "paidUntil": a.paid_until.map(ts), "createdAt": ts(a.created_at),
     })
 }
 
@@ -53,7 +54,7 @@ async fn overview(State(app): State<Shared>) -> ApiResult<Json<Value>> {
         "checkoutsOpen": s.checkouts_open,
         // Where each bank feed left off (never its stored state, which holds the feed's own credentials).
         "bankFeeds": app.store.bank_feeds().await?.into_iter().map(|f| json!({
-            "feed": f.feed, "polledAt": f.polled_at, "lastError": f.last_error, "creditsSeen": f.credits_seen,
+            "feed": f.feed, "polledAt": f.polled_at.map(ts), "lastError": f.last_error, "creditsSeen": f.credits_seen,
         })).collect::<Vec<_>>(),
         "switches": {
             "signup": c.signup, "thirdPartyPages": c.third_party_pages, "billingProviders": c.billing_providers,
@@ -84,18 +85,18 @@ async fn account(State(app): State<Shared>, Path(id): Path<Uuid>) -> ApiResult<J
     let page = app.store.page(id).await?;
     Ok(Json(json!({
         "account": account_row(&a),
-        "page": page.map(|p| json!({ "published": p.published.is_some(), "version": p.version, "publishedAt": p.published_at,
+        "page": page.map(|p| json!({ "published": p.published.is_some(), "version": p.version, "publishedAt": p.published_at.map(ts),
                                      "document": p.published.and_then(|d| serde_json::from_str::<Value>(&d).ok()) })),
         "invitees": app.store.invitees(id).await?.iter().map(account_row).collect::<Vec<_>>(),
         "invites": app.store.invites(Some(id), 100).await?.into_iter().map(|i| json!({
-            "id": i.id, "createdAt": i.created_at, "expiresAt": i.expires_at, "redeemedBy": i.redeemed_by, "revokedAt": i.revoked_at,
+            "id": i.id, "createdAt": ts(i.created_at), "expiresAt": ts(i.expires_at), "redeemedBy": i.redeemed_by, "revokedAt": i.revoked_at.map(ts),
         })).collect::<Vec<_>>(),
         "billing": app.store.billing_events(id).await?.into_iter().map(|e| json!({
-            "provider": e.provider, "kind": e.kind, "months": e.months, "amountPence": e.amount_pence, "at": e.created_at,
+            "provider": e.provider, "kind": e.kind, "months": e.months, "amountPence": e.amount_pence, "at": ts(e.created_at),
         })).collect::<Vec<_>>(),
         "domains": app.store.domains(id).await?.into_iter().map(|d| json!({ "hostname": d.hostname, "status": d.status })).collect::<Vec<_>>(),
         "audit": app.store.audit_log(Some(&id.to_string()), 50).await?.into_iter().map(|e| json!({
-            "at": e.at, "actor": e.actor, "action": e.action, "details": e.details,
+            "at": ts(e.at), "actor": e.actor, "action": e.action, "details": e.details,
         })).collect::<Vec<_>>(),
     })))
 }
@@ -185,7 +186,7 @@ async fn suspend(
             &actor(&op),
             "suspend",
             &id.to_string(),
-            &json!({ "kind": b.kind, "reason": b.reason, "until": until, "report": b.report }),
+            &json!({ "kind": b.kind, "reason": b.reason, "until": until.map(ts), "report": b.report }),
         )
         .await?;
     forget_account(&app, id).await;
@@ -245,11 +246,11 @@ async fn grant(
             &actor(&op),
             "grant",
             &id.to_string(),
-            &json!({ "months": b.months, "reason": b.reason, "paidUntil": until }),
+            &json!({ "months": b.months, "reason": b.reason, "paidUntil": until.map(ts) }),
         )
         .await?;
     forget_account(&app, id).await;
-    Ok(Json(json!({ "paidUntil": until })))
+    Ok(Json(json!({ "paidUntil": until.map(ts) })))
 }
 
 // ── invites ──────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -307,20 +308,20 @@ async fn issue(
             &actor(&op),
             "invites-issued",
             &b.held_by.map_or("operator".into(), |h| h.to_string()),
-            &json!({ "count": b.count, "expires": expires }),
+            &json!({ "count": b.count, "expires": ts(expires) }),
         )
         .await?;
     // Codes given to an account are shown to its holder in the app; codes for the operator are shown here, once.
     let shown = if b.held_by.is_some() { Vec::new() } else { codes };
-    Ok(Json(json!({ "codes": shown, "issued": b.count, "expiresAt": expires })))
+    Ok(Json(json!({ "codes": shown, "issued": b.count, "expiresAt": ts(expires) })))
 }
 
 async fn invites(State(app): State<Shared>) -> ApiResult<Json<Value>> {
     let rows = app.store.invites(None, 500).await?;
     Ok(Json(json!({ "invites": rows.into_iter().map(|i| json!({
         "id": i.id, "heldBy": i.held_by, "selection": i.selection_id, "note": i.note, "createdBy": i.created_by,
-        "createdAt": i.created_at, "expiresAt": i.expires_at, "redeemedBy": i.redeemed_by, "redeemedAt": i.redeemed_at,
-        "revokedAt": i.revoked_at,
+        "createdAt": ts(i.created_at), "expiresAt": ts(i.expires_at), "redeemedBy": i.redeemed_by,
+        "redeemedAt": i.redeemed_at.map(ts), "revokedAt": i.revoked_at.map(ts),
     })).collect::<Vec<_>>() })))
 }
 
@@ -345,7 +346,7 @@ struct NewSelection {
 
 async fn selections(State(app): State<Shared>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "selections": app.store.selections().await?.into_iter().map(|s| json!({
-        "id": s.id, "name": s.name, "criteria": s.criteria, "createdBy": s.created_by, "createdAt": s.created_at,
+        "id": s.id, "name": s.name, "criteria": s.criteria, "createdBy": s.created_by, "createdAt": ts(s.created_at),
     })).collect::<Vec<_>>() })))
 }
 
@@ -415,7 +416,7 @@ async fn selection_issue(
         )
         .await?;
     // The holders read their codes in the app; the operator does not see them.
-    Ok(Json(json!({ "accounts": accounts.len(), "codes": issued, "expiresAt": expires })))
+    Ok(Json(json!({ "accounts": accounts.len(), "codes": issued, "expiresAt": ts(expires) })))
 }
 
 // ── reports, appeals ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -430,7 +431,7 @@ async fn reports(State(app): State<Shared>, Query(q): Query<StatusQuery>) -> Api
     let rows = app.store.reports(&st, 200).await?;
     Ok(Json(json!({ "reports": rows.into_iter().map(|r| json!({
         "id": r.id, "page": r.handle, "account": r.account_id, "url": r.url, "reason": r.reason, "details": r.details,
-        "contact": r.contact, "status": r.status, "createdAt": r.created_at, "decidedAt": r.decided_at,
+        "contact": r.contact, "status": r.status, "createdAt": ts(r.created_at), "decidedAt": r.decided_at.map(ts),
         "decidedBy": r.decided_by, "decision": r.decision, "statement": r.statement,
     })).collect::<Vec<_>>() })))
 }
@@ -486,7 +487,7 @@ async fn appeals(State(app): State<Shared>, Query(q): Query<StatusQuery>) -> Api
     let st = q.status.unwrap_or_else(|| "open".into());
     Ok(Json(json!({ "appeals": app.store.appeals(&st, 200).await?.into_iter().map(|x| json!({
         "id": x.id, "account": x.account_id, "report": x.report_id, "text": x.text, "status": x.status,
-        "createdAt": x.created_at, "decidedAt": x.decided_at, "decidedBy": x.decided_by, "statement": x.statement,
+        "createdAt": ts(x.created_at), "decidedAt": x.decided_at.map(ts), "decidedBy": x.decided_by, "statement": x.statement,
     })).collect::<Vec<_>>() })))
 }
 
@@ -529,7 +530,7 @@ async fn decide_appeal(
 
 async fn blocklist(State(app): State<Shared>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "entries": app.store.blocklist().await?.into_iter().map(|b| json!({
-        "pattern": b.pattern, "kind": b.kind, "reason": b.reason, "addedBy": b.added_by, "addedAt": b.added_at,
+        "pattern": b.pattern, "kind": b.kind, "reason": b.reason, "addedBy": b.added_by, "addedAt": ts(b.added_at),
     })).collect::<Vec<_>>() })))
 }
 
@@ -608,7 +609,7 @@ struct AuditQuery {
 
 async fn audit(State(app): State<Shared>, Query(q): Query<AuditQuery>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "entries": app.store.audit_log(q.subject.as_deref(), 200).await?.into_iter().map(|e| json!({
-        "id": e.id, "at": e.at, "actor": e.actor, "action": e.action, "subject": e.subject, "details": e.details,
+        "id": e.id, "at": ts(e.at), "actor": e.actor, "action": e.action, "subject": e.subject, "details": e.details,
     })).collect::<Vec<_>>() })))
 }
 
@@ -618,9 +619,9 @@ fn refund_row(r: &link_in_bio_store::RefundRequest) -> Value {
     let e = &r.evidence;
     json!({
         "id": r.id, "account": r.account_id, "handle": r.handle, "event": r.event_id, "provider": r.provider,
-        "months": r.months, "amountPence": r.amount_pence, "paidAt": r.paid_at, "reason": r.reason, "status": r.status,
-        "createdAt": r.created_at, "refundReference": r.refund_reference, "refundEvent": r.refund_event,
-        "decidedBy": r.decided_by, "decidedAt": r.decided_at,
+        "months": r.months, "amountPence": r.amount_pence, "paidAt": ts(r.paid_at), "reason": r.reason, "status": r.status,
+        "createdAt": ts(r.created_at), "refundReference": r.refund_reference, "refundEvent": r.refund_event,
+        "decidedBy": r.decided_by, "decidedAt": r.decided_at.map(ts),
         // What the refund must match: the same coin and amount, back to the paying address.
         "payment": { "digest": e["digest"], "payer": e["payer"], "coinType": e["coinType"], "amount": e["amount"],
                      "method": e["method"], "checkout": e["checkout"] },
@@ -673,12 +674,12 @@ async fn refunded(
             "refund-recorded",
             &done.account_id.to_string(),
             &json!({ "request": id, "event": existing.event_id, "refundEvent": done.event_id, "months": -done.months,
-                     "reference": reference, "note": note, "paidUntil": done.paid_until }),
+                     "reference": reference, "note": note, "paidUntil": ts(done.paid_until) }),
         )
         .await?;
     forget_account(&app, done.account_id).await;
     let after = app.store.refund_request(id).await?.ok_or(ApiError::NotFound)?;
-    Ok(Json(json!({ "request": refund_row(&after), "paidUntil": done.paid_until })))
+    Ok(Json(json!({ "request": refund_row(&after), "paidUntil": ts(done.paid_until) })))
 }
 
 /// An ISO 20022 statement from the receiving bank: each booked credit whose creditor reference names a bank-transfer

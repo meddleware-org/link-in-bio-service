@@ -8,8 +8,8 @@
 
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
 use super::{BankFeed, Credit, FeedBatch, FeedState, positive_minor, rfc3339, window_start};
@@ -48,11 +48,11 @@ pub fn client_assertion(
     key: &RsaKey,
     client_id: &str,
     issuer: &str,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<String, BillingError> {
     jwt_rs256(
         key,
-        &json!({ "iss": issuer, "sub": client_id, "aud": "https://revolut.com", "iat": now.timestamp(), "exp": now.timestamp() + 300 }),
+        &json!({ "iss": issuer, "sub": client_id, "aud": "https://revolut.com", "iat": now.unix_timestamp(), "exp": now.unix_timestamp() + 300 }),
     )
 }
 
@@ -94,7 +94,7 @@ pub async fn exchange_code(
     key: &RsaKey,
     code: &str,
 ) -> Result<String, BillingError> {
-    let assertion = client_assertion(key, client_id, issuer, Utc::now())?;
+    let assertion = client_assertion(key, client_id, issuer, OffsetDateTime::now_utc())?;
     let v = token_request(
         http,
         api_base,
@@ -112,12 +112,11 @@ pub async fn exchange_code(
 
 /// The credits in a transactions list: incoming legs of completed transactions whose reference (or the leg's
 /// description) holds a creditor reference. Also the earliest `created_at` seen (Revolut lists the newest first).
-pub fn credits_from_transactions(list: &Value) -> (Vec<Credit>, Option<DateTime<Utc>>) {
+pub fn credits_from_transactions(list: &Value) -> (Vec<Credit>, Option<OffsetDateTime>) {
     let mut out = Vec::new();
-    let mut earliest: Option<DateTime<Utc>> = None;
+    let mut earliest: Option<OffsetDateTime> = None;
     for t in list.as_array().map(Vec::as_slice).unwrap_or_default() {
-        let created =
-            t["created_at"].as_str().and_then(|c| DateTime::parse_from_rfc3339(c).ok()).map(|c| c.with_timezone(&Utc));
+        let created = t["created_at"].as_str().and_then(crate::parse_rfc3339);
         if let Some(c) = created {
             earliest = Some(earliest.map_or(c, |e| e.min(c)));
         }
@@ -159,7 +158,8 @@ impl Revolut {
         }
         let refresh =
             state["refreshToken"].as_str().map(String::from).unwrap_or_else(|| self.config.refresh_token.clone());
-        let assertion = client_assertion(&self.config.key, &self.config.client_id, &self.config.issuer, Utc::now())?;
+        let assertion =
+            client_assertion(&self.config.key, &self.config.client_id, &self.config.issuer, OffsetDateTime::now_utc())?;
         let v = token_request(
             &self.http,
             &self.config.api_base,
@@ -188,12 +188,12 @@ impl BankFeed for Revolut {
         ID
     }
 
-    async fn fetch(&self, from: &FeedState, now: DateTime<Utc>) -> Result<FeedBatch, BillingError> {
+    async fn fetch(&self, from: &FeedState, now: OffsetDateTime) -> Result<FeedBatch, BillingError> {
         let mut state = if from.state.is_object() { from.state.clone() } else { json!({}) };
         let token = self.access_token(&mut state).await?;
         let start = window_start(from.cursor.as_deref(), now);
         let mut credits = Vec::new();
-        let mut to: Option<DateTime<Utc>> = None;
+        let mut to: Option<OffsetDateTime> = None;
         for _ in 0..MAX_PAGES {
             let mut u = url::Url::parse(&format!("{}/transactions", self.config.api_base.trim_end_matches('/')))
                 .map_err(|_| BillingError::Malformed("REVOLUT_API_BASE".into()))?;

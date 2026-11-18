@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use chrono::{DateTime, Utc};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use tokio::sync::OnceCell;
 
 use crate::{
@@ -182,11 +182,11 @@ impl BillingProvider for ChainPayments {
         &self,
         headers: &BTreeMap<String, String>,
         body: &[u8],
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         let header = headers.get(SIGNATURE_HEADER).ok_or(BillingError::Unauthentic)?;
         let key = self.webhook_key().await?;
-        if !signature_valid(key, header, body, now.timestamp().max(0) as u64) {
+        if !signature_valid(key, header, body, now.unix_timestamp().max(0) as u64) {
             return Err(BillingError::Unauthentic);
         }
         let v: Value = serde_json::from_slice(body).map_err(|e| BillingError::Malformed(e.to_string()))?;

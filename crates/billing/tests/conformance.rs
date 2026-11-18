@@ -14,11 +14,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use chrono::Utc;
 use link_in_bio_billing::chain_payments::{self, ChainPayments, Config};
 use link_in_bio_billing::{BillingError, BillingProvider, CheckoutRequest, Outcome};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 const KEY: &str = "cpk_test_000000000000000000000000000000";
@@ -120,7 +120,7 @@ async fn chain_payments_adapter_conforms() {
     assert!(matches!(wrong_key.create_checkout(&req).await, Err(BillingError::Refused(_))));
 
     // Notifications.
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let body = serde_json::to_vec(&json!({
         "id": Uuid::new_v4().to_string(), "event": "session.paid",
         "data": {"type": "session.paid", "sessionId": start.provider_ref, "units": 3, "amountPence": 900,
@@ -128,7 +128,7 @@ async fn chain_payments_adapter_conforms() {
                  "digest": "7AkSLeZf", "payer": "0xabc", "paidUntilMs": 1}
     }))
     .unwrap();
-    let good = sign(&kp, now.timestamp(), &body);
+    let good = sign(&kp, now.unix_timestamp(), &body);
     let events = p.verify_notification(&headers(&good), &body, now).await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].outcome, Outcome::Paid);
@@ -141,13 +141,13 @@ async fn chain_payments_adapter_conforms() {
     let unauthentic = |r: Result<_, BillingError>| matches!(r, Err(BillingError::Unauthentic));
     assert!(unauthentic(p.verify_notification(&BTreeMap::new(), &body, now).await), "unsigned");
     assert!(
-        unauthentic(p.verify_notification(&headers(&sign(&other, now.timestamp(), &body)), &body, now).await),
+        unauthentic(p.verify_notification(&headers(&sign(&other, now.unix_timestamp(), &body)), &body, now).await),
         "other key"
     );
     let mut altered = body.clone();
     altered[10] ^= 1;
     assert!(unauthentic(p.verify_notification(&headers(&good), &altered, now).await), "altered");
-    let stale = sign(&kp, now.timestamp() - 3600, &body);
+    let stale = sign(&kp, now.unix_timestamp() - 3600, &body);
     assert!(unauthentic(p.verify_notification(&headers(&stale), &body, now).await), "stale");
 
     // An event the adapter does not act on is acknowledged and produces nothing.
@@ -155,7 +155,7 @@ async fn chain_payments_adapter_conforms() {
         serde_json::to_vec(&json!({"id": "x", "event": "session.expired", "data": {"sessionId": start.provider_ref}}))
             .unwrap();
     assert!(
-        p.verify_notification(&headers(&sign(&kp, now.timestamp(), &other_event)), &other_event, now)
+        p.verify_notification(&headers(&sign(&kp, now.unix_timestamp(), &other_event)), &other_event, now)
             .await
             .unwrap()
             .is_empty()
@@ -252,7 +252,7 @@ async fn square_adapter_conforms() {
     let body = serde_json::to_vec(&json!({ "type": "payment.updated", "event_id": "E1", "data": { "object": { "payment": {
         "id": "P1", "order_id": "ORD1", "status": "COMPLETED", "amount_money": { "amount": 1200, "currency": "GBP" } } } } })).unwrap();
     let sig = square::signature(&c.signature_key, &c.notification_url, &body);
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let e = p.verify_notification(&h(square::SIGNATURE_HEADER, &sig), &body, now).await.unwrap();
     assert_eq!((e[0].outcome.clone(), e[0].event_id.clone()), (Outcome::Paid, p.paid_event_id("ORD1")));
     assert!(matches!(p.verify_notification(&BTreeMap::new(), &body, now).await, Err(BillingError::Unauthentic)));
@@ -294,7 +294,7 @@ async fn gocardless_adapter_conforms() {
         { "id": "EV1", "resource_type": "billing_requests", "action": "fulfilled", "links": { "billing_request": "BRQ123" } },
         { "id": "EV2", "resource_type": "mandates", "action": "created", "links": {} }
     ] })).unwrap();
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let e = p
         .verify_notification(&h(gocardless::SIGNATURE_HEADER, &gocardless::signature("ws", &body)), &body, now)
         .await
@@ -330,12 +330,12 @@ async fn paddle_adapter_conforms() {
     let s = p.create_checkout(&request("paddle:checkout", 6)).await.unwrap();
     assert_eq!(s.provider_ref, "txn_01");
     let body = serde_json::to_vec(&json!({ "event_id": "evt_1", "event_type": "transaction.completed", "data": { "id": "txn_01", "currency_code": "EUR" } })).unwrap();
-    let now = Utc::now();
-    let ts = now.timestamp().to_string();
+    let now = OffsetDateTime::now_utc();
+    let ts = now.unix_timestamp().to_string();
     let sig = format!("ts={ts};h1={}", paddle::h1("pw", &ts, &body));
     let e = p.verify_notification(&h(paddle::SIGNATURE_HEADER, &sig), &body, now).await.unwrap();
     assert_eq!((e[0].outcome.clone(), e[0].event_id.clone()), (Outcome::Paid, p.paid_event_id("txn_01")));
-    let old = (now.timestamp() - 3600).to_string();
+    let old = (now.unix_timestamp() - 3600).to_string();
     let stale = format!("ts={old};h1={}", paddle::h1("pw", &old, &body));
     assert!(matches!(
         p.verify_notification(&h(paddle::SIGNATURE_HEADER, &stale), &body, now).await,
@@ -366,7 +366,7 @@ async fn bank_transfer_adapter_conforms() {
     assert!(s.client["qr"].as_str().unwrap().starts_with("BCD\n002\n1\nSCT\n"));
     assert_eq!(bank_transfer::expected(&s.client), Some((700, "EUR".into())));
     assert!(matches!(
-        sepa.verify_notification(&BTreeMap::new(), b"{}", Utc::now()).await,
+        sepa.verify_notification(&BTreeMap::new(), b"{}", OffsetDateTime::now_utc()).await,
         Err(BillingError::Unauthentic)
     ));
     let camt = format!(
@@ -502,7 +502,10 @@ async fn open_payments_adapter_conforms() {
     {
         assert!(p.start_payment(&s.provider_ref, buyer, finish).await.is_err(), "{buyer}");
     }
-    assert!(matches!(p.verify_notification(&BTreeMap::new(), b"{}", Utc::now()).await, Err(BillingError::Unauthentic)));
+    assert!(matches!(
+        p.verify_notification(&BTreeMap::new(), b"{}", OffsetDateTime::now_utc()).await,
+        Err(BillingError::Unauthentic)
+    ));
 }
 
 #[test]
@@ -547,7 +550,7 @@ async fn wise_feed_conforms() {
             link_in_bio_billing::http_client(),
         )
     };
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let batch = feed(true).fetch(&FeedState::default(), now).await.unwrap();
     let mut got: Vec<_> =
         batch.credits.iter().map(|c| (c.reference.clone(), c.amount_minor, c.currency.clone())).collect();
@@ -567,7 +570,7 @@ async fn wise_feed_conforms() {
     }
     // The next poll starts from the cursor, less the overlap.
     let next = FeedState { cursor: batch.cursor.clone(), state: batch.state.clone() };
-    feed(true).fetch(&next, now + chrono::Duration::hours(1)).await.unwrap();
+    feed(true).fetch(&next, now + time::Duration::hours(1)).await.unwrap();
     assert_eq!(bank.state.lock().unwrap().intervals[2].0, bank_feed::rfc3339(now - bank_feed::OVERLAP));
     // Without the SCA key the challenge cannot be met.
     assert!(matches!(feed(false).fetch(&FeedState::default(), now).await, Err(BillingError::Refused(_))));
@@ -607,7 +610,7 @@ async fn bunq_feed_conforms() {
         },
         link_in_bio_billing::http_client(),
     );
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let first = feed.fetch(&FeedState::default(), now).await.unwrap();
     assert_eq!(first.credits.len(), 1, "outgoing and unreferenced payments are left out");
     assert_eq!((first.credits[0].reference.clone(), first.credits[0].amount_minor), (rf("BQ1"), 350));
@@ -660,8 +663,10 @@ async fn bunq_reads_on_while_pages_are_full() {
         },
         link_in_bio_billing::http_client(),
     );
-    let first =
-        feed.fetch(&FeedState { cursor: Some(r#"{"7":0}"#.into()), state: json!({}) }, Utc::now()).await.unwrap();
+    let first = feed
+        .fetch(&FeedState { cursor: Some(r#"{"7":0}"#.into()), state: json!({}) }, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
     assert_eq!(first.credits.len(), 450);
     assert_eq!(first.cursor.as_deref(), Some(r#"{"7":450}"#));
 }
@@ -700,7 +705,7 @@ async fn revolut_feed_conforms() {
         )
     };
     let f = feed(&refresh);
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let b = f.fetch(&FeedState::default(), now).await.unwrap();
     let mut got: Vec<_> = b.credits.iter().map(|c| (c.reference.clone(), c.amount_minor, c.currency.clone())).collect();
     got.sort();

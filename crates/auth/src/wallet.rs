@@ -3,8 +3,9 @@
 //! the challenge and checks the signature recovers the address (ed25519, secp256k1, secp256r1 through
 //! `access-gate-gateway-core::sig`; multisig and zkLogin are refused, fail-closed).
 
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use time::macros::format_description;
+use time::{Duration, OffsetDateTime, UtcOffset};
 
 /// A challenge is answered within this time.
 pub const VALID_FOR: Duration = Duration::minutes(5);
@@ -19,8 +20,40 @@ pub struct Challenge {
     pub address: String,
     pub nonce: String,
     pub statement: String,
-    pub issued_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub issued_at: OffsetDateTime,
+    #[serde(with = "rfc3339")]
+    pub expires_at: OffsetDateTime,
+}
+
+/// The challenge's timestamps in its stored JSON: RFC 3339 in UTC with `Z` and as many fractional digits as needed
+/// (none, 3, 6 or 9, the form the earlier chrono-based code wrote); any RFC 3339 offset is read and normalised to UTC.
+mod rfc3339 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use time::format_description::well_known::Rfc3339;
+    use time::macros::format_description;
+    use time::{OffsetDateTime, UtcOffset};
+
+    pub fn format(t: OffsetDateTime) -> String {
+        let t = t.to_offset(UtcOffset::UTC);
+        let secs = t.format(format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]")).unwrap_or_default();
+        let fraction = match t.nanosecond() {
+            0 => String::new(),
+            n if n % 1_000_000 == 0 => format!(".{:03}", n / 1_000_000),
+            n if n % 1_000 == 0 => format!(".{:06}", n / 1_000),
+            n => format!(".{n:09}"),
+        };
+        format!("{secs}{fraction}Z")
+    }
+
+    pub fn serialize<S: Serializer>(t: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format(*t))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<OffsetDateTime, D::Error> {
+        let s = String::deserialize(d)?;
+        OffsetDateTime::parse(&s, &Rfc3339).map(|t| t.to_offset(UtcOffset::UTC)).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -47,7 +80,7 @@ impl Challenge {
         network: &str,
         address: &str,
         statement: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Self, WalletError> {
         let address = canonical_address(address).ok_or(WalletError::Address)?;
         Ok(Self {
@@ -64,7 +97,11 @@ impl Challenge {
 
     /// The exact text the wallet signs (CAIP-122 / EIP-4361 layout with a Sui chain id).
     pub fn message(&self) -> String {
-        let ts = |t: &DateTime<Utc>| t.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let ts = |t: &OffsetDateTime| {
+            t.to_offset(UtcOffset::UTC)
+                .format(format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z"))
+                .unwrap_or_default()
+        };
         format!(
             "{domain} wants you to sign in with your Sui account:\n{address}\n\n{statement}\n\nURI: {uri}\nVersion: 1\n\
              Chain ID: sui:{network}\nNonce: {nonce}\nIssued At: {issued}\nExpiration Time: {expires}",
@@ -80,7 +117,7 @@ impl Challenge {
     }
 
     /// Checks a wallet's signature (base64 `flag || signature || public key`, as Sui wallets return it).
-    pub fn verify(&self, signature_b64: &str, now: DateTime<Utc>) -> Result<(), WalletError> {
+    pub fn verify(&self, signature_b64: &str, now: OffsetDateTime) -> Result<(), WalletError> {
         if now >= self.expires_at {
             return Err(WalletError::Expired);
         }
@@ -117,7 +154,7 @@ mod tests {
 
     #[test]
     fn sign_in_round_trip() {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let seed = [9u8; 32];
         let (address, _) = wallet_sign(&seed, b"");
         let c = Challenge::new(
@@ -140,6 +177,47 @@ mod tests {
         let (_, wrong_text) = wallet_sign(&seed, b"something else");
         assert_eq!(c.verify(&wrong_text, now), Err(WalletError::Signature));
         assert_eq!(c.verify("not base64", now), Err(WalletError::Signature));
+    }
+
+    #[test]
+    fn stored_challenges_read_back() {
+        // As the chrono-based code stored it (chrono's serde: RFC 3339, UTC, `Z`, 0/3/6/9 fractional digits).
+        let stored = serde_json::json!({
+            "domain": "app.example.link",
+            "uri": "https://app.example.link/",
+            "network": "testnet",
+            "address": format!("0x{}2", "0".repeat(63)),
+            "nonce": "00112233445566778899aabbccddeeff",
+            "statement": "Sign in to Link in Bio.",
+            "issuedAt": "2026-11-17T09:41:07.123456Z",
+            "expiresAt": "2026-11-17T09:46:07.123456Z",
+        });
+        let c: Challenge = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(c.issued_at, time::macros::datetime!(2026-11-17 09:41:07.123456 UTC));
+        assert_eq!(c.expires_at - c.issued_at, VALID_FOR);
+        assert!(c.message().contains("\nIssued At: 2026-11-17T09:41:07Z\nExpiration Time: 2026-11-17T09:46:07Z"));
+        // Written back the same way.
+        assert_eq!(serde_json::to_value(&c).unwrap(), stored);
+        // The other fraction widths chrono wrote, and an offset (normalised to UTC).
+        for (text, nanos) in [
+            ("2026-11-17T09:41:07Z", 0),
+            ("2026-11-17T09:41:07.120Z", 120_000_000),
+            ("2026-11-17T09:41:07.123456789Z", 123_456_789),
+        ] {
+            let mut v = stored.clone();
+            v["issuedAt"] = text.into();
+            let c: Challenge = serde_json::from_value(v.clone()).unwrap();
+            assert_eq!(c.issued_at.nanosecond(), nanos);
+            assert_eq!(serde_json::to_value(&c).unwrap(), v);
+        }
+        let mut v = stored.clone();
+        v["issuedAt"] = "2026-11-17T10:41:07.123456+01:00".into();
+        let c: Challenge = serde_json::from_value(v).unwrap();
+        assert_eq!(c.issued_at.offset(), UtcOffset::UTC);
+        assert_eq!(serde_json::to_value(&c).unwrap(), stored);
+        let mut v = stored;
+        v["issuedAt"] = "yesterday".into();
+        assert!(serde_json::from_value::<Challenge>(v).is_err());
     }
 
     #[test]

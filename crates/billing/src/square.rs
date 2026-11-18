@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 
 use crate::{
     BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, ProviderEvent, Seller,
@@ -115,7 +115,7 @@ impl BillingProvider for Square {
         &self,
         headers: &BTreeMap<String, String>,
         body: &[u8],
-        _now: DateTime<Utc>,
+        _now: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         let got = headers.get(SIGNATURE_HEADER).ok_or(BillingError::Unauthentic)?;
         let want = signature(&self.config.signature_key, &self.config.notification_url, body);

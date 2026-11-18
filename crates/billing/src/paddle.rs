@@ -8,8 +8,8 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 
 use crate::{
     BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, ProviderEvent, Seller,
@@ -97,7 +97,7 @@ impl BillingProvider for Paddle {
         &self,
         headers: &BTreeMap<String, String>,
         body: &[u8],
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         let header = headers.get(SIGNATURE_HEADER).ok_or(BillingError::Unauthentic)?;
         let mut ts = None;
@@ -111,7 +111,7 @@ impl BillingProvider for Paddle {
         }
         let ts = ts.ok_or(BillingError::Unauthentic)?;
         let t: i64 = ts.parse().map_err(|_| BillingError::Unauthentic)?;
-        if (now.timestamp() - t).abs() > MAX_AGE_SECS {
+        if (now.unix_timestamp() - t).abs() > MAX_AGE_SECS {
             return Err(BillingError::Unauthentic);
         }
         let want = h1(&self.config.webhook_secret, &ts, body);

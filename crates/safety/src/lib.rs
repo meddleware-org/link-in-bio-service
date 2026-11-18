@@ -11,9 +11,9 @@
 
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Datelike, Duration, Utc};
 use link_in_bio_store::Store;
 use serde_json::Value;
+use time::{Duration, OffsetDateTime, UtcOffset};
 
 pub const RESCAN_CLEAN: Duration = Duration::hours(24);
 pub const RESCAN_UNKNOWN: Duration = Duration::hours(1);
@@ -59,7 +59,7 @@ impl Verdict {
         }
     }
 
-    pub fn next_check(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+    pub fn next_check(&self, now: OffsetDateTime) -> OffsetDateTime {
         now + match self {
             Verdict::Clean { .. } => RESCAN_CLEAN,
             Verdict::Flagged { .. } => RESCAN_FLAGGED,
@@ -158,8 +158,9 @@ impl WebRisk {
 }
 
 /// The month a Web Risk call is counted in.
-pub fn period(now: DateTime<Utc>) -> String {
-    format!("{:04}-{:02}", now.year(), now.month())
+pub fn period(now: OffsetDateTime) -> String {
+    let now = now.to_offset(UtcOffset::UTC);
+    format!("{:04}-{:02}", now.year(), now.month() as u8)
 }
 
 pub struct Screener {
@@ -168,7 +169,7 @@ pub struct Screener {
 
 impl Screener {
     /// Screens one link (layers 1–3), without recording anything.
-    pub async fn screen(&self, store: &Store, link: &str, now: DateTime<Utc>) -> Verdict {
+    pub async fn screen(&self, store: &Store, link: &str, now: OffsetDateTime) -> Verdict {
         if let Some((source, detail)) = builtin(link) {
             return Verdict::Flagged { source, detail };
         }
@@ -198,7 +199,7 @@ impl Screener {
         &self,
         store: &Store,
         link: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Verdict, link_in_bio_store::DbError> {
         let v = self.screen(store, link, now).await;
         let (source, detail) = match &v {
@@ -278,10 +279,11 @@ mod tests {
 
     #[test]
     fn verdict_schedule() {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         assert_eq!(Verdict::Unknown { reason: "x".into() }.next_check(now), now + RESCAN_UNKNOWN);
         assert_eq!(Verdict::Clean { source: "webrisk" }.next_check(now), now + RESCAN_CLEAN);
-        assert_eq!(period(chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 3, 9, 0, 0, 0).unwrap()), "2026-03");
+        assert_eq!(period(time::macros::datetime!(2026-03-09 00:00 UTC)), "2026-03");
+        assert_eq!(period(time::macros::datetime!(2026-04-01 00:30 +01:00)), "2026-03", "counted in UTC");
     }
 
     #[test]

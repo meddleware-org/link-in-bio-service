@@ -13,7 +13,7 @@ link-in-bio-store.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 url.workspace = true
-chrono.workspace = true
+time.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

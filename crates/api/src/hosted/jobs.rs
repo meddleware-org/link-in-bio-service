@@ -12,8 +12,8 @@
 
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::Duration;
 use serde_json::Value;
+use time::Duration;
 
 use link_in_bio_billing::bank_feed::{BankFeed, FeedState, bunq, revolut, wise};
 use link_in_bio_billing::keys::RsaKey;

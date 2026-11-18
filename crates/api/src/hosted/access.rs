@@ -122,7 +122,7 @@ impl Admins {
         if stale {
             self.refresh_keys(true).await?;
         }
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let attempt = {
             let keys = self.keys.read().await;
             jwt::verify(token, &keys.0, &self.cfg.issuer, &self.cfg.audience, now)

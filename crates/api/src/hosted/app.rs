@@ -12,9 +12,9 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use chrono::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use time::Duration;
 use uuid::Uuid;
 
 use link_in_bio_auth::passkey::{LoginState, Passkeys};
@@ -30,6 +30,7 @@ use super::error::{ApiError, ApiResult};
 use super::metrics::Metrics;
 use super::{Shared, SignupMode, now};
 use crate::site::Site;
+use crate::time::rfc3339_full as ts;
 
 const CHALLENGE_TTL: Duration = Duration::minutes(5);
 
@@ -75,7 +76,7 @@ async fn account(app: &Shared, headers: &HeaderMap) -> ApiResult<Account> {
 async fn start_session(app: &Shared, account: Uuid) -> ApiResult<HeaderValue> {
     let (value, hash) = session::new_token();
     app.store.create_session(&hash, account, now() + session::IDLE).await?;
-    HeaderValue::from_str(&session::set_cookie(Some(&value), session::IDLE.num_seconds()))
+    HeaderValue::from_str(&session::set_cookie(Some(&value), session::IDLE.whole_seconds()))
         .map_err(|_| ApiError::Internal)
 }
 
@@ -110,10 +111,10 @@ fn page_url(app: &Shared, handle: &str) -> String {
 fn account_json(app: &Shared, a: &Account) -> Value {
     let n = now();
     json!({
-        "id": a.id, "handle": a.handle, "status": a.status, "free": a.free, "paidUntil": a.paid_until,
+        "id": a.id, "handle": a.handle, "status": a.status, "free": a.free, "paidUntil": a.paid_until.map(ts),
         "entitled": a.entitled(n, Duration::days(app.config.grace_days)), "country": a.country_declared,
-        "createdAt": a.created_at, "pageUrl": page_url(app, &a.handle), "termsVersion": a.terms_version,
-        "suspension": (a.status == "suspended").then(|| json!({ "kind": a.suspension_kind, "until": a.suspended_until })),
+        "createdAt": ts(a.created_at), "pageUrl": page_url(app, &a.handle), "termsVersion": a.terms_version,
+        "suspension": (a.status == "suspended").then(|| json!({ "kind": a.suspension_kind, "until": a.suspended_until.map(ts) })),
     })
 }
 
@@ -509,7 +510,7 @@ async fn me(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Val
 async fn me_invites(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let a = account(&app, &headers).await?;
     let (codes, redeemed) = app.store.held_codes(a.id, now()).await?;
-    let codes: Vec<Value> = codes.into_iter().map(|(c, exp)| json!({ "code": c, "expiresAt": exp })).collect();
+    let codes: Vec<Value> = codes.into_iter().map(|(c, exp)| json!({ "code": c, "expiresAt": ts(exp) })).collect();
     Ok(Json(json!({ "codes": if a.may_share_invites { codes } else { Vec::new() }, "redeemed": redeemed })))
 }
 
@@ -683,22 +684,22 @@ async fn me_export(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<R
     let a = account(&app, &headers).await?;
     let page = app.store.page(a.id).await?;
     let body = json!({
-        "exportedAt": now(),
+        "exportedAt": ts(now()),
         "account": account_json(&app, &a),
         "page": page.map(|p| json!({
             "draft": serde_json::from_str::<Value>(&p.draft).unwrap_or(Value::Null),
             "published": p.published.and_then(|x| serde_json::from_str::<Value>(&x).ok()),
-            "version": p.version, "publishedAt": p.published_at,
+            "version": p.version, "publishedAt": p.published_at.map(ts),
         })),
-        "versions": app.store.page_versions(a.id).await?.into_iter().map(|(v, t)| json!({ "version": v, "at": t })).collect::<Vec<_>>(),
+        "versions": app.store.page_versions(a.id).await?.into_iter().map(|(v, t)| json!({ "version": v, "at": ts(t) })).collect::<Vec<_>>(),
         "passkeys": app.store.passkeys(a.id).await?.into_iter().map(|(id, _, name)| json!({ "id": hex::encode(id), "name": name })).collect::<Vec<_>>(),
         "wallets": app.store.wallets(a.id).await?,
         "domains": app.store.domains(a.id).await?.into_iter().map(|d| json!({ "hostname": d.hostname, "status": d.status })).collect::<Vec<_>>(),
         "billing": app.store.billing_events(a.id).await?.into_iter().map(|e| json!({
-            "provider": e.provider, "kind": e.kind, "months": e.months, "amountPence": e.amount_pence, "at": e.created_at,
+            "provider": e.provider, "kind": e.kind, "months": e.months, "amountPence": e.amount_pence, "at": ts(e.created_at),
         })).collect::<Vec<_>>(),
         "statements": app.store.statements_for(a.id).await?.into_iter().map(|r| json!({
-            "decision": r.decision, "statement": r.statement, "at": r.decided_at,
+            "decision": r.decision, "statement": r.statement, "at": r.decided_at.map(ts),
         })).collect::<Vec<_>>(),
         "appeals": app.store.appeals_of(a.id).await?.into_iter().map(|x| json!({ "text": x.text, "status": x.status, "statement": x.statement })).collect::<Vec<_>>(),
     });
@@ -766,8 +767,8 @@ async fn page_get(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Js
         Err(e) => return Err(e),
     };
     Ok(Json(json!({
-        "draft": draft, "published": p.published.is_some(), "version": p.version, "updatedAt": p.updated_at,
-        "publishedAt": p.published_at, "url": page_url(&app, &a.handle), "issues": warnings, "screening": screening,
+        "draft": draft, "published": p.published.is_some(), "version": p.version, "updatedAt": ts(p.updated_at),
+        "publishedAt": p.published_at.map(ts), "url": page_url(&app, &a.handle), "issues": warnings, "screening": screening,
         "changed": p.published.as_deref() != Some(p.draft.as_str()),
     })))
 }
@@ -792,7 +793,7 @@ async fn page_preview(State(app): State<Shared>, headers: HeaderMap) -> ApiResul
         None => None,
     };
     let pic = picture.clone().and_then(super::pages::picture_of);
-    let site = Site::from_parts(config, manifest, warnings, pic.clone(), None, now().timestamp().max(0) as u64);
+    let site = Site::from_parts(config, manifest, warnings, pic.clone(), None, now().unix_timestamp().max(0) as u64);
     let mut html = site.html.clone();
     if let Some(p) = &pic {
         let base = format!("https://{host}");
@@ -852,7 +853,7 @@ async fn page_unpublish(State(app): State<Shared>, headers: HeaderMap) -> ApiRes
 async fn page_versions(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let a = account(&app, &headers).await?;
     let v: Vec<Value> =
-        app.store.page_versions(a.id).await?.into_iter().map(|(v, t)| json!({ "version": v, "at": t })).collect();
+        app.store.page_versions(a.id).await?.into_iter().map(|(v, t)| json!({ "version": v, "at": ts(t) })).collect();
     Ok(Json(json!({ "versions": v })))
 }
 
@@ -939,18 +940,18 @@ async fn billing(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Jso
         .into_iter()
         .map(|e| {
             let request = requests.get(&e.id).map(|r| {
-                json!({ "id": r.id, "status": r.status, "refundReference": r.refund_reference, "at": r.created_at, "decidedAt": r.decided_at })
+                json!({ "id": r.id, "status": r.status, "refundReference": r.refund_reference, "at": ts(r.created_at), "decidedAt": r.decided_at.map(ts) })
             });
             let refundable_until = (request.is_none() && refundable(&e, n)).then(|| e.created_at + REFUND_WINDOW);
             json!({
                 "id": e.id, "provider": e.provider, "kind": e.kind, "months": e.months, "amountPence": e.amount_pence,
-                "at": e.created_at, "paidUntil": e.paid_until_after, "unapplied": e.unapplied,
-                "refundableUntil": refundable_until, "refundRequest": request,
+                "at": ts(e.created_at), "paidUntil": e.paid_until_after.map(ts), "unapplied": e.unapplied,
+                "refundableUntil": refundable_until.map(ts), "refundRequest": request,
             })
         })
         .collect();
     Ok(Json(json!({
-        "free": a.free, "paidUntil": a.paid_until, "entitled": a.entitled(n, Duration::days(app.config.grace_days)),
+        "free": a.free, "paidUntil": a.paid_until.map(ts), "entitled": a.entitled(n, Duration::days(app.config.grace_days)),
         "pricePence": offers.price_pence, "currency": "GBP", "offers": offers.offers, "notes": offers.notes, "events": events,
     })))
 }
@@ -959,7 +960,7 @@ async fn billing(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Jso
 pub const REFUND_WINDOW: Duration = Duration::days(30);
 
 /// An unapplied Chain Payments payment, credited as months, within the refund window.
-fn refundable(e: &link_in_bio_store::BillingEvent, n: chrono::DateTime<chrono::Utc>) -> bool {
+fn refundable(e: &link_in_bio_store::BillingEvent, n: time::OffsetDateTime) -> bool {
     e.unapplied
         && e.provider == link_in_bio_billing::chain_payments::ID
         && e.kind == "purchase"
@@ -1094,7 +1095,7 @@ async fn checkout_get(State(app): State<Shared>, headers: HeaderMap, Path(id): P
         c = app.store.checkout(id).await?.ok_or(ApiError::NotFound)?;
     }
     let fresh = app.store.account(a.id).await?.ok_or(ApiError::NotFound)?;
-    Ok(Json(json!({ "checkout": c.id, "status": c.status, "months": c.months, "paidUntil": fresh.paid_until })))
+    Ok(Json(json!({ "checkout": c.id, "status": c.status, "months": c.months, "paidUntil": fresh.paid_until.map(ts) })))
 }
 
 // ── Open Payments: the steps after the checkout ──────────────────────────────────────────────────────────────────
@@ -1237,7 +1238,7 @@ async fn domains(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Jso
         .into_iter()
         .map(|d| {
             json!({
-                "hostname": d.hostname, "status": d.status, "verifiedAt": d.verified_at,
+                "hostname": d.hostname, "status": d.status, "verifiedAt": d.verified_at.map(ts),
                 "record": { "name": format!("{DOMAIN_TXT_LABEL}.{}", d.hostname), "type": "TXT", "value": d.token },
             })
         })
@@ -1358,14 +1359,14 @@ async fn statements(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<
         .statements_for(a.id)
         .await?
         .into_iter()
-        .map(|r| json!({ "report": r.id, "reason": r.reason, "decision": r.decision, "statement": r.statement, "decidedAt": r.decided_at }))
+        .map(|r| json!({ "report": r.id, "reason": r.reason, "decision": r.decision, "statement": r.statement, "decidedAt": r.decided_at.map(ts) }))
         .collect();
     let appeals: Vec<Value> = app
         .store
         .appeals_of(a.id)
         .await?
         .into_iter()
-        .map(|x| json!({ "appeal": x.id, "report": x.report_id, "status": x.status, "statement": x.statement, "at": x.created_at }))
+        .map(|x| json!({ "appeal": x.id, "report": x.report_id, "status": x.status, "statement": x.statement, "at": ts(x.created_at) }))
         .collect();
     Ok(Json(json!({ "statements": s, "appeals": appeals })))
 }

@@ -8,11 +8,11 @@ pub mod config;
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Row, Transaction};
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 pub use sqlx::Error as DbError;
@@ -39,7 +39,7 @@ pub struct Account {
     pub status: String,
     pub suspension_kind: Option<String>,
     pub suspension_reason: Option<String>,
-    pub suspended_until: Option<DateTime<Utc>>,
+    pub suspended_until: Option<OffsetDateTime>,
     pub free: bool,
     pub operator: bool,
     pub may_share_invites: bool,
@@ -48,13 +48,13 @@ pub struct Account {
     pub terms_version: String,
     pub country_declared: Option<String>,
     pub billing_ref: String,
-    pub paid_until: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
+    pub paid_until: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
 }
 
 impl Account {
     /// Whether the account may have a page online now (free, operator, or paid up within the grace period).
-    pub fn entitled(&self, now: DateTime<Utc>, grace: Duration) -> bool {
+    pub fn entitled(&self, now: OffsetDateTime, grace: Duration) -> bool {
         self.free || self.operator || self.paid_until.is_some_and(|p| p + grace > now)
     }
 }
@@ -97,8 +97,8 @@ pub struct PageRow {
     pub draft: String,
     pub published: Option<String>,
     pub version: i32,
-    pub updated_at: DateTime<Utc>,
-    pub published_at: Option<DateTime<Utc>>,
+    pub updated_at: OffsetDateTime,
+    pub published_at: Option<OffsetDateTime>,
 }
 
 /// What the page process reads about a handle (`public.page_v1`).
@@ -107,12 +107,12 @@ pub struct PublicPage {
     pub handle: String,
     pub status: String,
     pub suspension_kind: Option<String>,
-    pub suspended_until: Option<DateTime<Utc>>,
+    pub suspended_until: Option<OffsetDateTime>,
     pub free: bool,
     pub operator: bool,
-    pub paid_until: Option<DateTime<Utc>>,
+    pub paid_until: Option<OffsetDateTime>,
     pub published: Option<String>,
-    pub published_at: Option<DateTime<Utc>>,
+    pub published_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -132,11 +132,11 @@ pub struct Invite {
     pub selection_id: Option<Uuid>,
     pub note: Option<String>,
     pub created_by: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
     pub redeemed_by: Option<Uuid>,
-    pub redeemed_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub redeemed_at: Option<OffsetDateTime>,
+    pub revoked_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -145,7 +145,7 @@ pub struct Selection {
     pub name: String,
     pub criteria: Value,
     pub created_by: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
 }
 
 /// The criteria a saved selection matches accounts by (every given criterion must hold).
@@ -176,8 +176,8 @@ pub struct Checkout {
     pub status: String,
     pub country_declared: Option<String>,
     pub country_request: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: OffsetDateTime,
+    pub completed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -188,8 +188,8 @@ pub struct BillingEvent {
     pub kind: String,
     pub months: i32,
     pub amount_pence: i64,
-    pub paid_until_after: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
+    pub paid_until_after: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
     /// A payment that arrived after its checkout was paid or closed (credited as months; refundable on request).
     pub unapplied: bool,
 }
@@ -204,7 +204,7 @@ pub struct BillingEventDetail {
     pub months: i32,
     pub amount_pence: i64,
     pub evidence: Value,
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
 }
 
 /// An account holder's request to refund an unapplied payment, with what the operator needs to send it.
@@ -219,13 +219,13 @@ pub struct RefundRequest {
     pub refund_reference: Option<String>,
     pub refund_event: Option<Uuid>,
     pub decided_by: Option<String>,
-    pub decided_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
+    pub decided_at: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
     pub provider: String,
     pub months: i32,
     pub amount_pence: i64,
     pub evidence: Value,
-    pub paid_at: DateTime<Utc>,
+    pub paid_at: OffsetDateTime,
 }
 
 /// A recorded refund: whose period changed, to when, and the refund's own billing event.
@@ -234,7 +234,7 @@ pub struct RefundDone {
     pub account_id: Uuid,
     pub event_id: Uuid,
     pub months: i32,
-    pub paid_until: DateTime<Utc>,
+    pub paid_until: OffsetDateTime,
 }
 
 /// One change to an account's paid period.
@@ -258,7 +258,7 @@ pub struct BankFeedRow {
     pub feed: String,
     pub cursor: Option<String>,
     pub state: Value,
-    pub polled_at: Option<DateTime<Utc>>,
+    pub polled_at: Option<OffsetDateTime>,
     pub last_error: Option<String>,
     pub credits_seen: i64,
 }
@@ -270,8 +270,8 @@ pub struct Domain {
     pub method: String,
     pub token: String,
     pub status: String,
-    pub checked_at: Option<DateTime<Utc>>,
-    pub verified_at: Option<DateTime<Utc>>,
+    pub checked_at: Option<OffsetDateTime>,
+    pub verified_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -284,8 +284,8 @@ pub struct Report {
     pub details: String,
     pub contact: Option<String>,
     pub status: String,
-    pub created_at: DateTime<Utc>,
-    pub decided_at: Option<DateTime<Utc>>,
+    pub created_at: OffsetDateTime,
+    pub decided_at: Option<OffsetDateTime>,
     pub decided_by: Option<String>,
     pub decision: Option<String>,
     pub statement: Option<String>,
@@ -298,8 +298,8 @@ pub struct Appeal {
     pub report_id: Option<Uuid>,
     pub text: String,
     pub status: String,
-    pub created_at: DateTime<Utc>,
-    pub decided_at: Option<DateTime<Utc>>,
+    pub created_at: OffsetDateTime,
+    pub decided_at: Option<OffsetDateTime>,
     pub decided_by: Option<String>,
     pub statement: Option<String>,
 }
@@ -307,7 +307,7 @@ pub struct Appeal {
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct AuditEntry {
     pub id: i64,
-    pub at: DateTime<Utc>,
+    pub at: OffsetDateTime,
     pub actor: String,
     pub action: String,
     pub subject: String,
@@ -321,8 +321,8 @@ pub struct Screen {
     pub verdict: String,
     pub source: String,
     pub detail: String,
-    pub checked_at: DateTime<Utc>,
-    pub next_check_at: DateTime<Utc>,
+    pub checked_at: OffsetDateTime,
+    pub next_check_at: OffsetDateTime,
     pub overridden_by: Option<String>,
 }
 
@@ -332,7 +332,7 @@ pub struct BlockEntry {
     pub kind: String,
     pub reason: String,
     pub added_by: String,
-    pub added_at: DateTime<Utc>,
+    pub added_at: OffsetDateTime,
 }
 
 /// Figures for `/metrics` and the admin overview.
@@ -376,7 +376,7 @@ impl Store {
     // ── accounts ───────────────────────────────────────────────────────────
 
     /// Creates an account and its (unpublished) page; redeems the invite in the same transaction when one is given.
-    pub async fn create_account(&self, n: &NewAccount<'_>, now: DateTime<Utc>) -> Result<Account, CreateError> {
+    pub async fn create_account(&self, n: &NewAccount<'_>, now: OffsetDateTime) -> Result<Account, CreateError> {
         let mut tx = self.pool.begin().await?;
         let id = n.id;
         let mut invited_by = None;
@@ -493,7 +493,7 @@ impl Store {
         id: Uuid,
         kind: &str,
         reason: &str,
-        until: Option<DateTime<Utc>>,
+        until: Option<OffsetDateTime>,
     ) -> Result<bool, DbError> {
         let mut tx = self.pool.begin().await?;
         let r = sqlx::query(
@@ -525,7 +525,7 @@ impl Store {
     }
 
     /// Lifts suspensions whose end has passed; returns the accounts reinstated.
-    pub async fn lift_expired_suspensions(&self, now: DateTime<Utc>) -> Result<Vec<Uuid>, DbError> {
+    pub async fn lift_expired_suspensions(&self, now: OffsetDateTime) -> Result<Vec<Uuid>, DbError> {
         sqlx::query_scalar(
             "UPDATE lib.accounts SET status = 'active', suspension_kind = NULL, suspension_reason = NULL,
                     suspended_until = NULL
@@ -539,7 +539,7 @@ impl Store {
 
     /// Erases an account at its holder's request: sign-in methods, sessions, pictures, domains and the page go; the
     /// row stays as `deleted` (the handle is not reissued) with the billing records the law requires to be kept.
-    pub async fn delete_account(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool, DbError> {
+    pub async fn delete_account(&self, id: Uuid, now: OffsetDateTime) -> Result<bool, DbError> {
         let mut tx = self.pool.begin().await?;
         for q in [
             "DELETE FROM lib.sessions WHERE account_id = $1",
@@ -620,7 +620,7 @@ impl Store {
         &self,
         credential_id: &[u8],
         passkey: &Value,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<(), DbError> {
         sqlx::query("UPDATE lib.passkeys SET passkey = $2, last_used_at = $3 WHERE credential_id = $1")
             .bind(credential_id)
@@ -705,7 +705,7 @@ impl Store {
         &self,
         handle: &str,
         hash: &[u8],
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Option<Uuid>, DbError> {
         sqlx::query_scalar(
             "UPDATE lib.recovery_codes r SET used_at = $3
@@ -734,7 +734,7 @@ impl Store {
         &self,
         token_hash: &[u8],
         account: Uuid,
-        expires_at: DateTime<Utc>,
+        expires_at: OffsetDateTime,
     ) -> Result<(), DbError> {
         sqlx::query("INSERT INTO lib.sessions (token_hash, account_id, expires_at) VALUES ($1, $2, $3)")
             .bind(token_hash)
@@ -750,7 +750,7 @@ impl Store {
     pub async fn session_account(
         &self,
         token_hash: &[u8],
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         idle: Duration,
         absolute: Duration,
     ) -> Result<Option<Uuid>, DbError> {
@@ -791,7 +791,7 @@ impl Store {
         kind: &str,
         account: Option<Uuid>,
         state: &Value,
-        expires_at: DateTime<Utc>,
+        expires_at: OffsetDateTime,
     ) -> Result<(), DbError> {
         sqlx::query("INSERT INTO lib.challenges (id, kind, account_id, state, expires_at) VALUES ($1, $2, $3, $4, $5)")
             .bind(id)
@@ -809,7 +809,7 @@ impl Store {
         &self,
         id: &str,
         kind: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Option<(Option<Uuid>, Value)>, DbError> {
         let r = sqlx::query(
             "DELETE FROM lib.challenges WHERE id = $1 AND kind = $2 AND expires_at > $3 RETURNING account_id, state",
@@ -833,7 +833,7 @@ impl Store {
         .await
     }
 
-    pub async fn save_draft(&self, account: Uuid, manifest: &str, now: DateTime<Utc>) -> Result<(), DbError> {
+    pub async fn save_draft(&self, account: Uuid, manifest: &str, now: OffsetDateTime) -> Result<(), DbError> {
         sqlx::query("UPDATE lib.pages SET draft = $2, updated_at = $3 WHERE account_id = $1")
             .bind(account)
             .bind(manifest)
@@ -844,7 +844,7 @@ impl Store {
     }
 
     /// Publishes a checked manifest as the next version (the draft becomes the same document). Returns the version.
-    pub async fn publish(&self, account: Uuid, manifest: &str, now: DateTime<Utc>) -> Result<i32, DbError> {
+    pub async fn publish(&self, account: Uuid, manifest: &str, now: OffsetDateTime) -> Result<i32, DbError> {
         let mut tx = self.pool.begin().await?;
         let version: i32 = sqlx::query_scalar(
             "UPDATE lib.pages SET draft = $2, published = $2, version = version + 1, updated_at = $3, published_at = $3
@@ -876,7 +876,7 @@ impl Store {
             .map(|_| ())
     }
 
-    pub async fn page_versions(&self, account: Uuid) -> Result<Vec<(i32, DateTime<Utc>)>, DbError> {
+    pub async fn page_versions(&self, account: Uuid) -> Result<Vec<(i32, OffsetDateTime)>, DbError> {
         let rows = sqlx::query(
             "SELECT version, created_at FROM lib.page_versions WHERE account_id = $1 ORDER BY version DESC",
         )
@@ -1007,7 +1007,7 @@ impl Store {
         selection: Option<Uuid>,
         note: Option<&str>,
         created_by: &str,
-        expires_at: DateTime<Utc>,
+        expires_at: OffsetDateTime,
     ) -> Result<Vec<Uuid>, DbError> {
         let mut tx = self.pool.begin().await?;
         let mut ids = Vec::with_capacity(codes.len());
@@ -1037,8 +1037,8 @@ impl Store {
     pub async fn held_codes(
         &self,
         account: Uuid,
-        now: DateTime<Utc>,
-    ) -> Result<(Vec<(String, DateTime<Utc>)>, i64), DbError> {
+        now: OffsetDateTime,
+    ) -> Result<(Vec<(String, OffsetDateTime)>, i64), DbError> {
         let rows = sqlx::query(
             "SELECT code, expires_at FROM lib.invites
               WHERE held_by = $1 AND code IS NOT NULL AND redeemed_by IS NULL AND revoked_at IS NULL AND expires_at > $2
@@ -1072,7 +1072,7 @@ impl Store {
         .await
     }
 
-    pub async fn revoke_invite(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool, DbError> {
+    pub async fn revoke_invite(&self, id: Uuid, now: OffsetDateTime) -> Result<bool, DbError> {
         let r = sqlx::query(
             "UPDATE lib.invites SET revoked_at = $2, code = NULL WHERE id = $1 AND redeemed_by IS NULL AND revoked_at IS NULL",
         )
@@ -1114,7 +1114,7 @@ impl Store {
     }
 
     /// The active accounts a selection's criteria match now.
-    pub async fn match_selection(&self, c: &Criteria, now: DateTime<Utc>) -> Result<Vec<Account>, DbError> {
+    pub async fn match_selection(&self, c: &Criteria, now: OffsetDateTime) -> Result<Vec<Account>, DbError> {
         sqlx::query_as(concat!(
             "SELECT ",
             account_columns!(),
@@ -1181,7 +1181,7 @@ impl Store {
     }
 
     /// Open checkouts created before `before` (the worker asks their providers how they ended).
-    pub async fn stale_checkouts(&self, before: DateTime<Utc>, limit: i64) -> Result<Vec<Checkout>, DbError> {
+    pub async fn stale_checkouts(&self, before: OffsetDateTime, limit: i64) -> Result<Vec<Checkout>, DbError> {
         sqlx::query_as(
             "SELECT id, account_id, provider, provider_ref, method, months, amount_pence, status, country_declared,
                     country_request, created_at, completed_at
@@ -1193,7 +1193,7 @@ impl Store {
         .await
     }
 
-    pub async fn close_checkout(&self, id: Uuid, status: &str, now: DateTime<Utc>) -> Result<bool, DbError> {
+    pub async fn close_checkout(&self, id: Uuid, status: &str, now: OffsetDateTime) -> Result<bool, DbError> {
         let r =
             sqlx::query("UPDATE lib.checkouts SET status = $2, completed_at = $3 WHERE id = $1 AND status = 'open'")
                 .bind(id)
@@ -1210,8 +1210,8 @@ impl Store {
     pub async fn change_period(
         &self,
         c: &PeriodChange<'_>,
-        now: DateTime<Utc>,
-    ) -> Result<Option<DateTime<Utc>>, DbError> {
+        now: OffsetDateTime,
+    ) -> Result<Option<OffsetDateTime>, DbError> {
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
         let applied = Self::change_period_in(&mut tx, c, now).await?;
         tx.commit().await?;
@@ -1223,8 +1223,8 @@ impl Store {
     async fn change_period_in(
         tx: &mut Transaction<'_, Postgres>,
         c: &PeriodChange<'_>,
-        now: DateTime<Utc>,
-    ) -> Result<Option<(Uuid, DateTime<Utc>)>, DbError> {
+        now: OffsetDateTime,
+    ) -> Result<Option<(Uuid, OffsetDateTime)>, DbError> {
         let id = Uuid::new_v4();
         let inserted = sqlx::query(
             "INSERT INTO lib.billing_events (id, account_id, provider, provider_event, kind, months, amount_pence, evidence)
@@ -1246,7 +1246,7 @@ impl Store {
             return Ok(None);
         }
         let span = MONTH * c.months;
-        let until: DateTime<Utc> = sqlx::query_scalar(
+        let until: OffsetDateTime = sqlx::query_scalar(
             "UPDATE lib.accounts SET paid_until = CASE
                     WHEN $2 >= interval '0' THEN greatest(coalesce(paid_until, $3), $3) + $2
                     ELSE greatest(coalesce(paid_until, $3) + $2, $3) END
@@ -1360,7 +1360,7 @@ impl Store {
         reference: &str,
         by: &str,
         note: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Option<RefundDone>, DbError> {
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
         let row = sqlx::query(
@@ -1453,7 +1453,7 @@ impl Store {
         &self,
         checkout: Uuid,
         outgoing_payment: Option<&str>,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE lib.open_payments_grants
@@ -1495,7 +1495,7 @@ impl Store {
         cursor: Option<&str>,
         state: &Value,
         credits: i64,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO lib.bank_feeds (feed, cursor, state, polled_at, last_error, credits_seen)
@@ -1515,7 +1515,7 @@ impl Store {
     }
 
     /// A failed poll: the cursor and state stay as they were.
-    pub async fn bank_feed_failed(&self, feed: &str, error: &str, now: DateTime<Utc>) -> Result<(), DbError> {
+    pub async fn bank_feed_failed(&self, feed: &str, error: &str, now: OffsetDateTime) -> Result<(), DbError> {
         let error: String = error.chars().take(500).collect();
         sqlx::query(
             "INSERT INTO lib.bank_feeds (feed, polled_at, last_error) VALUES ($1, $2, $3)
@@ -1561,7 +1561,7 @@ impl Store {
     }
 
     /// Domains to (re)check: pending ones, and verified ones last checked before `before`.
-    pub async fn domains_due(&self, before: DateTime<Utc>, limit: i64) -> Result<Vec<Domain>, DbError> {
+    pub async fn domains_due(&self, before: OffsetDateTime, limit: i64) -> Result<Vec<Domain>, DbError> {
         sqlx::query_as(
             "SELECT hostname, account_id, method, token, status, checked_at, verified_at FROM lib.domains
               WHERE status = 'pending' OR checked_at IS NULL OR checked_at < $1 ORDER BY checked_at NULLS FIRST LIMIT $2",
@@ -1572,7 +1572,7 @@ impl Store {
         .await
     }
 
-    pub async fn set_domain_status(&self, hostname: &str, status: &str, now: DateTime<Utc>) -> Result<(), DbError> {
+    pub async fn set_domain_status(&self, hostname: &str, status: &str, now: OffsetDateTime) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE lib.domains SET status = $2, checked_at = $3,
                     verified_at = CASE WHEN $2 = 'verified' THEN coalesce(verified_at, $3) ELSE NULL END
@@ -1606,7 +1606,7 @@ impl Store {
         reason: &str,
         details: &str,
         contact: Option<&str>,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Uuid, DbError> {
         let id = Uuid::new_v4();
         sqlx::query(
@@ -1655,7 +1655,7 @@ impl Store {
         by: &str,
         decision: &str,
         statement: Option<&str>,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<bool, DbError> {
         let r = sqlx::query(
             "UPDATE lib.reports SET status = $2, decided_by = $3, decision = $4, statement = $5, decided_at = $6
@@ -1723,7 +1723,7 @@ impl Store {
         status: &str,
         by: &str,
         statement: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Option<Uuid>, DbError> {
         sqlx::query_scalar(
             "UPDATE lib.appeals SET status = $2, decided_by = $3, statement = $4, decided_at = $5
@@ -1779,8 +1779,8 @@ impl Store {
         verdict: &str,
         source: &str,
         detail: &str,
-        next_check_at: DateTime<Utc>,
-        now: DateTime<Utc>,
+        next_check_at: OffsetDateTime,
+        now: OffsetDateTime,
     ) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO lib.link_screens (url_hash, url, verdict, source, detail, checked_at, next_check_at)
@@ -1808,7 +1808,7 @@ impl Store {
         url: &str,
         verdict: Option<&str>,
         by: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<(), DbError> {
         let h = sha256(url.as_bytes());
         match verdict {
@@ -1838,7 +1838,7 @@ impl Store {
         }
     }
 
-    pub async fn screens_due(&self, now: DateTime<Utc>, limit: i64) -> Result<Vec<Screen>, DbError> {
+    pub async fn screens_due(&self, now: OffsetDateTime, limit: i64) -> Result<Vec<Screen>, DbError> {
         sqlx::query_as(
             "SELECT url_hash, url, verdict, source, detail, checked_at, next_check_at, overridden_by
                FROM lib.link_screens WHERE next_check_at <= $1 AND overridden_by IS NULL ORDER BY next_check_at LIMIT $2",
@@ -1957,7 +1957,7 @@ impl Store {
 
     /// Deletes expired sessions, challenges, invites (90 days after expiry), audit entries older than `audit_keep`,
     /// and decided reports and appeals older than `cases_keep`. Returns the rows removed.
-    pub async fn prune(&self, now: DateTime<Utc>, audit_keep: Duration, cases_keep: Duration) -> Result<u64, DbError> {
+    pub async fn prune(&self, now: OffsetDateTime, audit_keep: Duration, cases_keep: Duration) -> Result<u64, DbError> {
         let mut n = 0;
         n += sqlx::query("DELETE FROM lib.sessions WHERE expires_at <= $1")
             .bind(now)
@@ -1992,7 +1992,7 @@ impl Store {
         Ok(n)
     }
 
-    pub async fn stats(&self, now: DateTime<Utc>) -> Result<Stats, DbError> {
+    pub async fn stats(&self, now: OffsetDateTime) -> Result<Stats, DbError> {
         let r = sqlx::query(
             "SELECT
                (SELECT count(*) FROM lib.accounts WHERE status = 'active') AS active,
@@ -2043,7 +2043,7 @@ async fn insert_account(
     n: &NewAccount<'_>,
     free: bool,
     invited_by: Option<Uuid>,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<(), CreateError> {
     let r = sqlx::query(
         "INSERT INTO lib.accounts (id, handle, handle_skeleton, free, operator, invited_by, age_confirmed_at,
