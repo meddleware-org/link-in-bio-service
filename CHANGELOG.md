@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.5 — 2026-11-18
 
 Security audit first pass (`docs/audit/link-in-bio-service-audit.md`):
 
