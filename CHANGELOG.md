@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.0.6 — 2026-11-18
 
 - Unpublishing a page is in the audit log (`unpublish`, like `publish`) and sets the page's `updated_at`, so the
   console shows who took a page offline and when (FU-0150).
+- `page/` tooling: frontend-config 0.0.14 with stylelint 18 and stylelint-config-standard 41; Playwright stays on 1.64.1
+  (1.65 bundles a Firefox that crashes after axe scans); typescript-eslint 8.73 (`minimatch` 11, GHSA-g3hv-75wg-m249).
 
 ## 0.0.5 — 2026-11-18
 
