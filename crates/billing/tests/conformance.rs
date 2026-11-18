@@ -184,7 +184,7 @@ fn a_configured_key_must_be_well_formed() {
 
 // ── The fiat adapters, each against a stand-in for its provider's API ───────────────────────────────────────────────
 
-use link_in_bio_billing::{bank_transfer, gocardless, paddle, square};
+use link_in_bio_billing::{Paid, Refunded, bank_transfer, gocardless, months_refunded, paddle, paid_covers, square};
 
 /// Serves fixed JSON answers by path (the stand-in records nothing; the adapters' requests are checked by shape).
 async fn stand_in(routes: Vec<(&'static str, Value)>) -> String {
@@ -229,7 +229,7 @@ async fn square_adapter_conforms() {
             "/v2/online-checkout/payment-links",
             json!({ "payment_link": { "id": "PL1", "url": "https://square.link/u/abc", "order_id": "ORD1" } }),
         ),
-        ("/v2/orders/{id}", json!({ "order": { "id": "ORD1", "state": "COMPLETED" } })),
+        ("/v2/orders/{id}", json!({ "order": { "id": "ORD1", "state": "COMPLETED", "total_money": { "amount": 1200, "currency": "GBP" } } })),
     ])
     .await;
     let c = square::Config {
@@ -269,6 +269,42 @@ async fn square_adapter_conforms() {
     ));
     assert_eq!(p.checkout_outcome("ORD1").await.unwrap(), Outcome::Paid);
     assert!(p.checkout_outcome("../x").await.is_err());
+
+    // What was paid is read from the notification and, for reconciliation, from the order; it must cover the checkout.
+    let gbp = |minor| Some(Paid::Amount { minor, currency: "GBP".into() });
+    assert_eq!(e[0].paid, gbp(1200));
+    assert!(paid_covers(square::ID, e[0].paid.as_ref(), 4, 1200, None));
+    assert_eq!(p.paid_facts("ORD1").await.unwrap(), gbp(1200));
+    let short = serde_json::to_vec(&json!({ "type": "payment.updated", "event_id": "E9", "data": { "object": { "payment": {
+        "id": "P9", "order_id": "ORD1", "status": "COMPLETED", "amount_money": { "amount": 300, "currency": "GBP" } } } } })).unwrap();
+    let sig = square::signature(&c.signature_key, &c.notification_url, &short);
+    let e = p.verify_notification(&h(square::SIGNATURE_HEADER, &sig), &short, now).await.unwrap();
+    assert_eq!(e[0].paid, gbp(300));
+    assert!(!paid_covers(square::ID, e[0].paid.as_ref(), 4, 1200, None), "a short payment does not cover the checkout");
+
+    // Refunds carry their amount (in the payment's GBP); months come back pro rata on the running total.
+    let refund = |id: &str, amount: u64| {
+        serde_json::to_vec(&json!({ "type": "refund.updated", "event_id": format!("E-{id}"), "data": { "object": { "refund": {
+            "id": id, "order_id": "ORD1", "status": "COMPLETED", "amount_money": { "amount": amount, "currency": "GBP" } } } } }))
+        .unwrap()
+    };
+    let read = |b: Vec<u8>| {
+        let sig = square::signature(&c.signature_key, &c.notification_url, &b);
+        let p = &p;
+        async move { p.verify_notification(&h(square::SIGNATURE_HEADER, &sig), &b, now).await.unwrap().remove(0) }
+    };
+    let partial = read(refund("R1", 300)).await;
+    assert_eq!((partial.outcome.clone(), partial.event_id.clone()), (Outcome::Refunded, "refund:R1".to_string()));
+    assert_eq!(partial.refunded, Some(Refunded { minor: 300, of_minor: None }));
+    assert_eq!(months_refunded(4, 1200, 300), 1, "a partial refund: a quarter of 4 months");
+    let full = read(refund("R2", 1200)).await;
+    assert_eq!(full.refunded, Some(Refunded { minor: 1200, of_minor: None }));
+    assert_eq!(months_refunded(4, 1200, 1200), 4, "the full refund takes every month");
+    // Two partials that add up to the whole (500 + 700 of 1200): 1, then the other 3.
+    let (a, b) = (read(refund("R3", 500)).await, read(refund("R4", 700)).await);
+    let first = months_refunded(4, 1200, a.refunded.unwrap().minor);
+    let both = months_refunded(4, 1200, a.refunded.unwrap().minor + b.refunded.unwrap().minor);
+    assert_eq!((first, both - first, both), (1, 3, 4));
 }
 
 #[tokio::test]
@@ -276,7 +312,8 @@ async fn gocardless_adapter_conforms() {
     let base = stand_in(vec![
         ("/billing_requests", json!({ "billing_requests": { "id": "BRQ123", "status": "pending" } })),
         ("/billing_request_flows", json!({ "billing_request_flows": { "authorisation_url": "https://pay.gocardless.com/billing/static/flow?id=BRF1" } })),
-        ("/billing_requests/{id}", json!({ "billing_requests": { "id": "BRQ123", "status": "fulfilled" } })),
+        ("/billing_requests/{id}", json!({ "billing_requests": { "id": "BRQ123", "status": "fulfilled",
+            "payment_request": { "amount": 900, "currency": "GBP" } } })),
     ])
     .await;
     let c = gocardless::Config {
@@ -308,13 +345,28 @@ async fn gocardless_adapter_conforms() {
     ));
     assert_eq!(p.checkout_outcome("BRQ123").await.unwrap(), Outcome::Paid);
     assert!(p.checkout_outcome("PM123").await.is_err());
+    // The event names only the billing request; its amount is read from GoCardless and must cover the checkout.
+    let paid = Some(Paid::Amount { minor: 900, currency: "GBP".into() });
+    assert_eq!(e[0].paid, paid);
+    assert_eq!(p.paid_facts("BRQ123").await.unwrap(), paid);
+    assert!(paid_covers(gocardless::ID, paid.as_ref(), 3, 900, None));
+    assert!(!paid_covers(gocardless::ID, paid.as_ref(), 4, 1200, None));
+    // A failed payment gives back the whole purchase.
+    let failed = serde_json::to_vec(&json!({ "events": [
+        { "id": "EV3", "resource_type": "payments", "action": "failed", "links": { "billing_request": "BRQ123", "payment": "PM1" } } ] })).unwrap();
+    let e = p
+        .verify_notification(&h(gocardless::SIGNATURE_HEADER, &gocardless::signature("ws", &failed)), &failed, now)
+        .await
+        .unwrap();
+    assert_eq!((e[0].outcome.clone(), e[0].refunded), (Outcome::Refunded, None));
 }
 
 #[tokio::test]
 async fn paddle_adapter_conforms() {
     let base = stand_in(vec![
         ("/transactions", json!({ "data": { "id": "txn_01", "status": "ready", "checkout": { "url": "https://pay.example.org/?_ptxn=txn_01" } } })),
-        ("/transactions/{id}", json!({ "data": { "id": "txn_01", "status": "completed" } })),
+        ("/transactions/{id}", json!({ "data": { "id": "txn_01", "status": "completed", "currency_code": "EUR",
+            "items": [{ "price": { "id": "pri_1" }, "quantity": 6 }], "details": { "totals": { "grand_total": "2160" } } } })),
     ])
     .await;
     let c = paddle::Config {
@@ -329,7 +381,8 @@ async fn paddle_adapter_conforms() {
     assert_eq!(p.methods()[0].seller, link_in_bio_billing::Seller::MerchantOfRecord);
     let s = p.create_checkout(&request("paddle:checkout", 6)).await.unwrap();
     assert_eq!(s.provider_ref, "txn_01");
-    let body = serde_json::to_vec(&json!({ "event_id": "evt_1", "event_type": "transaction.completed", "data": { "id": "txn_01", "currency_code": "EUR" } })).unwrap();
+    let body = serde_json::to_vec(&json!({ "event_id": "evt_1", "event_type": "transaction.completed", "data": { "id": "txn_01", "currency_code": "EUR",
+        "items": [{ "price": { "id": "pri_1" }, "quantity": 6 }] } })).unwrap();
     let now = OffsetDateTime::now_utc();
     let ts = now.unix_timestamp().to_string();
     let sig = format!("ts={ts};h1={}", paddle::h1("pw", &ts, &body));
@@ -347,6 +400,42 @@ async fn paddle_adapter_conforms() {
         Err(BillingError::Unauthentic)
     ));
     assert_eq!(p.checkout_outcome("txn_01").await.unwrap(), Outcome::Paid);
+
+    // The buyer's currency varies, so what must cover the checkout is the quantity of the configured price.
+    let six = Some(Paid::Quantity { quantity: 6, price_id: "pri_1".into() });
+    assert_eq!(e[0].paid, six);
+    assert_eq!(p.paid_facts("txn_01").await.unwrap(), six);
+    assert!(paid_covers(paddle::ID, six.as_ref(), 6, 1800, Some("pri_1")));
+    let signed = |b: &[u8]| format!("ts={ts};h1={}", paddle::h1("pw", &ts, b));
+    for items in [
+        json!([{ "price": { "id": "pri_1" }, "quantity": 1 }]),
+        json!([{ "price": { "id": "pri_other" }, "quantity": 6 }]),
+        json!([{ "price": { "id": "pri_1" }, "quantity": 3 }, { "price": { "id": "pri_1" }, "quantity": 3 }]),
+    ] {
+        let b = serde_json::to_vec(&json!({ "event_id": "evt_2", "event_type": "transaction.completed", "data": { "id": "txn_01", "items": items } })).unwrap();
+        let e = p.verify_notification(&h(paddle::SIGNATURE_HEADER, &signed(&b)), &b, now).await.unwrap();
+        assert!(!paid_covers(paddle::ID, e[0].paid.as_ref(), 6, 1800, Some("pri_1")), "{items}");
+    }
+
+    // A refund adjustment is measured against the transaction's total in the same currency.
+    let adj = |id: &str, total: &str| {
+        serde_json::to_vec(&json!({ "event_id": format!("evt_{id}"), "event_type": "adjustment.updated", "data": {
+            "id": id, "action": "refund", "status": "approved", "transaction_id": "txn_01", "totals": { "total": total, "currency_code": "EUR" } } }))
+        .unwrap()
+    };
+    let read = |b: Vec<u8>| {
+        let sig = signed(&b);
+        let p = &p;
+        async move { p.verify_notification(&h(paddle::SIGNATURE_HEADER, &sig), &b, now).await.unwrap().remove(0) }
+    };
+    let partial = read(adj("adj_1", "720")).await;
+    assert_eq!(partial.refunded, Some(Refunded { minor: 720, of_minor: Some(2160) }));
+    assert_eq!(months_refunded(6, 2160, 720), 2, "a third of 6 months");
+    assert_eq!(read(adj("adj_2", "2160")).await.refunded, Some(Refunded { minor: 2160, of_minor: Some(2160) }));
+    assert_eq!(months_refunded(6, 2160, 2160), 6);
+    // Two partials adding up to the whole (1000 + 1160): 2 (2.78 rounded down), then the other 4.
+    let first = months_refunded(6, 2160, 1000);
+    assert_eq!((first, months_refunded(6, 2160, 2160) - first), (2, 4));
 }
 
 #[tokio::test]

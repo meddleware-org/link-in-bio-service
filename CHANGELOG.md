@@ -20,6 +20,25 @@ Security audit first pass (`docs/audit/link-in-bio-service-audit.md`):
   (`autoconfig`, `autodiscover`, `mta-sts`, `wpad`, `smtp`, `ns1`, …).
 - The page cache stays at most 10 000 hosts under a flood of made-up host names; `unsafe_code` is `forbid`.
 
+Audit findings F25–F29:
+
+- One database role per process kind (api, console, worker, the account Job), each with the grants it needs
+  (`docs/HOSTED.md` "Database roles per process"); the audit log is insert-only for all of them, and the worker's
+  two-year retention runs through `lib.prune_audit_log` (schema 5), which removes nothing younger. Role tests: the page
+  server's role reads only the public views and writes nothing; a writer cannot update, delete or truncate the audit log
+  or run DDL.
+- The console (`serve --mode admin`) holds no key: it reads no `*_FILE` setting and builds no provider or screener, and
+  its Overview shows which providers, feeds and Web Risk are on from the configuration.
+- A Square, GoCardless or Paddle payment is applied only when what the provider says was paid covers the checkout (Square
+  and GoCardless at least its GBP amount; Paddle exactly its months of `PADDLE_PRICE_ID`). One that does not leaves the
+  checkout open, is audited once as `payment-not-covering` and counted in `link_in_bio_payment_mismatches_total`.
+- Refunds take months back pro rata, rounded down, on the running total of a purchase's refunds: never more than it
+  bought, and every month once the whole amount is refunded. A refund of a checkout that was never paid takes nothing.
+- `WEB_RISK_ACCOUNT_DAILY_CAP` (default 200, `0` for none): Web Risk calls one account's publishes may spend in a day.
+  Past it, links are recorded as unknown and the worker screens them again within the hour under the monthly cap.
+- Schema 5: pictures are keyed by `(sha256, account_id)`, so two accounts can each use a byte-identical picture. During
+  the rollout an upload on a pod of the previous release fails until that pod is replaced.
+
 ## 0.0.4 — 2026-11-18
 
 - Open Payments (Interledger), off unless `BILLING_PROVIDERS` lists `open-payments`: an incoming payment on the

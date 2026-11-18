@@ -298,7 +298,8 @@ pub fn paid_event(c: &Credit) -> ProviderEvent {
         event_id: format!("paid:{}", c.reference),
         provider_ref: c.reference.clone(),
         outcome: Outcome::Paid,
-        months: None,
+        paid: None,
+        refunded: None,
         evidence: json!({ "entry": c.entry, "amountMinor": c.amount_minor, "currency": c.currency, "booked": c.booked }),
     }
 }

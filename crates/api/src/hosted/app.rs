@@ -829,7 +829,7 @@ async fn page_publish(State(app): State<Shared>, headers: HeaderMap) -> ApiResul
         if s["verdict"] == "unchecked"
             && let Some(u) = s["url"].as_str()
         {
-            app.screener.screen_and_record(&app.store, u, n).await?;
+            app.screener.screen_and_record_for(&app.store, u, n, Some(&a.id.to_string())).await?;
             Metrics::inc(&app.metrics.screenings);
         }
     }
@@ -1151,7 +1151,8 @@ async fn open_payments_settle(app: &Shared, c: &Checkout, evidence: Value) -> Ap
             event_id: p.paid_event_id(&c.provider_ref),
             provider_ref: c.provider_ref.clone(),
             outcome: link_in_bio_billing::Outcome::Paid,
-            months: None,
+            paid: None,
+            refunded: None,
             evidence,
         };
         super::internal::apply_event(app, open_payments::ID, &e).await?;

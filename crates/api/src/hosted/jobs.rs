@@ -95,11 +95,20 @@ pub async fn reconcile(app: &Shared) {
         let Some(p) = app.billing.provider(&c.provider) else { continue };
         match p.checkout_outcome(&c.provider_ref).await {
             Ok(Outcome::Paid) => {
+                // What was paid, as the provider reports it now (checked against the checkout like a notification).
+                let paid = match p.paid_facts(&c.provider_ref).await {
+                    Ok(paid) => paid,
+                    Err(e) => {
+                        failed(app, "reconcile", e);
+                        continue;
+                    }
+                };
                 let e = ProviderEvent {
                     event_id: p.paid_event_id(&c.provider_ref),
                     provider_ref: c.provider_ref.clone(),
                     outcome: Outcome::Paid,
-                    months: None,
+                    paid,
+                    refunded: None,
                     evidence: serde_json::json!({ "source": "reconciliation" }),
                 };
                 if let Err(e) = apply_event(app, p.id(), &e).await {

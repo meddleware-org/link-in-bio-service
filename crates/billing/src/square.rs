@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use crate::{
-    BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, ProviderEvent, Seller,
-    hmac_sha256, same, send_json,
+    BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, Paid, ProviderEvent,
+    Refunded, Seller, hmac_sha256, same, send_json,
 };
 
 pub const ID: &str = "square";
@@ -53,6 +53,11 @@ impl Square {
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
         self.http.get(self.url(path)).bearer_auth(&self.config.access_token).header("Square-Version", VERSION)
     }
+}
+
+/// A Square `Money` object (`{ "amount": 1200, "currency": "GBP" }`) as what was paid.
+fn money(m: &Value) -> Option<Paid> {
+    Some(Paid::Amount { minor: m["amount"].as_u64()?, currency: m["currency"].as_str()?.to_string() })
 }
 
 /// Square's signature over `notification URL + body`.
@@ -142,8 +147,9 @@ impl BillingProvider for Square {
                         format!("square:{event}")
                     },
                     provider_ref: order.into(),
+                    paid: if outcome == Outcome::Paid { money(&p["amount_money"]) } else { None },
                     outcome,
-                    months: None,
+                    refunded: None,
                     evidence: json!({
                         "event": event, "payment": p["id"], "amount": p["amount_money"], "status": status,
                         "cardBrand": p["card_details"]["card"]["card_brand"], "receipt": p["receipt_url"],
@@ -160,7 +166,14 @@ impl BillingProvider for Square {
                     event_id: format!("refund:{}", r["id"].as_str().unwrap_or(&event)),
                     provider_ref: order.into(),
                     outcome: Outcome::Refunded,
-                    months: None,
+                    paid: None,
+                    // A refund is in the payment's currency (GBP), so it is measured against the checkout's pence.
+                    refunded: Some(Refunded {
+                        minor: r["amount_money"]["amount"]
+                            .as_u64()
+                            .ok_or_else(|| BillingError::Malformed("no refund amount".into()))?,
+                        of_minor: None,
+                    }),
                     evidence: json!({ "event": event, "refund": r["id"], "amount": r["amount_money"] }),
                 }])
             }
@@ -179,5 +192,14 @@ impl BillingProvider for Square {
             Some("CANCELED") => Outcome::Expired,
             _ => Outcome::Open,
         })
+    }
+
+    async fn paid_facts(&self, provider_ref: &str) -> Result<Option<Paid>, BillingError> {
+        if provider_ref.is_empty() || !provider_ref.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(BillingError::Malformed("not an order id".into()));
+        }
+        let v = send_json(self.get(&format!("/v2/orders/{provider_ref}"))).await?;
+        Ok(money(&v["order"]["total_money"]))
     }
 }

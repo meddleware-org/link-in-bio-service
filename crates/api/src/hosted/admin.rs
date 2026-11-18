@@ -58,7 +58,7 @@ async fn overview(State(app): State<Shared>) -> ApiResult<Json<Value>> {
         })).collect::<Vec<_>>(),
         "switches": {
             "signup": c.signup, "thirdPartyPages": c.third_party_pages, "billingProviders": c.billing_providers,
-            "customHostnameCap": c.custom_hostname_cap, "webRisk": app.screener.web_risk.is_some(), "federation": c.federation,
+            "customHostnameCap": c.custom_hostname_cap, "webRisk": c.web_risk_on, "federation": c.federation,
             "bankFeeds": c.bank_feeds.iter().map(|f| match f {
                 super::config::BankFeedEnv::Wise { .. } => "wise",
                 super::config::BankFeedEnv::Bunq { .. } => "bunq",

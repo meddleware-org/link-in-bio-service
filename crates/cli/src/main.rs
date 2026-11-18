@@ -236,7 +236,12 @@ fn run(cli: Cli) -> Result<(), String> {
                     Mode::Pages => 8,
                     _ => 4,
                 };
-                let app = hosted_app(pool, matches!(m, Mode::Pages))?;
+                let role = match m {
+                    Mode::Pages => Role::Pages,
+                    Mode::Admin => Role::Console,
+                    _ => Role::App,
+                };
+                let app = hosted_app(pool, role)?;
                 match m {
                     Mode::Pages => serve(hosted::pages::router(app), listen).await,
                     Mode::Admin => serve(hosted::admin::router(app), listen).await,
@@ -255,7 +260,7 @@ fn run(cli: Cli) -> Result<(), String> {
             })
         }
         Command::Worker { listen } => runtime()?.block_on(async move {
-            let app = hosted_app(4, false)?;
+            let app = hosted_app(4, Role::Worker)?;
             let feeds = hosted::jobs::bank_feeds(&app.config)?;
             let (_, s) = tokio::join!(
                 hosted::jobs::run(app.clone(), feeds, shutdown_signal()),
@@ -441,24 +446,53 @@ fn store(pool: u32, read_only: bool) -> Result<link_in_bio_store::Store, String>
     Ok(link_in_bio_store::Store::new(settings.lazy_pool(pool, access).map_err(|e| e.to_string())?))
 }
 
-/// The hosted settings a process reads. The page server (read-only) never takes payments, screens no link and mounts no
-/// secret, so for it `BILLING_PROVIDERS` is always `manual`, `BANK_FEEDS` empty and every `*_FILE` setting (provider and
-/// bank keys, the Web Risk and ThreatFox keys) unset, whatever the shared configuration says: a key path in the shared
-/// ConfigMap can never make it read, or fail on, a file it does not have.
-fn hosted_env(read_only: bool, get: impl Fn(&str) -> Option<String>) -> impl Fn(&str) -> Option<String> {
+/// The hosted process roles, for what each may read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// `serve --mode pages`: tenant pages; no payment, no screening, no key.
+    Pages,
+    /// `serve --mode app`: the account API and provider notifications; the providers' and Web Risk keys.
+    App,
+    /// `serve --mode admin`: the console; switches for display only, no key.
+    Console,
+    /// `worker`: reconciliation, screening, bank feeds; every key it is configured with.
+    Worker,
+}
+
+impl Role {
+    /// Whether the role holds key files.
+    fn keys(self) -> hosted::Keys {
+        match self {
+            Role::App | Role::Worker => hosted::Keys::Read,
+            Role::Pages | Role::Console => hosted::Keys::DisplayOnly,
+        }
+    }
+}
+
+/// The hosted settings a process reads. The page server never takes payments, screens no link and mounts no secret,
+/// so for it `BILLING_PROVIDERS` is always `manual`, `BANK_FEEDS` empty and every `*_FILE` setting (provider and bank
+/// keys, the Web Risk and ThreatFox keys) unset, whatever the shared configuration says. The console sees every switch
+/// (it shows them) but, like the page server, holds no key: its configuration is parsed with `Keys::DisplayOnly`
+/// ([`Role::keys`]), so no `*_FILE` setting is required or read. A key path in the shared ConfigMap can never make either
+/// read, or fail on, a file it does not have.
+fn hosted_env(role: Role, get: impl Fn(&str) -> Option<String>) -> impl Fn(&str) -> Option<String> {
+    let pages = role == Role::Pages;
     move |k: &str| match k {
-        "BILLING_PROVIDERS" if read_only => Some("manual".into()),
-        "BANK_FEEDS" if read_only => None,
-        _ if read_only && k.ends_with("_FILE") => None,
+        "BILLING_PROVIDERS" if pages => Some("manual".into()),
+        "BANK_FEEDS" if pages => None,
+        _ if pages && k.ends_with("_FILE") => None,
         _ => get(k),
     }
 }
 
-fn hosted_app(pool: u32, read_only: bool) -> Result<hosted::Shared, String> {
-    let config =
-        hosted::HostedConfig::from_env(hosted_env(read_only, |k| std::env::var(k).ok())).map_err(|e| e.to_string())?;
+fn hosted_config(role: Role, get: impl Fn(&str) -> Option<String>) -> Result<hosted::HostedConfig, String> {
+    hosted::HostedConfig::from_env_with(hosted_env(role, get), role.keys()).map_err(|e| e.to_string())
+}
+
+fn hosted_app(pool: u32, role: Role) -> Result<hosted::Shared, String> {
+    let config = hosted_config(role, |k| std::env::var(k).ok())?;
     let cache = std::env::var("PAGE_CACHE_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(30).clamp(1, 600);
-    let app = hosted::App::new(store(pool, read_only)?, config, std::time::Duration::from_secs(cache))?;
+    let app = hosted::App::new(store(pool, role == Role::Pages)?, config, std::time::Duration::from_secs(cache))?;
     Ok(Arc::new(app))
 }
 
@@ -483,36 +517,70 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod hosted_env_tests {
+    use super::Role;
+
     #[test]
     fn the_page_server_never_reads_payment_providers() {
         let shared = |k: &str| (k == "BILLING_PROVIDERS").then(|| "chain-payments,square".to_string());
-        assert_eq!(super::hosted_env(true, shared)("BILLING_PROVIDERS").as_deref(), Some("manual"));
-        assert_eq!(super::hosted_env(false, shared)("BILLING_PROVIDERS").as_deref(), Some("chain-payments,square"));
+        assert_eq!(super::hosted_env(Role::Pages, shared)("BILLING_PROVIDERS").as_deref(), Some("manual"));
+        for role in [Role::App, Role::Console, Role::Worker] {
+            assert_eq!(super::hosted_env(role, shared)("BILLING_PROVIDERS").as_deref(), Some("chain-payments,square"));
+        }
         let feeds = |k: &str| (k == "BANK_FEEDS").then(|| "wise".to_string());
-        assert_eq!(super::hosted_env(true, feeds)("BANK_FEEDS"), None);
-        assert_eq!(super::hosted_env(false, feeds)("BANK_FEEDS").as_deref(), Some("wise"));
-        assert_eq!(super::hosted_env(true, shared)("PAGES_DOMAIN"), None);
+        assert_eq!(super::hosted_env(Role::Pages, feeds)("BANK_FEEDS"), None);
+        assert_eq!(super::hosted_env(Role::Worker, feeds)("BANK_FEEDS").as_deref(), Some("wise"));
+        assert_eq!(super::hosted_env(Role::Pages, shared)("PAGES_DOMAIN"), None);
+    }
+
+    /// The shared ConfigMap names every switch and the Web Risk key path; the provider keys' paths are set only in the
+    /// processes that mount them (absent here, as in the console's and the page server's Deployments).
+    fn shared(k: &str) -> Option<String> {
+        match k {
+            "PAGES_DOMAIN" => Some("example.link".to_string()),
+            "APP_HOST" => Some("app.example.link".to_string()),
+            "BILLING_PROVIDERS" => Some("chain-payments,square,bank-transfer".to_string()),
+            "CHAIN_PAYMENTS_METHODS" => Some("sui-testnet:SUI=SUI".to_string()),
+            "CHAIN_PAYMENTS_ORIGIN" => Some("https://cp.example.org".to_string()),
+            "CHAIN_PAYMENTS_MERCHANT_API" | "CHAIN_PAYMENTS_PUBLIC_API" => Some("http://cp.svc".to_string()),
+            "SQUARE_LOCATION_ID" => Some("L1".to_string()),
+            "BANK_TRANSFER_SCHEME" => Some("faster-payments".to_string()),
+            "BANK_TRANSFER_PAYEE" => Some("Example Ltd".to_string()),
+            "BANK_TRANSFER_SORT_CODE" => Some("12-34-56".to_string()),
+            "BANK_TRANSFER_ACCOUNT_NUMBER" => Some("12345678".to_string()),
+            "WEB_RISK_KEY_FILE" | "THREATFOX_KEY_FILE" => Some(format!("/nonexistent/{k}")),
+            _ => None,
+        }
+    }
+
+    fn with_keys(k: &str) -> Option<String> {
+        shared(k).or_else(|| k.ends_with("_FILE").then(|| format!("/nonexistent/{k}")))
     }
 
     #[test]
     fn the_page_server_never_reads_a_secret_file() {
-        let shared = |k: &str| match k {
-            "PAGES_DOMAIN" => Some("example.link".to_string()),
-            "APP_HOST" => Some("app.example.link".to_string()),
-            "WEB_RISK_MONTHLY_CAP" => Some("1000".to_string()),
-            k if k.ends_with("_FILE") => Some(format!("/nonexistent/{k}")),
-            _ => None,
-        };
         for k in ["WEB_RISK_KEY_FILE", "THREATFOX_KEY_FILE", "CHAIN_PAYMENTS_KEY_FILE", "SQUARE_ACCESS_TOKEN_FILE"] {
-            assert_eq!(super::hosted_env(true, shared)(k), None, "{k}");
-            assert_eq!(super::hosted_env(false, shared)(k), Some(format!("/nonexistent/{k}")), "{k}");
+            assert_eq!(super::hosted_env(Role::Pages, with_keys)(k), None, "{k}");
+            assert_eq!(super::hosted_env(Role::App, with_keys)(k), Some(format!("/nonexistent/{k}")), "{k}");
         }
-        assert_eq!(super::hosted_env(true, shared)("PAGES_DOMAIN").as_deref(), Some("example.link"));
-        // The page server's configuration names no key at all, so building it reads no file.
-        let pages = link_in_bio_api::hosted::HostedConfig::from_env(super::hosted_env(true, shared)).unwrap();
-        assert!(pages.web_risk_key_file.is_none() && pages.threatfox_key_file.is_none());
+        assert_eq!(super::hosted_env(Role::Pages, with_keys)("PAGES_DOMAIN").as_deref(), Some("example.link"));
+        let pages = super::hosted_config(Role::Pages, with_keys).unwrap();
+        assert!(pages.web_risk_key_file.is_none() && pages.threatfox_key_file.is_none() && !pages.web_risk_on);
         assert!(pages.chain_payments.is_none() && pages.bank_feeds.is_empty());
-        let app = link_in_bio_api::hosted::HostedConfig::from_env(super::hosted_env(false, shared)).unwrap();
+        let app = super::hosted_config(Role::App, with_keys).unwrap();
         assert_eq!(app.web_risk_key_file.as_deref(), Some("/nonexistent/WEB_RISK_KEY_FILE"));
+    }
+
+    #[test]
+    fn the_console_shows_the_switches_and_holds_no_key() {
+        // The app and the worker need their key paths; the console starts without any.
+        assert!(super::hosted_config(Role::App, shared).is_err(), "the app needs CHAIN_PAYMENTS_KEY_FILE");
+        let c = super::hosted_config(Role::Console, shared).unwrap();
+        assert_eq!(c.keys, link_in_bio_api::hosted::Keys::DisplayOnly);
+        assert!(c.billing_providers.contains("chain-payments") && c.billing_providers.contains("square"));
+        assert!(c.web_risk_on, "the switch is shown");
+        assert!(c.web_risk_key_file.is_none() && c.threatfox_key_file.is_none());
+        assert_eq!(c.chain_payments.as_ref().unwrap().api_key_file, "");
+        assert_eq!(c.square.as_ref().unwrap().access_token_file, "");
+        assert!(c.bank_transfer.is_some(), "statement imports need the scheme, which is not a secret");
     }
 }

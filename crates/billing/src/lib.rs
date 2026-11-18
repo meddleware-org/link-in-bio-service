@@ -116,6 +116,25 @@ pub enum Outcome {
     Open,
 }
 
+/// What a provider says was paid for a checkout, compared with the checkout before a payment is applied
+/// ([`paid_covers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Paid {
+    /// An amount in minor units of a currency (Square, GoCardless).
+    Amount { minor: u64, currency: String },
+    /// A quantity of one catalog price (Paddle: the currency is the buyer's, so the quantity and price are what count).
+    Quantity { quantity: u32, price_id: String },
+}
+
+/// How much of a purchase a refund gave back, in the provider's minor units of one currency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refunded {
+    /// This refund's amount.
+    pub minor: u64,
+    /// What the purchase was paid, in the same currency; `None` means the checkout's own amount in pence.
+    pub of_minor: Option<u64>,
+}
+
 /// One verified notification from a provider.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderEvent {
@@ -124,10 +143,46 @@ pub struct ProviderEvent {
     /// The checkout it is about (`CheckoutStart::provider_ref`).
     pub provider_ref: String,
     pub outcome: Outcome,
-    /// For a refund: the months taken back.
-    pub months: Option<u32>,
+    /// For a payment: what the provider says was paid (required by the card and bank providers, see [`paid_covers`]).
+    pub paid: Option<Paid>,
+    /// For a refund: how much was refunded; `None` is the whole purchase (a failed or charged-back payment).
+    pub refunded: Option<Refunded>,
     /// What the provider says about the payment (kept as tax and accounting evidence).
     pub evidence: Value,
+}
+
+/// Whether what a provider says was paid covers the checkout: for Square and GoCardless at least the checkout's amount in
+/// GBP; for Paddle exactly the checkout's months of the configured price (`paddle_price_id`). Other providers verify the
+/// amount themselves (Chain Payments on-chain, Open Payments from the operator's own incoming payment, bank transfer from
+/// the credit), so their events need no `paid`. A provider that needs one and sends none is not covered.
+pub fn paid_covers(
+    provider: &str,
+    paid: Option<&Paid>,
+    months: u32,
+    amount_pence: u64,
+    paddle_price_id: Option<&str>,
+) -> bool {
+    match provider {
+        square::ID | gocardless::ID => {
+            matches!(paid, Some(Paid::Amount { minor, currency }) if currency == "GBP" && *minor >= amount_pence)
+        }
+        paddle::ID => matches!(
+            paid,
+            Some(Paid::Quantity { quantity, price_id }) if *quantity == months && Some(price_id.as_str()) == paddle_price_id
+        ),
+        _ => true,
+    }
+}
+
+/// The months a purchase of `months` months, paid `paid_minor`, has given back once refunds totalling `refunded_minor`
+/// (same currency) are made: pro rata, rounded down, and all of them once the whole amount is refunded. Applying each
+/// refund as the difference between this before and after it means the months taken back never exceed the purchase's,
+/// and partial refunds that add up to the whole take all of them.
+pub fn months_refunded(months: u32, paid_minor: u64, refunded_minor: u64) -> u32 {
+    if paid_minor == 0 || refunded_minor >= paid_minor {
+        return months;
+    }
+    (u128::from(months) * u128::from(refunded_minor) / u128::from(paid_minor)) as u32
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -164,6 +219,10 @@ pub trait BillingProvider: Send + Sync {
     fn paid_event_id(&self, provider_ref: &str) -> String {
         format!("paid:{provider_ref}")
     }
+    /// What the provider says was paid for a checkout it reports `Paid` (the reconciliation's [`ProviderEvent::paid`]).
+    async fn paid_facts(&self, _provider_ref: &str) -> Result<Option<Paid>, BillingError> {
+        Ok(None)
+    }
 }
 
 /// A shared adapter is an adapter (the app keeps a typed handle to one whose flow has steps beyond the port).
@@ -191,6 +250,9 @@ impl<T: BillingProvider + ?Sized> BillingProvider for std::sync::Arc<T> {
     }
     fn paid_event_id(&self, provider_ref: &str) -> String {
         (**self).paid_event_id(provider_ref)
+    }
+    async fn paid_facts(&self, provider_ref: &str) -> Result<Option<Paid>, BillingError> {
+        (**self).paid_facts(provider_ref).await
     }
 }
 
@@ -478,6 +540,40 @@ mod tests {
         assert_eq!(t, datetime!(2026-11-17 09:41:07.123456 UTC));
         assert_eq!(t.offset(), time::UtcOffset::UTC);
         assert_eq!(parse_rfc3339("2026-11-17"), None);
+    }
+
+    #[test]
+    fn refunds_give_back_months_pro_rata_rounded_down() {
+        // A partial refund: a third of 12 months paid 3600 is 4; a little less is 3.
+        assert_eq!(months_refunded(12, 3600, 1200), 4);
+        assert_eq!(months_refunded(12, 3600, 1199), 3);
+        // The whole amount (or more) gives back every month.
+        assert_eq!(months_refunded(12, 3600, 3600), 12);
+        assert_eq!(months_refunded(12, 3600, 5000), 12);
+        // Two partials that add up to the whole: counted on the running total, so 3 + 9 = 12 (not 3 + 8).
+        let first = months_refunded(12, 3600, 1000);
+        let second = months_refunded(12, 3600, 1000 + 2600) - first;
+        assert_eq!((first, second), (3, 9));
+        assert_eq!(months_refunded(1, 300, 299), 0);
+        assert_eq!(months_refunded(5, 0, 0), 5, "nothing was paid: a refund takes everything");
+    }
+
+    #[test]
+    fn a_payment_counts_only_when_it_covers_the_checkout() {
+        let gbp = |minor| Paid::Amount { minor, currency: "GBP".into() };
+        assert!(paid_covers(square::ID, Some(&gbp(1200)), 4, 1200, None));
+        assert!(paid_covers(gocardless::ID, Some(&gbp(1300)), 4, 1200, None), "more is fine");
+        assert!(!paid_covers(square::ID, Some(&gbp(1199)), 4, 1200, None), "short");
+        assert!(!paid_covers(square::ID, Some(&Paid::Amount { minor: 1200, currency: "EUR".into() }), 4, 1200, None));
+        assert!(!paid_covers(square::ID, None, 4, 1200, None), "a card payment says what it paid");
+        let q = |quantity, price_id: &str| Paid::Quantity { quantity, price_id: price_id.into() };
+        assert!(paid_covers(paddle::ID, Some(&q(6, "pri_1")), 6, 1800, Some("pri_1")));
+        assert!(!paid_covers(paddle::ID, Some(&q(1, "pri_1")), 6, 1800, Some("pri_1")), "fewer months");
+        assert!(!paid_covers(paddle::ID, Some(&q(6, "pri_cheap")), 6, 1800, Some("pri_1")), "another price");
+        assert!(!paid_covers(paddle::ID, Some(&gbp(1800)), 6, 1800, Some("pri_1")));
+        for p in [chain_payments::ID, open_payments::ID, bank_transfer::ID, manual::ID] {
+            assert!(paid_covers(p, None, 1, 300, None), "{p} verifies the amount itself");
+        }
     }
 
     #[test]

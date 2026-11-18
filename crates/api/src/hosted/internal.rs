@@ -10,9 +10,19 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Value, json};
 
+use link_in_bio_billing::Paid;
 use link_in_bio_billing::bank_transfer::{self, Credit, Scheme};
 use link_in_bio_billing::{Outcome, ProviderEvent};
-use link_in_bio_store::PeriodChange;
+use link_in_bio_store::{PeriodChange, RefundChange};
+
+/// What a provider said was paid, for the audit log.
+fn paid_json(p: Option<&Paid>) -> Value {
+    match p {
+        Some(Paid::Amount { minor, currency }) => json!({ "amountMinor": minor, "currency": currency }),
+        Some(Paid::Quantity { quantity, price_id }) => json!({ "quantity": quantity, "priceId": price_id }),
+        None => Value::Null,
+    }
+}
 
 use super::error::{ApiError, ApiResult};
 use super::metrics::Metrics;
@@ -27,6 +37,29 @@ pub async fn apply_event(app: &Shared, provider: &str, e: &ProviderEvent) -> Api
     let n = now();
     match e.outcome {
         Outcome::Paid => {
+            // What the provider says was paid must cover the checkout (amount and currency, or Paddle's quantity and
+            // price). If it does not, nothing is applied: the checkout stays open and the operator sees why, once.
+            let price_id = app.config.paddle.as_ref().map(|p| p.price_id.as_str());
+            if !link_in_bio_billing::paid_covers(
+                provider,
+                e.paid.as_ref(),
+                c.months as u32,
+                c.amount_pence as u64,
+                price_id,
+            ) {
+                Metrics::inc(&app.metrics.payment_mismatches);
+                tracing::warn!(provider, checkout = %c.id, "a payment notification does not cover its checkout");
+                app.store
+                    .audit_once(
+                        &format!("provider:{provider}"),
+                        "payment-not-covering",
+                        &c.account_id.to_string(),
+                        &json!({ "event": format!("{provider}:{}", e.event_id), "checkout": c.id, "months": c.months,
+                                 "amountPence": c.amount_pence, "paid": paid_json(e.paid.as_ref()), "evidence": e.evidence }),
+                    )
+                    .await?;
+                return Ok(());
+            }
             let mut evidence = e.evidence.clone();
             evidence["countryDeclared"] = json!(c.country_declared);
             evidence["countryRequest"] = json!(c.country_request);
@@ -101,22 +134,44 @@ pub async fn apply_event(app: &Shared, provider: &str, e: &ProviderEvent) -> Api
             }
         }
         Outcome::Refunded => {
-            let months = -(e.months.unwrap_or(c.months as u32) as i32);
-            app.store
-                .change_period(
-                    &PeriodChange {
+            // Pro rata, rounded down, counted over every refund of this purchase (FU-0139): a refund of the whole
+            // amount, or partial refunds that add up to it, take back every month, and never more.
+            let (refunded, of) = match e.refunded {
+                Some(r) => (r.minor, r.of_minor.unwrap_or(c.amount_pence as u64)),
+                None => (c.amount_pence as u64, c.amount_pence as u64),
+            };
+            let applied = app
+                .store
+                .refund_purchase(
+                    &RefundChange {
                         account_id: c.account_id,
                         provider,
                         provider_event: &e.event_id,
-                        kind: "refund",
-                        months,
-                        amount_pence: -c.amount_pence,
+                        checkout: c.id,
+                        months: c.months as u32,
+                        paid_minor: of,
+                        refunded_minor: refunded,
+                        amount_pence: c.amount_pence,
                         evidence: e.evidence.clone(),
-                        checkout: None,
                     },
+                    link_in_bio_billing::months_refunded,
                     n,
                 )
                 .await?;
+            if let Some(r) = applied {
+                app.store
+                    .audit(
+                        &format!("provider:{provider}"),
+                        "refunded",
+                        &c.account_id.to_string(),
+                        &json!({ "checkout": c.id, "refundedMinor": refunded, "ofMinor": of, "monthsTaken": r.months_taken,
+                                 "paidUntil": r.paid_until.map(crate::time::rfc3339_full) }),
+                    )
+                    .await?;
+                if let Some(a) = app.store.account(c.account_id).await? {
+                    app.pages.forget(&format!("{}.{}", a.handle, app.config.pages_domain)).await;
+                }
+            }
         }
         Outcome::Expired | Outcome::Failed => {
             app.store.close_checkout(c.id, "expired", n).await?;

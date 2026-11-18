@@ -213,7 +213,14 @@ impl BillingProvider for ChainPayments {
         // Chain Payments keeps across delivery attempts.
         let event_id =
             if outcome == Outcome::Unapplied { format!("unapplied:{webhook_id}") } else { paid_event_id(session) };
-        Ok(vec![ProviderEvent { event_id, provider_ref: session.to_string(), outcome, months: None, evidence }])
+        Ok(vec![ProviderEvent {
+            event_id,
+            provider_ref: session.to_string(),
+            outcome,
+            paid: None,
+            refunded: None,
+            evidence,
+        }])
     }
 
     async fn checkout_outcome(&self, provider_ref: &str) -> Result<Outcome, BillingError> {

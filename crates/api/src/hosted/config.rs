@@ -25,8 +25,22 @@ pub enum HostedConfigError {
     Invalid(&'static str, String),
 }
 
+/// Whether a process holds the key files its configuration names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keys {
+    /// The app and the worker: every switched-on provider's and feed's key files are required and read.
+    Read,
+    /// The console and the page server: switches for display only; no key file is required, kept or read.
+    DisplayOnly,
+}
+
 #[derive(Debug, Clone)]
 pub struct HostedConfig {
+    /// Whether this process holds key files ([`Keys`]).
+    pub keys: Keys,
+    /// Web Risk screening is switched on (a key file is configured and the monthly cap is above 0), as shown in the
+    /// console; only a process with `Keys::Read` holds the key.
+    pub web_risk_on: bool,
     /// The domain tenant pages live under (`<handle>.<pages_domain>`), e.g. `meddleware.link`.
     pub pages_domain: String,
     /// The app host (the passkey RP ID), e.g. `app.meddleware.link`.
@@ -45,6 +59,8 @@ pub struct HostedConfig {
     pub custom_hostname_cap: i64,
     pub web_risk_key_file: Option<String>,
     pub web_risk_monthly_cap: i64,
+    /// Web Risk calls one account's publishes may spend a day (0: no per-account limit).
+    pub web_risk_account_daily_cap: i64,
     pub threatfox_key_file: Option<String>,
     pub sui_network: String,
     /// Bytes of pictures one account may store.
@@ -181,6 +197,26 @@ fn number<T: std::str::FromStr + PartialOrd>(
 
 impl HostedConfig {
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, HostedConfigError> {
+        Self::from_env_with(get, Keys::Read)
+    }
+
+    /// The configuration of a process that holds key files (`Keys::Read`: the app and the worker) or holds none
+    /// (`Keys::DisplayOnly`: the console and the page server). Without keys, the switches still parse and show (which
+    /// providers and feeds are on, whether Web Risk is), but no `*_FILE` setting is required or kept, so nothing reads
+    /// one.
+    pub fn from_env_with(get: impl Fn(&str) -> Option<String>, keys: Keys) -> Result<Self, HostedConfigError> {
+        let display_only = keys == Keys::DisplayOnly;
+        let key = |v: &'static str| -> Result<String, HostedConfigError> {
+            if display_only {
+                Ok(String::new())
+            } else {
+                get(v).filter(|x| !x.trim().is_empty()).ok_or(HostedConfigError::Missing(v))
+            }
+        };
+        let key_opt = |v: &'static str| -> Option<String> {
+            if display_only { None } else { get(v).filter(|x| !x.trim().is_empty()) }
+        };
+        let web_risk_set = get("WEB_RISK_KEY_FILE").is_some_and(|v| !v.trim().is_empty());
         let pages_domain =
             host("PAGES_DOMAIN", &get("PAGES_DOMAIN").ok_or(HostedConfigError::Missing("PAGES_DOMAIN"))?)?;
         let app_host = host("APP_HOST", &get("APP_HOST").ok_or(HostedConfigError::Missing("APP_HOST"))?)?;
@@ -234,7 +270,7 @@ impl HostedConfig {
                 merchant_api: need("CHAIN_PAYMENTS_MERCHANT_API")?,
                 public_api: need("CHAIN_PAYMENTS_PUBLIC_API")?,
                 checkout_origin,
-                api_key_file: need("CHAIN_PAYMENTS_KEY_FILE")?,
+                api_key_file: key("CHAIN_PAYMENTS_KEY_FILE")?,
                 methods,
                 webhook_key: get("CHAIN_PAYMENTS_WEBHOOK_KEY").filter(|k| !k.trim().is_empty()),
             })
@@ -253,9 +289,9 @@ impl HostedConfig {
         let square = if billing_providers.contains("square") {
             Some(SquareEnv {
                 api_base: base("SQUARE_API_BASE", "https://connect.squareupsandbox.com")?,
-                access_token_file: need("SQUARE_ACCESS_TOKEN_FILE")?,
+                access_token_file: key("SQUARE_ACCESS_TOKEN_FILE")?,
                 location_id: need("SQUARE_LOCATION_ID")?,
-                signature_key_file: need("SQUARE_SIGNATURE_KEY_FILE")?,
+                signature_key_file: key("SQUARE_SIGNATURE_KEY_FILE")?,
                 fixed_pence: number(&get, "SQUARE_FIXED_PENCE", 25u32, 0, 1000)?,
                 percent_bps: number(&get, "SQUARE_PERCENT_BPS", 140u32, 0, 2000)?,
             })
@@ -265,8 +301,8 @@ impl HostedConfig {
         let gocardless = if billing_providers.contains("gocardless") {
             Some(GoCardlessEnv {
                 api_base: base("GOCARDLESS_API_BASE", "https://api-sandbox.gocardless.com")?,
-                access_token_file: need("GOCARDLESS_ACCESS_TOKEN_FILE")?,
-                webhook_secret_file: need("GOCARDLESS_WEBHOOK_SECRET_FILE")?,
+                access_token_file: key("GOCARDLESS_ACCESS_TOKEN_FILE")?,
+                webhook_secret_file: key("GOCARDLESS_WEBHOOK_SECRET_FILE")?,
                 fixed_pence: number(&get, "GOCARDLESS_FIXED_PENCE", 20u32, 0, 1000)?,
                 percent_bps: number(&get, "GOCARDLESS_PERCENT_BPS", 100u32, 0, 2000)?,
             })
@@ -276,8 +312,8 @@ impl HostedConfig {
         let paddle = if billing_providers.contains("paddle") {
             Some(PaddleEnv {
                 api_base: base("PADDLE_API_BASE", "https://sandbox-api.paddle.com")?,
-                api_key_file: need("PADDLE_API_KEY_FILE")?,
-                webhook_secret_file: need("PADDLE_WEBHOOK_SECRET_FILE")?,
+                api_key_file: key("PADDLE_API_KEY_FILE")?,
+                webhook_secret_file: key("PADDLE_WEBHOOK_SECRET_FILE")?,
                 price_id: need("PADDLE_PRICE_ID")?,
                 fixed_pence: number(&get, "PADDLE_FIXED_PENCE", 40u32, 0, 1000)?,
                 percent_bps: number(&get, "PADDLE_PERCENT_BPS", 500u32, 0, 2000)?,
@@ -320,7 +356,7 @@ impl HostedConfig {
             Some(OpenPaymentsEnv {
                 wallet_address,
                 key_id: need("OPEN_PAYMENTS_KEY_ID")?,
-                key_file: need("OPEN_PAYMENTS_KEY_FILE")?,
+                key_file: key("OPEN_PAYMENTS_KEY_FILE")?,
                 asset_code: get("OPEN_PAYMENTS_ASSET_CODE").unwrap_or_else(|| "GBP".into()).trim().to_string(),
                 asset_scale: number(&get, "OPEN_PAYMENTS_ASSET_SCALE", 2u8, 0, 18)?,
                 minor_per_month,
@@ -348,14 +384,14 @@ impl HostedConfig {
                     api_version: get("WISE_API_VERSION")
                         .filter(|v| !v.trim().is_empty())
                         .unwrap_or_else(|| link_in_bio_billing::bank_feed::wise::VERSION.into()),
-                    token_file: need("WISE_TOKEN_FILE")?,
+                    token_file: key("WISE_TOKEN_FILE")?,
                     profile_id: number(&get, "WISE_PROFILE_ID", 0u64, 1, u64::MAX)?,
-                    sca_key_file: get("WISE_SCA_KEY_FILE").filter(|v| !v.trim().is_empty()),
+                    sca_key_file: key_opt("WISE_SCA_KEY_FILE"),
                 },
                 "bunq" => BankFeedEnv::Bunq {
                     api_base: base("BUNQ_API_BASE", link_in_bio_billing::bank_feed::bunq::SANDBOX)?,
-                    api_key_file: need("BUNQ_API_KEY_FILE")?,
-                    key_file: need("BUNQ_KEY_FILE")?,
+                    api_key_file: key("BUNQ_API_KEY_FILE")?,
+                    key_file: key("BUNQ_KEY_FILE")?,
                     permitted_ips: get("BUNQ_PERMITTED_IPS")
                         .unwrap_or_default()
                         .split(',')
@@ -367,8 +403,8 @@ impl HostedConfig {
                     api_base: base("REVOLUT_API_BASE", link_in_bio_billing::bank_feed::revolut::SANDBOX)?,
                     client_id: need("REVOLUT_CLIENT_ID")?,
                     issuer: need("REVOLUT_ISSUER")?,
-                    key_file: need("REVOLUT_KEY_FILE")?,
-                    refresh_token_file: need("REVOLUT_REFRESH_TOKEN_FILE")?,
+                    key_file: key("REVOLUT_KEY_FILE")?,
+                    refresh_token_file: key("REVOLUT_REFRESH_TOKEN_FILE")?,
                 },
                 o => return Err(HostedConfigError::Invalid("BANK_FEEDS", format!("{o} is not wise, bunq or revolut"))),
             });
@@ -400,8 +436,11 @@ impl HostedConfig {
             None => serde_json::from_value(serde_json::json!({ "baseUrl": format!("https://{pages_domain}/") }))
                 .map_err(|e| HostedConfigError::Invalid("SITE_CONFIG", e.to_string()))?,
         };
+        let web_risk_monthly_cap = number(&get, "WEB_RISK_MONTHLY_CAP", 90_000i64, 0, 100_000)?;
         let custom_hostname_cap = number(&get, "CUSTOM_HOSTNAME_CAP", 0i64, 0, 100)?;
         Ok(Self {
+            keys,
+            web_risk_on: web_risk_set && web_risk_monthly_cap > 0,
             app_origin: format!("https://{app_host}"),
             product_name: get("PRODUCT_NAME").unwrap_or_else(|| "Link in Bio".into()),
             signup,
@@ -413,9 +452,10 @@ impl HostedConfig {
             billing_providers,
             billing_countries,
             custom_hostname_cap,
-            web_risk_key_file: get("WEB_RISK_KEY_FILE").filter(|v| !v.is_empty()),
-            web_risk_monthly_cap: number(&get, "WEB_RISK_MONTHLY_CAP", 90_000i64, 0, 100_000)?,
-            threatfox_key_file: get("THREATFOX_KEY_FILE").filter(|v| !v.is_empty()),
+            web_risk_key_file: key_opt("WEB_RISK_KEY_FILE"),
+            web_risk_monthly_cap,
+            web_risk_account_daily_cap: number(&get, "WEB_RISK_ACCOUNT_DAILY_CAP", 200i64, 0, 100_000)?,
+            threatfox_key_file: key_opt("THREATFOX_KEY_FILE"),
             sui_network: get("SUI_NETWORK").unwrap_or_else(|| "testnet".into()),
             asset_quota_bytes: number(&get, "ASSET_QUOTA_BYTES", 512 * 1024i64, 64 * 1024, 16 * 1024 * 1024)?,
             pages_domain,

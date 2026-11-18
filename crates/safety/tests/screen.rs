@@ -69,7 +69,7 @@ async fn layers_cap_and_outage() {
     let now = OffsetDateTime::now_utc();
     let mut w = WebRisk::new("test-key".into(), 3);
     w.endpoint = web_risk().await;
-    let screener = Screener { web_risk: Some(w) };
+    let screener = Screener { web_risk: Some(w), account_daily_cap: 0 };
 
     // Layer 1 answers without spending a Web Risk call.
     assert!(matches!(screener.screen(&s, "https://bit.ly/x", now).await, Verdict::Flagged { .. }));

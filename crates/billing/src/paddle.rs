@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use crate::{
-    BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, ProviderEvent, Seller,
-    hmac_sha256, same, send_json,
+    BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, Paid, ProviderEvent,
+    Refunded, Seller, hmac_sha256, same, send_json,
 };
 
 pub const ID: &str = "paddle";
@@ -48,6 +48,20 @@ impl Paddle {
             .request(m, format!("{}{path}", self.config.api_base.trim_end_matches('/')))
             .bearer_auth(&self.config.api_key)
     }
+}
+
+/// What a transaction (from a notification or from the API) says was bought: its one item's quantity and price. A
+/// transaction with any other set of items is not one this service created, so it says nothing (`None`).
+pub fn bought(transaction: &Value) -> Option<Paid> {
+    let items = transaction["items"].as_array()?;
+    let [item] = items.as_slice() else { return None };
+    let price_id = item["price"]["id"].as_str().or_else(|| item["price_id"].as_str())?;
+    Some(Paid::Quantity { quantity: u32::try_from(item["quantity"].as_u64()?).ok()?, price_id: price_id.to_string() })
+}
+
+/// A Paddle amount (a string or number of minor units).
+fn minor(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str()?.parse().ok())
 }
 
 /// The `h1` value for a timestamp and body.
@@ -128,7 +142,8 @@ impl BillingProvider for Paddle {
                     event_id: self.paid_event_id(id),
                     provider_ref: id.into(),
                     outcome: Outcome::Paid,
-                    months: None,
+                    paid: bought(d),
+                    refunded: None,
                     evidence: json!({
                         "event": event, "currency": d["currency_code"], "totals": d["details"]["totals"],
                         "customer": d["customer_id"], "address": d["address_id"],
@@ -141,7 +156,8 @@ impl BillingProvider for Paddle {
                     event_id: format!("paddle:{event}"),
                     provider_ref: id.into(),
                     outcome: Outcome::Expired,
-                    months: None,
+                    paid: None,
+                    refunded: None,
                     evidence: json!({ "event": event }),
                 }])
             }
@@ -150,11 +166,18 @@ impl BillingProvider for Paddle {
             {
                 let id =
                     d["transaction_id"].as_str().ok_or_else(|| BillingError::Malformed("no transaction id".into()))?;
+                let refunded =
+                    minor(&d["totals"]["total"]).ok_or_else(|| BillingError::Malformed("no refund total".into()))?;
+                // The refund is in the buyer's currency: measured against what the transaction was paid in it.
+                let paid = self.transaction(id).await?;
+                let of = minor(&paid["details"]["totals"]["grand_total"])
+                    .ok_or_else(|| BillingError::Malformed("the transaction has no total".into()))?;
                 Ok(vec![ProviderEvent {
                     event_id: format!("refund:{}", d["id"].as_str().unwrap_or(&event)),
                     provider_ref: id.into(),
                     outcome: Outcome::Refunded,
-                    months: None,
+                    paid: None,
+                    refunded: Some(Refunded { minor: refunded, of_minor: Some(of) }),
                     evidence: json!({ "event": event, "adjustment": d["id"], "totals": d["totals"] }),
                 }])
             }
@@ -163,14 +186,25 @@ impl BillingProvider for Paddle {
     }
 
     async fn checkout_outcome(&self, provider_ref: &str) -> Result<Outcome, BillingError> {
-        if !provider_ref.starts_with("txn_") || !provider_ref.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(BillingError::Malformed("not a transaction id".into()));
-        }
-        let v = send_json(self.req(reqwest::Method::GET, &format!("/transactions/{provider_ref}"))).await?;
-        Ok(match v["data"]["status"].as_str() {
+        let v = self.transaction(provider_ref).await?;
+        Ok(match v["status"].as_str() {
             Some("completed") | Some("paid") => Outcome::Paid,
             Some("canceled") => Outcome::Expired,
             _ => Outcome::Open,
         })
+    }
+
+    async fn paid_facts(&self, provider_ref: &str) -> Result<Option<Paid>, BillingError> {
+        Ok(bought(&self.transaction(provider_ref).await?))
+    }
+}
+
+impl Paddle {
+    /// A transaction as Paddle reports it now (`GET /transactions/{id}`, its `data`).
+    async fn transaction(&self, id: &str) -> Result<Value, BillingError> {
+        if !id.starts_with("txn_") || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(BillingError::Malformed("not a transaction id".into()));
+        }
+        Ok(send_json(self.req(reqwest::Method::GET, &format!("/transactions/{id}"))).await?["data"].clone())
     }
 }

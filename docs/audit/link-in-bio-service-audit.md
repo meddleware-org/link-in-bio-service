@@ -21,7 +21,7 @@
 **Severity ceiling:** High — the service decides who signs in to an account, whether a payment extends a paid period, and
   what HTML is served under the product's domain for every tenant. A sign-in flaw takes over accounts; a ledger flaw gives
   away or takes away paid time; a renderer flaw runs a tenant's script for every visitor. Realised ceiling at this pass:
-  **Low** (F25–F29, all DEFERRED; F1 and F2 were Medium and are RESOLVED).
+  **Low** (F30–F34; F1 and F2 were Medium, F25–F29 Low, all RESOLVED).
 **Status:** first-pass baseline
 
 **Toolchain:** `rust-version = "1.94"` (MSRV job), stable in CI   **Edition:** 2024
@@ -114,20 +114,22 @@ boundaries are well drawn:
 - F6 to F12: reserved infrastructure labels, console cache headers, an https-only Access team domain, a `sandbox` preview,
   a bounded page cache, `forbid(unsafe_code)`, and `SECURITY.md`.
 
-**Open, most important first:**
+**Fixed after the first pass (F25–F29, unreleased, next patch 0.0.5):**
 
-1. **F25 (Low)** — the public API, the console, the worker and the account Job share one writer role; there are no role
-   tests; the console reads provider keys and the Web Risk key it never uses (FU-0138).
-2. **F27 (Low)** — a provider notification is applied without comparing its amount or quantity with the checkout (FU-0140,
-   before the card providers go live).
-3. **F26 (Low; OQ1)** — a partial refund takes back every month of the purchase, once per partial refund (FU-0139).
-4. F28 and F29 (Low): one account can spend the shared Web Risk budget; pictures are keyed by hash across accounts.
+- **F25:** one database role per process kind with grants per table and the audit log insert-only for all of them (its
+  retention runs through an owner function); role tests for the page server and a writer; the console holds no key.
+- **F27:** a card provider's payment is applied only when what it says was paid covers the checkout.
+- **F26 (OQ1, built as pro rata rounded down):** refunds take months back in proportion to the amount, never more than the
+  purchase bought.
+- **F28 (OQ2, built as 200 a day by default):** a per-account daily budget of Web Risk calls; **F29:** pictures keyed per account.
 
-**Dispositions (34 findings):** RESOLVED 12 · ADJUDICATED 4 · ACCEPTED-RISK 1 · DEFERRED 5 · Positive 12.
+**Open:** none above Info but F30–F34 (each dispositioned below).
+
+**Dispositions (34 findings):** RESOLVED 17 · ADJUDICATED 4 · ACCEPTED-RISK 1 · DEFERRED 0 · Positive 12.
 **Counts by severity:** Medium 2 · Low 13 · Info 7 · Positive 12.
 
-**Posture:** a careful design with the right primitives at every boundary. The remaining work is least privilege between
-the service's own processes and the checks the card providers' notifications should get before real money flows.
+**Posture:** a careful design with the right primitives at every boundary, now with least privilege between the service's
+own processes and amount checks on the card providers' notifications before real money flows.
 
 ## Threat model / trust boundaries
 
@@ -137,7 +139,7 @@ the service's own processes and the checks the card providers' notifications sho
 | Tenant (signed-in account) | its session cookie | edit, preview and publish its page; upload pictures; buy months; ask refunds; appeal | session → one account; the parser on every save and publish; asset quota; ingress 20 r/s, uploads 2 r/s; one decode at a time (F1) |
 | Anyone (no account) | requests to the app API | start sign-up (closed today), sign in, report a page | `SIGNUP_MODE`/`TERMS_VERSION`; ingress 30 r/min on sign-up, sign-in and reports; uniform refusals |
 | A buyer's Open Payments wallet | its servers' answers | answer the service's requests | https, public addresses only, checked at connect (F5); answers ≤ 1 MiB (F2); no redirects; 15 s |
-| Payment providers (Square, GoCardless, Paddle, Chain Payments) | notifications, API answers | mark a checkout paid or refunded | signature per adapter; ledger key per event; answers ≤ 1 MiB (F2); amount not compared (F27) |
+| Payment providers (Square, GoCardless, Paddle, Chain Payments) | notifications, API answers | mark a checkout paid or refunded | signature per adapter; ledger key per event; answers ≤ 1 MiB (F2); paid amount must cover the checkout (F27) |
 | Banks (statement import, feeds) | credits | pay bank-transfer checkouts | reference, currency and amount ≥ the checkout's; once per reference; statements ≤ 16 MiB |
 | Operator (console) | Access identity + Keto role | moderate, suspend, grant months, issue invites, import statements, record refunds | Access JWT + Keto per request (cached 30 s); CSRF; every change audited |
 | Cloudflare edge and tunnel | `CF-IPCountry`, client address, Access | country evidence, rate-limit key, console gate | origin reachable only through the tunnel (platform); F30 |
@@ -169,16 +171,16 @@ unique `(provider, provider_event)` and each adapter's signature check.
 | Invite codes | operator or the holding account | one free account each | free accounts | revoke; expiry; `may_share_invites` |
 | Access JWT | the operator's browser (Access cookie) | the console with the Keto role | moderate, grant months, import statements | Access session (12 h); remove the Keto tuple |
 | Keto tuple `LinkInBio:admin#member` | Keto (written by the operator) | the console role | full console | delete the tuple (effective within 30 s) |
-| Chain Payments merchant key | api, admin, worker (file) | create and read merchant sessions | create checkouts in Link in Bio's name | `merchant rotate-key` (Chain Payments) |
-| Provider and bank keys (off today) | api, admin, worker; feeds worker only (files) | take payments, read accounts | depends on the provider (a Revolut token with payment scope could pay out) | each provider's dashboard; F25 (admin holds keys it does not need) |
-| Database password (`link_in_bio_app`) | api, admin, worker, account Job (Secret env) | DML on `lib` | rewrite any account, ledger or audit row | `new-service-db-secret.sh --force`; F25 |
+| Chain Payments merchant key | api, worker (file; the console holds none, F25) | create and read merchant sessions | create checkouts in Link in Bio's name | `merchant rotate-key` (Chain Payments) |
+| Provider and bank keys (off today) | api, worker; feeds worker only (files) | take payments, read accounts | depends on the provider (a Revolut token with payment scope could pay out) | each provider's dashboard; the console reads none (F25) |
+| Database passwords (`link_in_bio_api`, `_admin`, `_worker`, `_jobs`) | one per process kind (Secret env) | that process's grants on `lib` (F25) | that process's rows; never an audit-log rewrite | `new-service-db-secret.sh --force` |
 
 ### Database actor matrix (DB lens)
 
 | Actor / asset | Power | Bounded by |
 | --- | --- | --- |
-| page server (`link_in_bio_pages`) | SELECT on the four `public.*_v1` views only | read-only role (no grant on `lib`, provisioner); `Access::ReadOnly` sets `default_transaction_read_only` per connection; no role test here (F25) |
-| api, admin, worker, account Job (`link_in_bio_app`) | DML on every `lib` table | one shared writer (F25); no DDL, no TRUNCATE |
+| page server (`link_in_bio_pages`) | SELECT on the four `public.*_v1` views only | read-only role (no grant on `lib`, provisioner); `Access::ReadOnly` sets `default_transaction_read_only` per connection; `the_pages_role_reads_only_the_public_views_and_writes_nothing` (F25) |
+| api, admin, worker, account Job (`link_in_bio_api`, `_admin`, `_worker`, `_jobs`) | the DML each needs on `lib` (`docs/HOSTED.md` "Database roles per process") | one role per process kind with `read_only_tables`; audit log insert-only, pruned only through `lib.prune_audit_log`; no DDL, no TRUNCATE (`a_writer_cannot_rewrite_the_audit_log_or_change_the_schema`, F25) |
 | migrate Job (`link_in_bio_migrate`) | schema | runs before rollout; embedded, checksummed migrations |
 | Request author | values in queries; page sizes | bound parameters only; fixed `LIMIT`s (admin lists 100–500, audit 200); `statement_timeout` |
 | Another service on the tier | connections, locks | per-role connection limits; its own database |
@@ -609,7 +611,7 @@ deployment must provide.
 
 ### F25 — One writer role and the full key set for processes that need less
 
-**Severity:** Low   **Disposition:** DEFERRED (FU-0138)
+**Severity:** Low   **Disposition:** RESOLVED (FU-0138)
 **Where:** `services.conf` (`writer link_in_bio link_in_bio_app schema=lib`, used by api, admin, worker and the account Job);
 `hosted/mod.rs::App::new` (every role builds every enabled provider and reads its key files, and the Web Risk key);
 `admin-deployment.yaml` (mounts the Chain Payments merchant key).
@@ -619,26 +621,40 @@ never calls a provider (grants, statements and refunds go through the store) and
 those keys. No test proves what the read-only role cannot do.
 **Impact:** A compromised API pod could grant itself paid time or rewrite audit history; a compromised console pod holds
 keys it does not use (with Revolut on, the worker's token and key are separate files, so the console would not hold them).
-**Remediation / evidence:** tracked in FU-0138: roles per process kind (api, console, worker; the account Job on the
-console's role) with grants per table, the audit log insert-only for the application roles; role tests in `crates/store`
-(write as the pages role, DDL as a writer, delete from the audit log); a role-aware `hosted_env` that leaves the console
-without provider and Web Risk key files while it still shows which providers are on.
+**Remediation / evidence:**
+
+- One writer role per process kind (`link_in_bio_api`, `link_in_bio_admin`, `link_in_bio_worker`, `link_in_bio_jobs`),
+  each with `insert_only_tables=audit_log` and `read_only_tables` for the tables it never writes. The table-by-process
+  matrix is read from the store calls each process makes and kept in `docs/HOSTED.md` "Database roles per process"; the
+  roles, their Secrets and the Deployments are the platform's (workspace `services.conf`).
+- The worker's two-year retention no longer needs DELETE on the audit log: `lib.prune_audit_log` (schema 5,
+  `SECURITY DEFINER` as the owner) removes only entries older than two years, whatever it is asked.
+- Tests on the real engine with the provisioner's grants: `the_pages_role_reads_only_the_public_views_and_writes_nothing`
+  (no read of `lib`, no write, no DDL, no temporary table) and `a_writer_cannot_rewrite_the_audit_log_or_change_the_schema`
+  (no UPDATE, DELETE or TRUNCATE of the audit log, no DDL in `lib` or `public`; retention through the function keeps the
+  last two years).
+- `serve --mode admin` reads no `*_FILE` setting and builds no provider and no screener; its Overview shows the switches
+  from the configuration (`the_console_starts_without_any_key_and_shows_the_switches`).
 
 ### F26 — A partial refund takes back every month, once per partial refund
 
-**Severity:** Low   **Disposition:** DEFERRED (FU-0139, OQ1)
+**Severity:** Low   **Disposition:** RESOLVED (FU-0139, OQ1)
 **Where:** `square.rs` (`refund.*` → `Outcome::Refunded`, `months: None`), `paddle.rs` (`adjustment.*` refunds),
 `hosted/internal.rs::apply_event` (`months = e.months.unwrap_or(c.months)`).
 **Issue:** Any completed refund event, whatever its amount, takes back all the checkout's months; two partial refunds of one
 purchase take back twice. The period never goes below now.
 **Impact:** Refunds are the operator's act in the provider's dashboard, so this hurts only the account holder of a refunded
 purchase; the providers are off today.
-**Remediation / evidence:** a rule is a decision (OQ1): pro rata by amount (rounded down), only full refunds, or a manual
-adjustment in the console. Tracked in FU-0139.
+**Remediation / evidence:** built as OQ1's first option, pro rata by amount, rounded down. `Store::refund_purchase` takes back
+`floor(months × refunded ÷ paid)` on the running total of the purchase's refunds, under the checkout's row lock, so the
+refunds of one purchase never take back more than it bought and add up to every month once the whole amount is refunded;
+a refund of a checkout never paid takes nothing; a GoCardless failure or chargeback takes the whole purchase. Tests:
+`refunds_take_months_back_pro_rata_and_never_more_than_bought` (store), `refunds_give_back_months_pro_rata_rounded_down`
+(billing) and the hosted Square case below.
 
 ### F27 — Notifications are applied without comparing the paid amount with the checkout
 
-**Severity:** Low   **Disposition:** DEFERRED (FU-0140)
+**Severity:** Low   **Disposition:** RESOLVED (FU-0140)
 **Where:** `hosted/internal.rs::apply_event` (months and amount come from the checkout); `square.rs` (the event's
 `amount_money` kept as evidence only); `paddle.rs` (totals kept, quantity not read).
 **Issue:** A paid notification credits the checkout's months whatever the notification says was paid. That is safe only while
@@ -651,9 +667,17 @@ for the same months. Latent: the card providers are off.
 `price_id`, GoCardless the payment request amount) to match the checkout, and record a mismatch as `short` in the audit log
 without applying it. Tracked in FU-0140, with conformance tests per adapter.
 
+Done: `ProviderEvent` carries what was paid (`Paid`: minor units and currency, and for Paddle the price id and quantity),
+filled by the Square, GoCardless and Paddle adapters. `apply_event` applies a payment only when it covers the checkout
+(Square and GoCardless at least its GBP amount; Paddle exactly its months of `PADDLE_PRICE_ID`); otherwise the checkout
+stays open, the audit log records it once (`payment-not-covering`) and `link_in_bio_payment_mismatches_total` counts it.
+Chain Payments, Open Payments and bank transfers already check the amount themselves. Tests:
+`a_payment_counts_only_when_it_covers_the_checkout` (billing: short, another currency, fewer months and another price
+refused) and `card_payments_apply_only_when_they_cover_the_checkout_and_refunds_take_months_pro_rata` (hosted).
+
 ### F28 — One account can spend the shared Web Risk budget
 
-**Severity:** Low   **Disposition:** DEFERRED (FU-0141, OQ2)
+**Severity:** Low   **Disposition:** RESOLVED (FU-0141, OQ2)
 **Where:** `hosted/app.rs::page_publish` (every unscreened link of up to 60 is screened); `safety::Screener::screen` (the
 monthly cap is global).
 **Issue:** Each publish with 60 new URLs spends 60 calls. At the ingress limit one account could spend the 90 000 monthly calls in
@@ -663,9 +687,13 @@ lists only); no money is spent (the cap is hard). Latent: no Web Risk key and no
 **Remediation / evidence:** a per-account daily budget of Web Risk calls (the number is OQ2), with links beyond it recorded
 as unknown and rescreened by the worker. Tracked in FU-0141.
 
+Done: `WEB_RISK_ACCOUNT_DAILY_CAP` (default 200, `0` for none) is taken from `lib.counters` per account and UTC day before
+each Web Risk call a publish makes; past it the link is recorded as unknown, shown, and screened again by the worker within
+the hour under the monthly cap. Test: `one_account_cannot_spend_everyones_screening` (hosted).
+
 ### F29 — Pictures are keyed by their hash across accounts
 
-**Severity:** Low   **Disposition:** DEFERRED (FU-0142)
+**Severity:** Low   **Disposition:** RESOLVED (FU-0142)
 **Where:** `lib.assets` (`sha256` primary key); `store::put_asset` (`ON CONFLICT (sha256) DO NOTHING`); `owns_asset`.
 **Issue:** When a second account uploads a picture whose re-encoded bytes equal one already stored, the row keeps the first
 owner and the second account cannot use the picture ("Upload the picture first"). Whoever can predict another person's
@@ -674,6 +702,11 @@ re-encoded picture (a public logo) could upload it first.
 **Remediation / evidence:** key the table by `(account_id, sha256)` in a new migration (expand: add the unique pair and change
 `put_asset`'s conflict target in one release; contract: drop the old key in the next, so the running release keeps working),
 with a store test that two accounts can each use the same picture. Tracked in FU-0142.
+
+Done in one step rather than expand-then-contract: schema 5 makes `(sha256, account_id)` the primary key and `put_asset`
+names it. While the rollout runs, an upload on a pod of the previous release fails until that pod is replaced; reading by
+hash keeps working (identical bytes). Test: `two_accounts_can_each_use_the_same_picture` (each owns and counts its copy;
+deleting one account keeps the other's).
 
 ### F30 — `CF-IPCountry` is trusted as tax evidence
 
@@ -738,16 +771,16 @@ nothing by themselves (an operator decides).
 | I11 | Invites are issued only by the operator and redeemed once | admin routes only; `create_account` (`FOR UPDATE`, unique `redeemed_by`) | `accounts_invites_and_handles` | HOLDS |
 | I12 | A provider event changes a paid period at most once | unique `(provider, provider_event)`; shared `paid:<ref>` key | `billing_periods_are_idempotent`; conformance suite | HOLDS |
 | I13 | Only an authentic notification is applied | each adapter's `verify_notification` | `crates/billing/tests/conformance.rs` (tampered and stale refused) | HOLDS |
-| I14 | A notification credits only what was paid | — | — | GAP (F27) |
-| I15 | Refunds take back what was refunded | `apply_event` (all months) | — | GAP (F26) |
+| I14 | A notification credits only what was paid | `apply_event` with `ProviderEvent::paid` (F27) | `a_payment_counts_only_when_it_covers_the_checkout`, `card_payments_apply_only_when_they_cover_the_checkout_and_refunds_take_months_pro_rata` | HOLDS |
+| I15 | Refunds take back what was refunded | `Store::refund_purchase` (pro rata on the running total, F26) | `refunds_take_months_back_pro_rata_and_never_more_than_bought`, `refunds_give_back_months_pro_rata_rounded_down` | HOLDS |
 | I16 | Every outbound URL a buyer controls reaches only public addresses | `OpenPayments::checked` + `PublicOnly` resolver | `only_public_addresses`, `the_resolver_refuses_names_of_private_addresses_at_connect_time` | HOLDS (F5) |
 | I17 | Requests and upstream answers are bounded in size, time and number | body limits; `bounded`; `read_limited`; decode limits | `bounds_tests::*`, `answers_are_read_up_to_a_limit`, `pictures_too_large_to_decode_safely_are_refused_before_decoding` | HOLDS (F1, F2, F4) |
-| I18 | The page server reads only public views and holds no key | read-only role and `Access::ReadOnly`; `hosted_env` | `the_page_server_never_reads_a_secret_file`, `…_payment_providers` | HOLDS (role grants code-only: F25) |
-| I19 | Least privilege between the writer processes | — | — | GAP (F25) |
+| I18 | The page server reads only public views and holds no key | read-only role and `Access::ReadOnly`; `hosted_env` | `the_page_server_never_reads_a_secret_file`, `…_payment_providers`, `the_pages_role_reads_only_the_public_views_and_writes_nothing` | HOLDS |
+| I19 | Least privilege between the writer processes | a role per process kind; audit log insert-only, pruned through `lib.prune_audit_log`; the console holds no key (F25) | `a_writer_cannot_rewrite_the_audit_log_or_change_the_schema`, `the_console_starts_without_any_key_and_shows_the_switches` | HOLDS (per-table `read_only_tables` grants: provisioner, matrix in `docs/HOSTED.md`) |
 | I20 | Values are bound parameters; no string-built SQL with values | `store` | inspection | HOLDS (code-only) |
 | I21 | Database transport is `verify-full` only (or an explicit local switch); secrets never in `Debug` or errors | `DatabaseSettings::parse` | config tests incl. `the_password_never_appears_in_debug_or_errors` | HOLDS |
 | I22 | Reserved and look-alike handles cannot be taken | `check_handle`, `looks_reserved`, unique `handle_skeleton` | `skeletons`; store handle test | HOLDS |
-| I23 | The screening budget never passes its monthly cap | `take_from_counter` | `crates/safety/tests/screen.rs` | HOLDS (per-account share: F28) |
+| I23 | The screening budget never passes its monthly cap | `take_from_counter`, monthly and per account per day (F28) | `crates/safety/tests/screen.rs`, `one_account_cannot_spend_everyones_screening` | HOLDS |
 | I24 | No panic on attacker input; no `unsafe` | `forbid(unsafe_code)`; no `unwrap` on request paths (OS RNG only); `overflow-checks`, `panic = "abort"` | clippy; parser property tests | HOLDS (code-only for the handlers) |
 
 ## Section B — Supply-chain, publish-authority & capability matrix
@@ -816,8 +849,8 @@ sign-in message.
 | Session tokens | 256-bit opaque, SHA-256 at rest | browser; `lib.sessions` | the account holder | 14 d idle / 60 d · per sign-in | delete the account's sessions (suspend, or SQL) |
 | Recovery codes | 80-bit, SHA-256 at rest | the person; `lib.recovery_codes` | the person | on replacement · per account | replace in the app |
 | Invite codes | 80-bit, SHA-256 (holder codes readable) | `lib.invites` | operator; the holder | expiry 1–365 d | revoke in the console |
-| Chain Payments merchant key | opaque bearer | Secret, mounted 0440 | api, admin, worker (F25) | on suspicion · 2026-11-17 | `merchant rotate-key` |
-| Provider, bank, Web Risk, ThreatFox keys | per provider | Secrets, files (off today) | the roles that load them (F25) | on suspicion · not yet issued | revoke at the provider, re-issue |
+| Chain Payments merchant key | opaque bearer | Secret, mounted 0440 | api, worker (F25) | on suspicion · 2026-11-17 | `merchant rotate-key` |
+| Provider, bank, Web Risk, ThreatFox keys | per provider | Secrets, files (off today) | api and worker; feeds and ThreatFox the worker only; never the console or the page server (F25) | on suspicion · not yet issued | revoke at the provider, re-issue |
 | Open Payments client key | ed25519 (PKCS #8) | Secret, file (off today) | api, worker | on suspicion | remove from the wallet's `jwks.json`, re-issue |
 | DB passwords | password | Secrets (env from `secretKeyRef`) | the pods using them | on suspicion · 2026-11-17 | `new-service-db-secret.sh --force` |
 
@@ -846,21 +879,22 @@ sign-in message.
 | Role | Process | Database | Schema | Tables | Limits | Evidence (test) |
 | --- | --- | --- | --- | --- | --- | --- |
 | `link_in_bio_migrate` | migrate Job | owner | owner of `lib`, `public` | DDL + DML | 2 conn, 60 s | provisioner (platform); none here |
-| `link_in_bio_app` | api, admin, worker, account Job | CONNECT | USAGE `lib` | SELECT/INSERT/UPDATE/DELETE, no TRUNCATE, no DDL | 20 conn (api 2×4 + admin 4 + worker 4 + Job 1 = 17), 10 s, 30 s idle | provisioner; **no role test here** (F25) |
-| `link_in_bio_pages` | page server | CONNECT | `public` only | SELECT on the `*_v1` views; read-only default | 18 conn (2×8), 5 s, 5 s idle | provisioner; **no role test here** (F25) |
+| `link_in_bio_api`, `link_in_bio_admin`, `link_in_bio_worker`, `link_in_bio_jobs` | api, console, worker, account Job | CONNECT | USAGE `lib` | the DML each needs (`docs/HOSTED.md` "Database roles per process"), the rest `read_only_tables`; `audit_log` insert-only; no TRUNCATE, no DDL | 8, 4, 4 and 2 conn (api 2×4, console 4, worker 4, Job 1), 10 s, 30 s idle | provisioner; `a_writer_cannot_rewrite_the_audit_log_or_change_the_schema` (F25) |
+| `link_in_bio_pages` | page server | CONNECT | `public` only | SELECT on the `*_v1` views; read-only default | 18 conn (2×8), 5 s, 5 s idle | provisioner; `the_pages_role_reads_only_the_public_views_and_writes_nothing` (F25) |
 
 ### B.DB-2 Schema change process
 
 - A change is a new numbered file in `crates/store/migrations/`, embedded by `sqlx::migrate!` and checksummed; an edited
   released file is refused at start, and a newer schema than the build is an unknown applied version that `migrate` refuses.
 - The `migrate` Job runs as the owner before the workloads roll (`apply.sh`); `0002`–`0004` only added tables and columns
-  (expand only), so the previous release kept working during each rollout.
+  (expand only), so the previous release kept working during each rollout. `0005` changes the primary key of
+  `lib.assets` in one step (F29): during that rollout only an upload on a pod of the previous release fails.
 - Queries are runtime-checked, so the store and hosted tests on the real engine are the compatibility proof; a view change
   for the page server needs a new `_v2` view (the `_v1` name is the contract).
 
 ## Section C — Test-coverage & hermetic/live split
 
-### C.1 Coverage grade — B+ (127/127 on stable against PostgreSQL over TLS)
+### C.1 Coverage grade — B+ (137 tests on stable, 25 of them against PostgreSQL over TLS)
 
 | Dimension | Assessment |
 | --- | --- |
@@ -871,7 +905,8 @@ sign-in message.
 
 Not covered by tests:
 
-- the role grants (F25);
+- each writer role's per-table `read_only_tables` grants (the provisioner's; the matrix in `docs/HOSTED.md` is read from
+  the code, and the role tests cover the page server and the audit log);
 - the Keto-down path (code-only, `503`);
 - concurrency between the API and the worker applying the same event (the unique key makes it safe; no race test);
 - the image, probes and headers in a running container (CI's smoke test, not run here).
@@ -907,16 +942,16 @@ Not covered by tests:
 - [x] verify-full TLS; credentials only from Secrets; nothing secret in logs (F21)
 - [x] B.AUTH-1 and B.AUTH-2 inventories complete; cookie flags and CSRF tested (F15)
 - [x] public responses only from public views (I18); readiness fails and liveness stays up on database loss
-- [ ] one role per process, least privilege proven by tests (F25, FU-0138)
+- [x] one role per process, least privilege proven by tests (F25, FU-0138)
 - [x] deployment references the image by digest from `config/images.yaml`
 - [x] `SECURITY.md` present and consistent (F12)
 
 ### pre-mainnet (before third-party pages and live payments)
 
-- [ ] notification amounts compared with the checkout (F27, FU-0140)
-- [ ] the partial-refund rule decided and built (F26, OQ1, FU-0139)
-- [ ] a per-account screening budget (F28, OQ2, FU-0141)
-- [ ] pictures keyed per account (F29, FU-0142)
+- [x] notification amounts compared with the checkout (F27, FU-0140)
+- [x] the partial-refund rule built (F26, OQ1: pro rata, FU-0139)
+- [x] a per-account screening budget (F28, OQ2, FU-0141)
+- [x] pictures keyed per account (F29, FU-0142)
 - [ ] sandbox runs of every provider and feed that will be switched on (FU-0118, FU-0119)
 - [ ] database in the backup set with an offsite copy; a dated restore drill (DB-M9)
 - [x] personal-data inventory and deletion path written (`docs/HOSTED.md` Data and Erasure; `DELETE /api/v1/me`)
@@ -980,9 +1015,10 @@ Not covered by tests:
 ## Open questions (`OQ#`)
 
 - **OQ1** — How should a partial refund change the paid period: pro rata by amount (rounded down), only full refunds take
-  months back, or a console adjustment by hand? (F26, FU-0139)
+  months back, or a console adjustment by hand? (F26, FU-0139) Built: pro rata, rounded down, on the running total.
 - **OQ2** — How many Web Risk calls may one account spend a day (for example 200), and what happens beyond it (links
-  recorded as unknown and rescreened by the worker, or the publish refused)? (F28, FU-0141)
+  recorded as unknown and rescreened by the worker, or the publish refused)? (F28, FU-0141) Built: 200 by default
+  (`WEB_RISK_ACCOUNT_DAILY_CAP`), links beyond it recorded as unknown and rescreened by the worker.
 
 ## Risks (residual)
 

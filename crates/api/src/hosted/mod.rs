@@ -34,7 +34,7 @@ use link_in_bio_billing::{BillingProvider, Router as Billing, RouterConfig};
 use link_in_bio_safety::{Screener, WebRisk};
 use link_in_bio_store::Store;
 
-pub use config::{HostedConfig, SignupMode};
+pub use config::{HostedConfig, Keys, SignupMode};
 pub use error::{ApiError, ApiResult};
 
 pub struct App {
@@ -66,7 +66,10 @@ impl App {
         let passkeys =
             Passkeys::new(&config.app_host, &config.app_origin, &config.product_name).map_err(|e| e.to_string())?;
         let mut providers: Vec<Box<dyn BillingProvider>> = vec![Box::new(link_in_bio_billing::manual::Manual)];
-        if let Some(cp) = &config.chain_payments {
+        // A process without keys (the console, the page server) builds no provider and no screener: it reads no key
+        // file, and shows the switches from the configuration.
+        let keys = config.keys == config::Keys::Read;
+        if let Some(cp) = config.chain_payments.as_ref().filter(|_| keys) {
             let key = read_secret(&cp.api_key_file)?;
             let p = ChainPayments::new(
                 chain_payments::Config {
@@ -83,7 +86,7 @@ impl App {
             providers.push(Box::new(p));
         }
         let file = |f: &str| read_secret(f);
-        if let Some(c) = &config.square {
+        if let Some(c) = config.square.as_ref().filter(|_| keys) {
             providers.push(Box::new(link_in_bio_billing::square::Square::new(
                 link_in_bio_billing::square::Config {
                     api_base: c.api_base.clone(),
@@ -97,7 +100,7 @@ impl App {
                 link_in_bio_billing::http_client(),
             )));
         }
-        if let Some(c) = &config.gocardless {
+        if let Some(c) = config.gocardless.as_ref().filter(|_| keys) {
             providers.push(Box::new(link_in_bio_billing::gocardless::GoCardless::new(
                 link_in_bio_billing::gocardless::Config {
                     api_base: c.api_base.clone(),
@@ -109,7 +112,7 @@ impl App {
                 link_in_bio_billing::http_client(),
             )));
         }
-        if let Some(c) = &config.paddle {
+        if let Some(c) = config.paddle.as_ref().filter(|_| keys) {
             providers.push(Box::new(link_in_bio_billing::paddle::Paddle::new(
                 link_in_bio_billing::paddle::Config {
                     api_base: c.api_base.clone(),
@@ -132,7 +135,7 @@ impl App {
             ));
         }
         let mut open_payments = None;
-        if let Some(c) = &config.open_payments {
+        if let Some(c) = config.open_payments.as_ref().filter(|_| keys) {
             let p = Arc::new(
                 link_in_bio_billing::open_payments::OpenPayments::new(
                     link_in_bio_billing::open_payments::Config {
@@ -159,11 +162,12 @@ impl App {
             providers,
         );
         let web_risk = match &config.web_risk_key_file {
-            Some(f) if config.web_risk_monthly_cap > 0 => {
+            Some(f) if keys && config.web_risk_monthly_cap > 0 => {
                 Some(WebRisk::new(read_secret(f)?, config.web_risk_monthly_cap))
             }
             _ => None,
         };
+        let account_daily_cap = config.web_risk_account_daily_cap;
         let access = config.access.as_ref().map(|a| {
             access::Admins::new(access::AccessConfig {
                 issuer: a.team_domain.clone(),
@@ -178,7 +182,7 @@ impl App {
             config,
             billing,
             passkeys,
-            screener: Screener { web_risk },
+            screener: Screener { web_risk, account_daily_cap },
             metrics: metrics::Metrics::default(),
             pages: pages::PageCache::new(page_cache),
             access,

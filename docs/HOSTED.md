@@ -11,7 +11,7 @@ part trusts.
 | `link-in-bio migrate` | applies the schema, then exits | owner (DDL) | none |
 | `link-in-bio serve --mode pages` | every tenant host: `<handle>.<PAGES_DOMAIN>`, and verified custom domains when they are on. It takes no payment and reads no key: `BILLING_PROVIDERS` counts as `manual`, `BANK_FEEDS` as empty and every `*_FILE` setting as unset | read-only (it can read only the `public.*_v1` views) | 8080 |
 | `link-in-bio serve --mode app` | the account API on `APP_HOST` (`/api/v1/…`, the page assets under `/_/`), plus the internal port (provider notifications, `/metrics`) | writer (schema `lib`) | 8080 and `INTERNAL_LISTEN_ADDR` (8081) |
-| `link-in-bio serve --mode admin` | the operator console's API (`/api/v1/admin/…`) behind Cloudflare Access and the `LinkInBio:admin#member` Keto role | writer | 8080 |
+| `link-in-bio serve --mode admin` | the operator console's API (`/api/v1/admin/…`) behind Cloudflare Access and the `LinkInBio:admin#member` Keto role. It holds no key: it shows which providers, feeds and Web Risk are on from the configuration, but no `*_FILE` setting is required or read, and it builds no provider and no screener | writer | 8080 |
 | `link-in-bio worker` | its own `/metrics` and `/healthz`; one process at a time holds an advisory lock and does the scheduled duties | writer | `WORKER_LISTEN_ADDR` (8081) |
 | `link-in-bio account create --handle h --wallet 0x… --terms-version v` | creates one of the operator's own accounts while sign-up is closed (free, served while third-party pages are off; signs in with that Sui wallet) | writer | none |
 | `link-in-bio bank-feed revolut-token --code c --out f` | exchanges the code from Revolut Business's consent page for a refresh token and writes it to a new file (mode 0600) for `REVOLUT_REFRESH_TOKEN_FILE`; the token is never printed | none | none |
@@ -39,6 +39,7 @@ in the environment. Every switch starts at its safest value, and each one can on
 | `CUSTOM_HOSTNAME_CAP` | `0` | custom domains allowed in total; `0` means off, with a hard stop at 100 |
 | `WEB_RISK_KEY_FILE` | unset | Google Web Risk API key; without it, screening uses the built-in checks and the lists only |
 | `WEB_RISK_MONTHLY_CAP` | `90000` | a hard cap on Web Risk calls per month, counted across every process (at most 100 000, the free tier) |
+| `WEB_RISK_ACCOUNT_DAILY_CAP` | `200` | Web Risk calls one account's publishes may spend in a day (UTC), counted in `lib.counters`; `0` means no per-account limit. Past it, a link is recorded as unknown (shown, not yet checked by Web Risk) and the worker screens it again within the hour under the monthly cap |
 | `THREATFOX_KEY_FILE` | unset | abuse.ch Auth-Key; when set, the worker syncs the last 7 days of ThreatFox indicators every 6 hours |
 | `FEDERATION` | `on` | WebFinger, the read-only ActivityPub actor and NIP-05 on tenant pages |
 | `SUI_NETWORK` | `testnet` | the chain id in the wallet sign-in message (`sui:<network>`) |
@@ -93,6 +94,16 @@ in the environment. Every switch starts at its safest value, and each one can on
   minimum is `ceil(fixed fee × 1.25 / (3 % × price))`, so its fixed fee stays at most 3 % of a month.
 - **The ledger.** Every change to a paid period (purchase, grant, refund) is one row per provider event, applied once.
   A payment seen both by notification and by the worker's reconciliation extends the period once.
+- **What was paid must cover the checkout.** Before a Square, GoCardless or Paddle payment is applied, what the provider
+  says was paid is compared with the checkout: for Square and GoCardless at least its amount in GBP; for Paddle exactly
+  its months of `PADDLE_PRICE_ID` (the buyer's currency varies). A payment that does not cover its checkout is not
+  applied: the checkout stays open, the console's audit log records it once (`payment-not-covering`) and the metric
+  `link_in_bio_payment_mismatches_total` counts it. Chain Payments, Open Payments and bank transfers check the amount
+  themselves.
+- **Refunds take months back pro rata.** A refund takes back `floor(months × refunded ÷ paid)` months, counted on the
+  running total of the purchase's refunds: the refunds of one purchase never take back more than it bought, and partial
+  refunds that add up to the whole amount take back every month. A failed or charged-back payment (GoCardless) takes
+  back the whole purchase. A refund of a checkout that was never paid is recorded and takes nothing.
 - **Card and bank providers.** Square (UK cards), GoCardless (UK bank payments over Open Banking), and Paddle (merchant
   of record, so offered anywhere) each send the buyer to the provider's hosted page. The app loads no provider script.
   Their signed notifications arrive at `/api/v1/webhooks/<provider>` on the app host.
@@ -171,6 +182,71 @@ in the environment. Every switch starts at its safest value, and each one can on
   page versions, and empties its page. The row stays as `deleted`, so the handle is never reissued, and the billing
   records stay as the law requires.
 - **Export.** `GET /api/v1/me/export` returns everything else stored about the account.
+
+## Database roles per process
+
+What each process does to each `lib` table, read from the store calls it makes (`crates/store/src/lib.rs` and its
+callers). S = SELECT, I = INSERT, U = UPDATE, D = DELETE; "—" means it never touches the table. Every role also needs
+`USAGE` on `lib.audit_log_id_seq` (the audit log's id) and may execute `lib.prune_audit_log` (schema 5; it runs as the
+schema owner and removes nothing younger than two years). The page server's role reads only the `public.*_v1` views.
+The migrate Job runs as the owner.
+
+| Table | api (`serve --mode app`) | admin (console) | worker | jobs (`account create`, `account add-wallet`) |
+| --- | --- | --- | --- | --- |
+| `accounts` | S I U | S U | S U | S I U |
+| `passkeys` | S I U D | — | — | — |
+| `wallets` | S I D | — | — | S I |
+| `recovery_codes` | S I U D | — | — | — |
+| `sessions` | S I U D | S D | S D | — |
+| `challenges` | S I D | — | S D | — |
+| `pages` | S I U | S | S | I |
+| `page_versions` | S I D | S | S D | — |
+| `assets` | S I D | S | S D | — |
+| `selections` | — | S I D | — | — |
+| `invites` | S U | S I U | S D | — |
+| `checkouts` | S I U | S U | S U | — |
+| `billing_events` | S I U | S I U | S I U | — |
+| `refund_requests` | S I | S U | — | — |
+| `open_payments_grants` | S I U | — | — | — |
+| `domains` | S I D | S | S U | — |
+| `reports` | S I | S U | S D | — |
+| `appeals` | S I | S U | S D | — |
+| `audit_log` | S I | S I | S I | I |
+| `link_screens` | S I U | S I U | S I U D | — |
+| `blocklist` | S | S I U D | S | — |
+| `threat_iocs` | S | — | S I D | — |
+| `counters` | S I U | — | S I U D | — |
+| `bank_feeds` | — | S | S I U | — |
+
+**The audit log is insert-only for every process** (`insert_only_tables=audit_log`): no process updates or deletes it,
+and the worker's two-year retention goes through `lib.prune_audit_log`.
+
+**Tables each process may have read-only** (`read_only_tables`, SELECT only), without breaking it:
+
+- **api:** `selections`, `blocklist`, `threat_iocs`, `bank_feeds`.
+- **admin:** `passkeys`, `wallets`, `recovery_codes`, `challenges`, `pages`, `page_versions`, `assets`,
+  `open_payments_grants`, `domains`, `threat_iocs`, `counters`, `bank_feeds`.
+- **worker:** `passkeys`, `wallets`, `recovery_codes`, `pages`, `selections`, `refund_requests`, `open_payments_grants`,
+  `blocklist`.
+- **jobs:** every table but `accounts`, `pages`, `wallets` and `audit_log`: `passkeys`, `recovery_codes`, `sessions`,
+  `challenges`, `page_versions`, `assets`, `selections`, `invites`, `checkouts`, `billing_events`, `refund_requests`,
+  `open_payments_grants`, `domains`, `reports`, `appeals`, `link_screens`, `blocklist`, `threat_iocs`, `counters`,
+  `bank_feeds`.
+
+**Writes made only for a narrow reason** (a finer grant than the table would need a column grant or a function):
+
+- **api:** `accounts` U only for the declared country, erasure (`status = 'deleted'`) and `paid_until` through the ledger;
+  `invites` U only to mark a code redeemed at sign-up; `checkouts` U only to mark one paid or expired (and its row lock
+  for refunds, which needs U); `billing_events` U only `paid_until_after` of the row it just inserted.
+- **admin:** `accounts` U for flags, suspension and `paid_until` (operator grants, bank statements); `sessions` D only to
+  end a suspended account's sessions; `checkouts` and `billing_events` U only when an imported statement pays a checkout or
+  a refund is recorded.
+- **worker:** `sessions`, `challenges`, `invites`, `reports`, `appeals`, `page_versions`, `assets` and `counters` D only for
+  expiry and retention; `accounts` U only to lift suspensions whose time is up and for `paid_until` through the ledger.
+- **jobs:** `accounts` I and U only to create the operator's own accounts and set their flags.
+
+No process needs more than table-level grants: the row locks taken (`FOR UPDATE` on `checkouts`, `invites` and
+`refund_requests`) are on tables where the process already has U.
 
 ## API
 

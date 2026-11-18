@@ -365,3 +365,254 @@ async fn selections_reports_appeals_and_housekeeping() {
     assert!(s.view_page("alice").await.unwrap().unwrap().published.is_none());
     assert!(!s.handle_available("alice", "allce").await.unwrap(), "a deleted handle is not reissued");
 }
+
+#[tokio::test]
+async fn two_accounts_can_each_use_the_same_picture() {
+    let Some(s) = store().await else { return };
+    let now = OffsetDateTime::now_utc();
+    let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
+    let b = s.create_account(&new("bob", "bob", "ref-bob-00000000001", None), now).await.unwrap();
+    let pic = link_in_bio_store::AssetRow {
+        sha256: "ab".repeat(32),
+        mime: "image/png".into(),
+        ext: "png".into(),
+        width: 400,
+        height: 400,
+        bytes: vec![1, 2, 3],
+    };
+    s.put_asset(a.id, &pic).await.unwrap();
+    s.put_asset(b.id, &pic).await.unwrap();
+    s.put_asset(b.id, &pic).await.unwrap();
+    assert!(s.owns_asset(a.id, &pic.sha256).await.unwrap());
+    assert!(s.owns_asset(b.id, &pic.sha256).await.unwrap(), "the second account owns its own copy");
+    assert_eq!(s.asset_bytes(b.id).await.unwrap(), 3, "counted once for each account");
+    assert_eq!(s.view_asset(&pic.sha256).await.unwrap().unwrap().bytes, vec![1, 2, 3]);
+    // Deleting one account leaves the other's copy.
+    s.delete_account(a.id, now).await.unwrap();
+    assert!(s.owns_asset(b.id, &pic.sha256).await.unwrap());
+    assert!(s.view_asset(&pic.sha256).await.unwrap().is_some());
+}
+
+fn months_refunded(months: u32, paid: u64, refunded: u64) -> u32 {
+    if paid == 0 || refunded >= paid {
+        months
+    } else {
+        (u128::from(months) * u128::from(refunded) / u128::from(paid)) as u32
+    }
+}
+
+#[tokio::test]
+async fn refunds_take_months_back_pro_rata_and_never_more_than_bought() {
+    let Some(s) = store().await else { return };
+    let now = time::macros::datetime!(2026-11-18 12:00 UTC);
+    let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
+    let paid_checkout = |id: uuid::Uuid, status: &str| link_in_bio_store::Checkout {
+        id,
+        account_id: a.id,
+        provider: "square".into(),
+        provider_ref: format!("ORD-{}", id.simple()),
+        method: "square:card".into(),
+        months: 12,
+        amount_pence: 3600,
+        status: status.into(),
+        country_declared: None,
+        country_request: None,
+        created_at: now,
+        completed_at: None,
+    };
+    let c = uuid::Uuid::new_v4();
+    s.create_checkout(&paid_checkout(c, "open")).await.unwrap();
+    s.change_period(
+        &PeriodChange {
+            account_id: a.id,
+            provider: "square",
+            provider_event: "paid:x",
+            kind: "purchase",
+            months: 12,
+            amount_pence: 3600,
+            evidence: json!({}),
+            checkout: Some(c),
+        },
+        now,
+    )
+    .await
+    .unwrap();
+    let refund = |event: &'static str, minor: u64| link_in_bio_store::RefundChange {
+        account_id: a.id,
+        provider: "square",
+        provider_event: event,
+        checkout: c,
+        months: 12,
+        paid_minor: 3600,
+        refunded_minor: minor,
+        amount_pence: 3600,
+        evidence: json!({}),
+    };
+    let r1 = s.refund_purchase(&refund("refund:1", 1000), months_refunded, now).await.unwrap().unwrap();
+    assert_eq!(r1.months_taken, 3, "1000 of 3600 is 3.33 months: 3");
+    assert!(s.refund_purchase(&refund("refund:1", 1000), months_refunded, now).await.unwrap().is_none(), "once");
+    let r2 = s.refund_purchase(&refund("refund:2", 2600), months_refunded, now).await.unwrap().unwrap();
+    assert_eq!(r2.months_taken, 9, "together the whole amount: the other 9");
+    let r3 = s.refund_purchase(&refund("refund:3", 100), months_refunded, now).await.unwrap().unwrap();
+    assert_eq!(r3.months_taken, 0, "never more than the purchase bought");
+    let events = s.billing_events(a.id).await.unwrap();
+    let refunds: Vec<_> = events.iter().filter(|e| e.kind == "refund").collect();
+    assert_eq!(refunds.iter().map(|e| -e.months).sum::<i32>(), 12);
+    assert_eq!(refunds.iter().map(|e| -e.amount_pence).sum::<i64>(), 1000 + 2600 + 100);
+    assert_eq!(s.account(a.id).await.unwrap().unwrap().paid_until, Some(now), "back to now, not before");
+
+    // A checkout that was never paid gives nothing back.
+    let open = uuid::Uuid::new_v4();
+    s.create_checkout(&paid_checkout(open, "open")).await.unwrap();
+    let r = s
+        .refund_purchase(
+            &link_in_bio_store::RefundChange { checkout: open, ..refund("refund:open", 3600) },
+            months_refunded,
+            now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.months_taken, 0);
+}
+
+// ── Roles: the grants the database tier gives each process, set up here as the provisioner does ─────────────────
+
+/// A fresh database with the schema, the superuser's URL for it, and a pool on it as `role` (password `pw`).
+struct Roles {
+    admin: sqlx::PgPool,
+    url: String,
+    created: Vec<String>,
+}
+
+impl Roles {
+    async fn new() -> Option<(Store, Roles)> {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            assert!(std::env::var("REQUIRE_TEST_DATABASE").as_deref() != Ok("1"), "TEST_DATABASE_URL is required");
+            eprintln!("SKIPPED: no TEST_DATABASE_URL");
+            return None;
+        };
+        let server = DatabaseSettings::parse(&url, false).unwrap().lazy_pool(2, Access::ReadWrite).unwrap();
+        let name = format!("lib_roles_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&server).await.unwrap();
+        let db_url = url.replacen("/postgres?", &format!("/{name}?"), 1);
+        let admin = DatabaseSettings::parse(&db_url, false).unwrap().lazy_pool(2, Access::ReadWrite).unwrap();
+        let s = Store::new(admin.clone());
+        s.migrate().await.unwrap();
+        Some((s, Roles { admin, url: db_url, created: Vec::new() }))
+    }
+
+    /// A login role with `grants` (statements with `{role}` for its name); returns a pool connected as it.
+    async fn role(&mut self, kind: &str, grants: &[&str], access: Access) -> sqlx::PgPool {
+        let role = format!("lib_test_{kind}_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let db: String = sqlx::query_scalar("SELECT current_database()").fetch_one(&self.admin).await.unwrap();
+        let mut statements = vec![
+            format!("CREATE ROLE {role} LOGIN PASSWORD 'pw'"),
+            format!("REVOKE ALL ON DATABASE {db} FROM PUBLIC"),
+            format!("GRANT CONNECT ON DATABASE {db} TO {role}"),
+        ];
+        statements.extend(grants.iter().map(|g| g.replace("{role}", &role)));
+        for q in statements {
+            sqlx::query(sqlx::AssertSqlSafe(q)).execute(&self.admin).await.unwrap();
+        }
+        self.created.push(role.clone());
+        let at = self.url.find('@').unwrap();
+        let url = format!("postgres://{role}:pw{}", &self.url[at..]);
+        DatabaseSettings::parse(&url, false).unwrap().lazy_pool(2, access).unwrap()
+    }
+
+    async fn drop_all(self) {
+        for r in &self.created {
+            for q in [format!("DROP OWNED BY {r}"), format!("DROP ROLE {r}")] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(q)).execute(&self.admin).await;
+            }
+        }
+    }
+}
+
+/// The writer grants of `services.conf` (`writer … schema=lib`) with `insert_only_tables=audit_log`.
+const WRITER: &[&str] = &[
+    "GRANT USAGE ON SCHEMA lib TO {role}",
+    "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA lib TO {role}",
+    "REVOKE UPDATE, DELETE ON lib.audit_log FROM {role}",
+    "GRANT USAGE ON ALL SEQUENCES IN SCHEMA lib TO {role}",
+    "GRANT USAGE ON SCHEMA public TO {role}",
+];
+
+/// The page server's read-only grants: the public views only, read-only by default.
+const PAGES: &[&str] = &[
+    "GRANT USAGE ON SCHEMA public TO {role}",
+    "GRANT SELECT ON public.page_v1, public.asset_v1, public.domain_v1, public.flagged_link_v1 TO {role}",
+    "ALTER ROLE {role} SET default_transaction_read_only = on",
+];
+
+async fn refused(pool: &sqlx::PgPool, q: &str) -> bool {
+    match sqlx::query(sqlx::AssertSqlSafe(q.to_string())).execute(pool).await {
+        Err(sqlx::Error::Database(e)) => {
+            let code = e.code().unwrap_or_default().to_string();
+            // 42501 insufficient privilege; 25006 read-only transaction.
+            code == "42501" || code == "25006"
+        }
+        _ => false,
+    }
+}
+
+#[tokio::test]
+async fn the_pages_role_reads_only_the_public_views_and_writes_nothing() {
+    let Some((s, mut roles)) = Roles::new().await else { return };
+    let now = OffsetDateTime::now_utc();
+    s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
+    let pages = roles.role("pages", PAGES, Access::ReadOnly).await;
+    let p = Store::new(pages.clone());
+    assert!(p.view_page("alice").await.unwrap().is_some(), "the views are readable");
+    for q in [
+        "SELECT * FROM lib.sessions",
+        "SELECT * FROM lib.accounts",
+        "SELECT * FROM lib.billing_events",
+        "INSERT INTO lib.audit_log (actor, action, subject) VALUES ('x', 'y', 'z')",
+        "UPDATE lib.accounts SET free = true",
+        "DELETE FROM lib.pages",
+        "CREATE TABLE public.x (a int)",
+        "CREATE TEMPORARY TABLE x (a int)",
+    ] {
+        assert!(refused(&pages, q).await, "the pages role must not: {q}");
+    }
+    pages.close().await;
+    roles.drop_all().await;
+}
+
+#[tokio::test]
+async fn a_writer_cannot_rewrite_the_audit_log_or_change_the_schema() {
+    let Some((s, mut roles)) = Roles::new().await else { return };
+    let writer = roles.role("writer", WRITER, Access::ReadWrite).await;
+    let w = Store::new(writer.clone());
+    let now = OffsetDateTime::now_utc();
+    let a = w.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
+    // It writes rows, and appends to the audit log.
+    w.audit("test", "act", &a.id.to_string(), &json!({})).await.unwrap();
+    assert!(w.audit_once("test", "once", "s", &json!({ "event": "e1" })).await.unwrap());
+    assert!(!w.audit_once("test", "once", "s", &json!({ "event": "e1" })).await.unwrap());
+    for q in [
+        "UPDATE lib.audit_log SET action = 'forged'",
+        "DELETE FROM lib.audit_log",
+        "TRUNCATE lib.audit_log",
+        "CREATE TABLE lib.x (a int)",
+        "CREATE TABLE public.x (a int)",
+        "ALTER TABLE lib.accounts ADD COLUMN x int",
+        "DROP TABLE lib.sessions",
+    ] {
+        assert!(refused(&writer, q).await, "a writer must not: {q}");
+    }
+    // Retention still runs through the owner's function, which never removes anything younger than two years.
+    sqlx::query("INSERT INTO lib.audit_log (at, actor, action, subject) VALUES (now() - interval '800 days', 'a', 'old', 's'), (now() - interval '1 day', 'a', 'new', 's')")
+        .execute(&s.pool().clone())
+        .await
+        .unwrap();
+    w.prune(now, Duration::days(0), Duration::days(730)).await.unwrap();
+    let left: Vec<String> =
+        sqlx::query_scalar("SELECT action FROM lib.audit_log ORDER BY action").fetch_all(s.pool()).await.unwrap();
+    assert!(!left.contains(&"old".to_string()), "older than two years: pruned");
+    assert!(left.contains(&"new".to_string()), "asked to prune everything, it still kept the last two years");
+    writer.close().await;
+    roles.drop_all().await;
+}

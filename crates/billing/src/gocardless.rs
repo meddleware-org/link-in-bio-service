@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use crate::{
-    BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, ProviderEvent, Seller,
+    BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, Paid, ProviderEvent, Seller,
     hmac_sha256, same, send_json,
 };
 
@@ -118,21 +118,26 @@ impl BillingProvider for GoCardless {
                     event_id: self.paid_event_id(br),
                     provider_ref: br.into(),
                     outcome: Outcome::Paid,
-                    months: None,
+                    // The event names the billing request only; its amount is read from GoCardless.
+                    paid: self.paid_facts(br).await?,
+                    refunded: None,
                     evidence: json!({ "event": id, "payment": e["links"]["payment_request_payment"], "cause": e["details"]["cause"] }),
                 }),
                 (Some("billing_requests"), Some("cancelled"), Some(br)) => out.push(ProviderEvent {
                     event_id: format!("gocardless:{id}"),
                     provider_ref: br.into(),
                     outcome: Outcome::Expired,
-                    months: None,
+                    paid: None,
+                    refunded: None,
                     evidence: json!({ "event": id }),
                 }),
                 (Some("payments"), Some("failed" | "charged_back"), Some(br)) => out.push(ProviderEvent {
                     event_id: format!("gocardless:{id}"),
                     provider_ref: br.into(),
                     outcome: Outcome::Refunded,
-                    months: None,
+                    paid: None,
+                    // A failed or charged-back payment gives back the whole purchase.
+                    refunded: None,
                     evidence: json!({ "event": id, "payment": e["links"]["payment"], "cause": e["details"]["cause"] }),
                 }),
                 _ => {}
@@ -150,6 +155,18 @@ impl BillingProvider for GoCardless {
             Some("fulfilled") => Outcome::Paid,
             Some("cancelled") => Outcome::Expired,
             _ => Outcome::Open,
+        })
+    }
+
+    async fn paid_facts(&self, provider_ref: &str) -> Result<Option<Paid>, BillingError> {
+        if !provider_ref.starts_with("BRQ") || !provider_ref.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(BillingError::Malformed("not a billing request id".into()));
+        }
+        let v = send_json(self.req(reqwest::Method::GET, &format!("/billing_requests/{provider_ref}"))).await?;
+        let pr = &v["billing_requests"]["payment_request"];
+        Ok(match (pr["amount"].as_u64(), pr["currency"].as_str()) {
+            (Some(minor), Some(currency)) => Some(Paid::Amount { minor, currency: currency.to_string() }),
+            _ => None,
         })
     }
 }

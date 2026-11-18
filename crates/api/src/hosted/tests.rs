@@ -1144,3 +1144,191 @@ async fn refund_requests_for_unapplied_payments() {
         "{audit:?}"
     );
 }
+
+/// A Square notification signed as Square signs it (for the app's registered notification URL).
+fn square_hook(key: &str, body: &Value) -> Request<Body> {
+    let bytes = serde_json::to_vec(body).unwrap();
+    let sig = link_in_bio_billing::square::signature(key, &format!("{APP}/api/v1/webhooks/square"), &bytes);
+    Request::post("/api/v1/webhooks/square")
+        .header(link_in_bio_billing::square::SIGNATURE_HEADER, sig)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+fn square_payment(event: &str, order: &str, amount: u64) -> Value {
+    json!({ "type": "payment.updated", "event_id": event, "data": { "object": { "payment": {
+        "id": format!("P-{event}"), "order_id": order, "status": "COMPLETED", "amount_money": { "amount": amount, "currency": "GBP" } } } } })
+}
+
+fn square_refund(id: &str, order: &str, amount: u64) -> Value {
+    json!({ "type": "refund.updated", "event_id": format!("E-{id}"), "data": { "object": { "refund": {
+        "id": id, "order_id": order, "status": "COMPLETED", "amount_money": { "amount": amount, "currency": "GBP" } } } } })
+}
+
+#[tokio::test]
+async fn card_payments_apply_only_when_they_cover_the_checkout_and_refunds_take_months_pro_rata() {
+    let Some(s) = store().await else { return };
+    let dir = std::env::temp_dir().join(format!("lib-square-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("token"), "t").unwrap();
+    std::fs::write(dir.join("sig"), "sk").unwrap();
+    let a = app(
+        s.clone(),
+        config(&[
+            ("BILLING_PROVIDERS", "square".into()),
+            ("SQUARE_LOCATION_ID", "L1".into()),
+            ("SQUARE_ACCESS_TOKEN_FILE", dir.join("token").display().to_string()),
+            ("SQUARE_SIGNATURE_KEY_FILE", dir.join("sig").display().to_string()),
+        ]),
+    );
+    let app_r = super::app::router(a.clone());
+    let (id, _) = account_with_session(&s, "dora").await;
+    let checkout = uuid::Uuid::new_v4();
+    let n = time::OffsetDateTime::now_utc();
+    s.create_checkout(&link_in_bio_store::Checkout {
+        id: checkout,
+        account_id: id,
+        provider: "square".into(),
+        provider_ref: "ORD12".into(),
+        method: "square:card".into(),
+        months: 12,
+        amount_pence: 3600,
+        status: "open".into(),
+        country_declared: Some("GB".into()),
+        country_request: Some("GB".into()),
+        created_at: n,
+        completed_at: None,
+    })
+    .await
+    .unwrap();
+    let not_covering = |s: Store| async move {
+        s.audit_log(Some(&id.to_string()), 50)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.action == "payment-not-covering")
+            .count()
+    };
+
+    // A genuine notification that paid less than the checkout: acknowledged, not applied, audited once.
+    for _ in 0..2 {
+        let r = send(&app_r, square_hook("sk", &square_payment("E1", "ORD12", 1200))).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    }
+    assert_eq!(s.checkout(checkout).await.unwrap().unwrap().status, "open");
+    assert!(s.account(id).await.unwrap().unwrap().paid_until.is_none());
+    assert_eq!(not_covering(s.clone()).await, 1, "audited once, however often it is sent");
+
+    // The whole amount: paid for 12 months.
+    assert_eq!(
+        send(&app_r, square_hook("sk", &square_payment("E2", "ORD12", 3600))).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(s.checkout(checkout).await.unwrap().unwrap().status, "paid");
+    let months_left = |s: Store| async move {
+        let until = s.account(id).await.unwrap().unwrap().paid_until.unwrap();
+        ((until - time::OffsetDateTime::now_utc()).whole_milliseconds() as f64 / 2_629_800_000.0).round() as i64
+    };
+    assert_eq!(months_left(s.clone()).await, 12);
+
+    // Refunds, pro rata and rounded down over the running total: 1000 of 3600 takes 3 months; another 2600 (the whole
+    // amount together) takes the other 9; the same refund again changes nothing; more than was paid takes nothing more.
+    send(&app_r, square_hook("sk", &square_refund("R1", "ORD12", 1000))).await;
+    assert_eq!(months_left(s.clone()).await, 9);
+    send(&app_r, square_hook("sk", &square_refund("R1", "ORD12", 1000))).await;
+    assert_eq!(months_left(s.clone()).await, 9, "one refund applies once");
+    send(&app_r, square_hook("sk", &square_refund("R2", "ORD12", 2600))).await;
+    let a_row = s.account(id).await.unwrap().unwrap();
+    assert!(a_row.paid_until.unwrap() <= time::OffsetDateTime::now_utc() + time::Duration::minutes(1), "all 12 back");
+    send(&app_r, square_hook("sk", &square_refund("R3", "ORD12", 500))).await;
+    let events = s.billing_events(id).await.unwrap();
+    let taken: i32 = events.iter().filter(|e| e.kind == "refund").map(|e| -e.months).sum();
+    assert_eq!(taken, 12, "never more than the purchase bought");
+    assert_eq!(events.iter().filter(|e| e.kind == "refund").count(), 3);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn one_account_cannot_spend_everyones_screening() {
+    let Some(s) = store().await else { return };
+    // A Web Risk stand-in that knows no threat.
+    let stub = Router::new().route("/v1/uris:search", axum::routing::get(|| async { axum::Json(json!({})) }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, stub).await.unwrap() });
+    let mut a =
+        App::new(s.clone(), config(&[("WEB_RISK_ACCOUNT_DAILY_CAP", "2".into())]), Duration::from_millis(200)).unwrap();
+    assert_eq!(a.screener.account_daily_cap, 2);
+    let mut w = link_in_bio_safety::WebRisk::new("key".into(), 1000);
+    w.endpoint = format!("http://{addr}/v1/uris:search");
+    a.screener.web_risk = Some(w);
+    let a: Shared = Arc::new(a);
+    let app_r = super::app::router(a.clone());
+    let publish = |handle: &'static str, urls: Vec<&'static str>| {
+        let s = s.clone();
+        let app_r = app_r.clone();
+        async move {
+            let (id, cookie) = account_with_session(&s, handle).await;
+            s.set_flags(id, false, true, true, &[]).await.unwrap();
+            let items: Vec<Value> = urls
+                .iter()
+                .enumerate()
+                .map(|(i, u)| json!({ "kind": "link", "id": format!("l{i}"), "title": format!("Link {i}"), "url": u }))
+                .collect();
+            let doc = json!({ "schema": 1, "identity": { "displayName": handle, "handle": handle }, "items": items });
+            assert_eq!(
+                send(&app_r, call("PUT", "/api/v1/page", Some(doc), Some(&cookie))).await.status,
+                StatusCode::OK
+            );
+            let r = send(&app_r, call("POST", "/api/v1/page/publish", None, Some(&cookie))).await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        }
+    };
+    publish("erin", vec!["https://one.example/", "https://two.example/", "https://three.example/"]).await;
+    let verdicts = |urls: &[&str]| {
+        let s = s.clone();
+        let hashes: Vec<Vec<u8>> = urls.iter().map(|u| link_in_bio_store::sha256(u.as_bytes())).collect();
+        async move { s.screens(&hashes).await.unwrap() }
+    };
+    let erin = verdicts(&["https://one.example/", "https://two.example/", "https://three.example/"]).await;
+    let clean = erin.iter().filter(|v| v.verdict == "clean" && v.source == "webrisk").count();
+    let over: Vec<_> = erin.iter().filter(|v| v.verdict == "unknown").collect();
+    assert_eq!((clean, over.len()), (2, 1), "two within the budget, the third left for the worker");
+    assert!(over[0].detail.contains("daily screening budget"), "{}", over[0].detail);
+    assert!(over[0].next_check_at <= time::OffsetDateTime::now_utc() + time::Duration::hours(1));
+    // Another account has its own budget.
+    publish("fred", vec!["https://four.example/"]).await;
+    assert_eq!(verdicts(&["https://four.example/"]).await[0].verdict, "clean");
+    // The shared monthly count saw only the calls made: 2 + 1.
+    let month = link_in_bio_safety::period(time::OffsetDateTime::now_utc());
+    assert_eq!(s.counter("webrisk", &month).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn the_console_starts_without_any_key_and_shows_the_switches() {
+    let Some(s) = store().await else { return };
+    let env: Vec<(&str, &str)> = vec![
+        ("PAGES_DOMAIN", "example.link"),
+        ("APP_HOST", "app.example.link"),
+        ("BILLING_PROVIDERS", "chain-payments,square"),
+        ("CHAIN_PAYMENTS_METHODS", "sui-testnet:SUI=SUI"),
+        ("CHAIN_PAYMENTS_ORIGIN", "https://cp.example.org"),
+        ("CHAIN_PAYMENTS_MERCHANT_API", "http://cp.invalid"),
+        ("CHAIN_PAYMENTS_PUBLIC_API", "http://cp.invalid"),
+        ("SQUARE_LOCATION_ID", "L1"),
+        ("WEB_RISK_KEY_FILE", "/nonexistent/web-risk"),
+    ];
+    let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
+    // No key file exists, and none is named for the providers: the console builds anyway, and builds no provider.
+    let c = HostedConfig::from_env_with(get, super::Keys::DisplayOnly).unwrap();
+    let a = app(s, c);
+    assert!(a.billing.provider("chain-payments").is_none() && a.billing.provider("square").is_none());
+    assert!(a.screener.web_risk.is_none());
+    let admin = super::admin::router(a);
+    let o = send(&admin, admin_call("GET", "/api/v1/admin/overview", None)).await;
+    assert_eq!(o.status, StatusCode::OK, "{}", o.text());
+    let sw = &o.json()["switches"];
+    assert_eq!(sw["webRisk"], true);
+    assert_eq!(sw["billingProviders"], json!(["chain-payments", "manual", "square"]));
+}

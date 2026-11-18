@@ -188,11 +188,20 @@ pub fn period(now: OffsetDateTime) -> String {
 
 pub struct Screener {
     pub web_risk: Option<WebRisk>,
+    /// Web Risk calls one account's publishes may spend in a day (`WEB_RISK_ACCOUNT_DAILY_CAP`; 0: no per-account limit).
+    /// Past it a link is recorded as unknown, and the worker screens it again within the hour under the monthly cap.
+    pub account_daily_cap: i64,
 }
 
 impl Screener {
     /// Screens one link (layers 1–3), without recording anything.
     pub async fn screen(&self, store: &Store, link: &str, now: OffsetDateTime) -> Verdict {
+        self.screen_for(store, link, now, None).await
+    }
+
+    /// Screens one link on behalf of an account (its publish): the account's daily budget is spent before the shared
+    /// monthly cap, so one account cannot spend everyone's screening.
+    pub async fn screen_for(&self, store: &Store, link: &str, now: OffsetDateTime, account: Option<&str>) -> Verdict {
         if let Some((source, detail)) = builtin(link) {
             return Verdict::Flagged { source, detail };
         }
@@ -205,6 +214,18 @@ impl Screener {
             return Verdict::Clean { source: "lists" };
         }
         let Some(w) = &self.web_risk else { return Verdict::Clean { source: "lists" } };
+        if let Some(a) = account.filter(|_| self.account_daily_cap > 0) {
+            match store
+                .take_from_counter(&format!("webrisk:{a}"), &link_in_bio_store::day(now), 1, self.account_daily_cap)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Verdict::Unknown { reason: "the account's daily screening budget is spent".into() };
+                }
+                Err(_) => return Verdict::Unknown { reason: "the Web Risk counter could not be read".into() },
+            }
+        }
         match store.take_from_counter("webrisk", &period(now), 1, w.monthly_cap).await {
             Ok(true) => {}
             Ok(false) => return Verdict::Unknown { reason: "the Web Risk monthly cap is reached".into() },
@@ -224,7 +245,18 @@ impl Screener {
         link: &str,
         now: OffsetDateTime,
     ) -> Result<Verdict, link_in_bio_store::DbError> {
-        let v = self.screen(store, link, now).await;
+        self.screen_and_record_for(store, link, now, None).await
+    }
+
+    /// [`Screener::screen_and_record`] on behalf of an account ([`Screener::screen_for`]).
+    pub async fn screen_and_record_for(
+        &self,
+        store: &Store,
+        link: &str,
+        now: OffsetDateTime,
+        account: Option<&str>,
+    ) -> Result<Verdict, link_in_bio_store::DbError> {
+        let v = self.screen_for(store, link, now, account).await;
         let (source, detail) = match &v {
             Verdict::Clean { source } => (source.to_string(), String::new()),
             Verdict::Flagged { source, detail } => (source.clone(), detail.clone()),
