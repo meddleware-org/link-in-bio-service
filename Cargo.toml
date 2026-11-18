@@ -47,7 +47,6 @@ base64 = "=0.23.1"
 ring = "=0.17.14"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2"] }
-anyhow = "=1.0.104"
 async-trait = "=0.1.89"
 # Passkeys (kanidm's WebAuthn implementation; MPL-2.0, listed in deny.toml as a reviewed exception).
 webauthn-rs = { version = "=0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui"] }
