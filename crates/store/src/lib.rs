@@ -1016,12 +1016,15 @@ impl Store {
         Ok(version)
     }
 
+    /// Takes the page offline (the draft and the versions stay); `updated_at` records when.
     pub async fn unpublish(&self, account: Uuid) -> Result<(), DbError> {
-        sqlx::query("UPDATE lib.pages SET published = NULL, published_at = NULL WHERE account_id = $1")
-            .bind(account)
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
+        sqlx::query(
+            "UPDATE lib.pages SET published = NULL, published_at = NULL, updated_at = now() WHERE account_id = $1",
+        )
+        .bind(account)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
     }
 
     pub async fn page_versions(&self, account: Uuid) -> Result<Vec<(i32, OffsetDateTime)>, DbError> {

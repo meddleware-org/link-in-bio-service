@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Unpublishing a page is in the audit log (`unpublish`, like `publish`) and sets the page's `updated_at`, so the
+  console shows who took a page offline and when (FU-0150).
+
 ## 0.0.5 — 2026-11-18
 
 Security audit first pass (`docs/audit/link-in-bio-service-audit.md`):

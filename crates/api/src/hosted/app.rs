@@ -872,6 +872,8 @@ async fn page_publish(State(app): State<Shared>, headers: HeaderMap) -> ApiResul
 async fn page_unpublish(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<StatusCode> {
     let a = account(&app, &headers).await?;
     app.store.unpublish(a.id).await?;
+    // Recorded like a publish, so the console shows who took a page offline and when.
+    app.store.audit(&format!("account:{}", a.id), "unpublish", &a.id.to_string(), &json!({})).await?;
     app.pages.forget(&page_host(&app, &a.handle)).await;
     Ok(StatusCode::NO_CONTENT)
 }

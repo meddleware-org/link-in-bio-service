@@ -1322,6 +1322,9 @@ async fn an_account_has_change_budgets_but_can_always_remove_links() {
         send(&app_r, call("POST", "/api/v1/page/unpublish", None, Some(&cookie))).await.status,
         StatusCode::NO_CONTENT
     );
+    let audit: Vec<String> =
+        s.audit_log(Some(&id.to_string()), 50).await.unwrap().into_iter().map(|e| e.action).collect();
+    assert!(audit.contains(&"unpublish".to_string()), "an unpublish is in the audit log: {audit:?}");
     // The console shows the preset and the values in effect.
     let o = send(&super::admin::router(a), admin_call("GET", "/api/v1/admin/overview", None)).await.json();
     assert_eq!(o["accountLimits"], json!({ "preset": "standard", "changesPerHour": 3, "newLinksPerDay": 4 }));
