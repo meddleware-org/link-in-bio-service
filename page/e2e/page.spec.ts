@@ -37,13 +37,26 @@ test('the whole page works with scripts blocked', async ({ browser }) => {
   await context.close()
 })
 
-test('with scripts, the colour control works and is remembered', async ({ page }) => {
+test('with scripts, the colour control works and is remembered only when asked (L-PECR-2)', async ({ page }) => {
   await page.goto('/')
+  const remember = page.getByRole('checkbox', { name: 'Remember on this device' })
+  await expect(remember).not.toBeChecked()
+  // A choice applies at once but is not kept.
   await page.getByRole('button', { name: 'Dark', exact: true }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  expect(await page.evaluate(() => localStorage.length)).toBe(0)
+  await page.reload()
+  await expect(page.getByRole('button', { name: 'Dark', exact: true })).toHaveAttribute('aria-pressed', 'false')
+  // Ticking keeps it across a reload.
+  await page.getByRole('button', { name: 'Dark', exact: true }).click()
+  await remember.check()
   await page.reload()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
   await expect(page.getByRole('button', { name: 'Dark', exact: true })).toHaveAttribute('aria-pressed', 'true')
+  await expect(remember).toBeChecked()
+  // Unticking forgets it.
+  await remember.uncheck()
+  expect(await page.evaluate(() => localStorage.length)).toBe(0)
 })
 
 test('identity links carry rel=me and the page is an h-card', async ({ page }) => {

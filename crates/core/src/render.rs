@@ -214,6 +214,9 @@ fn page(m: &Manifest, cx: &PageContext) -> Markup {
                         button type="button" data-mode="light" aria-pressed="false" { "Light" }
                         button type="button" data-mode="dark" aria-pressed="false" { "Dark" }
                         button type="button" data-mode="system" aria-pressed="false" { "System" }
+                        // Nothing is stored unless the visitor ticks this; unticking forgets (PECR Sch. A1 para 6:
+                        // the information and the means of objecting, beside the choice; workspace docs/legal L-PECR-2).
+                        label class="remember" { input type="checkbox" name="remember"; " Remember on this device" }
                     } }
                     @if let Some(r) = &cx.footer.report_url { p { a href=(r) { "Report this page" } } }
                     @if let Some(a) = &cx.footer.attribution { p { "Made with " a href=(a.url) { (a.text) } } }

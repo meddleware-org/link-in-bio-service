@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Pages store the colour choice only when asked (PECR Sch. A1 para 6).** The page's colour control gains a **Remember on this
+  device** box: a choice applies for the visit and is kept in `localStorage` only while the box is ticked; unticking removes it.
+
 - CI: the page job builds the binary once and hands it to five browser jobs, one per Playwright project, in Playwright's
   image with the runner's fonts (D129); no job installs browsers or compiles Rust twice. `page/` takes a prebuilt binary
   from `LIB_PAGE_BIN` (local runs still build it).

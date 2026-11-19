@@ -360,6 +360,23 @@ summary:focus-visible,
   font-weight: 600;
 }
 
+/* The remember box sits with the modes and wraps under them on a narrow page; it is never hidden, because it is the information a
+   visitor needs before anything is kept on their device. */
+.mode .remember {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3xs);
+  min-block-size: 2.75rem;
+  cursor: pointer;
+}
+
+.mode .remember input {
+  inline-size: 1.25rem;
+  block-size: 1.25rem;
+  margin: 0;
+  accent-color: var(--text);
+}
+
 /* ── The Profile Links specification page ──────────────────────────────── */
 .spec {
   max-width: 48rem;
