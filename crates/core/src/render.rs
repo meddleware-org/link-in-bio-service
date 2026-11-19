@@ -34,6 +34,30 @@ pub struct FooterLink {
     pub url: String,
 }
 
+/// The symbol a rights notice leads with. The same marks as `@meddleware/ui` `CopyrightLine` (its `symbolVariant`), so the
+/// operator's page and the Vue sites show one notice (workspace docs/legal L-IP-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightsSymbol {
+    /// The Kopimi triangle: copy freely.
+    Kopimi,
+    /// The reversed C.
+    Copyleft,
+    /// ©.
+    Copyright,
+}
+
+/// "<symbol> <year> <organisation>. <statement>", the symbol linking to the document that explains it.
+#[derive(Debug, Clone)]
+pub struct RightsNotice {
+    pub symbol: RightsSymbol,
+    /// The document the symbol links to (an https URL, checked by the site configuration).
+    pub href: String,
+    pub year: i32,
+    pub organisation: String,
+    /// For example "All jams preserved."; empty for none.
+    pub statement: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Footer {
     /// "Made with …" on tenant pages (entitlement-controlled).
@@ -42,8 +66,10 @@ pub struct Footer {
     pub report_url: Option<String>,
     /// The operator's own footer links (legal notice, licence).
     pub links: Vec<FooterLink>,
-    /// A short line of text, for example the rights statement.
+    /// A short line of text.
     pub note: Option<String>,
+    /// The rights notice, drawn like `CopyrightLine` (prefer it to a link and a `note`).
+    pub rights: Option<RightsNotice>,
 }
 
 #[derive(Debug, Clone)]
@@ -226,8 +252,42 @@ fn page(m: &Manifest, cx: &PageContext) -> Markup {
                         }
                     }
                     @if let Some(n) = &cx.footer.note { p class="note" { (n) } }
+                    @if let Some(r) = &cx.footer.rights { p class="rights" { (rights_notice(r)) } }
                 }
             }
+        }
+    }
+}
+
+/// The notice in `CopyrightLine`'s markup and wording: the symbol (an inline SVG, the same geometry) as a link with an accessible
+/// name, then the year, the organisation and the statement.
+fn rights_notice(r: &RightsNotice) -> Markup {
+    let label = match r.symbol {
+        RightsSymbol::Kopimi => "Kopimi legal notice",
+        RightsSymbol::Copyleft => "Copyleft legal notice",
+        RightsSymbol::Copyright => "Copyright legal notice",
+    };
+    html! {
+        small class="copyright-line" {
+            a class="symbol-link" href=(r.href) aria-label=(label) {
+                @match r.symbol {
+                    RightsSymbol::Copyright => { "©" }
+                    RightsSymbol::Copyleft => {
+                        svg class="symbol-mark" viewBox="0 0 24 24" width="1em" height="1em" aria-hidden="true" focusable="false" {
+                            circle cx="12" cy="12" r="9.5" fill="none" stroke="currentColor" stroke-width="1.5" {}
+                            text x="-12" y="12" transform="scale(-1,1)" text-anchor="middle" dominant-baseline="central" font-family="system-ui, sans-serif" font-size="13" fill="currentColor" { "C" }
+                        }
+                    }
+                    RightsSymbol::Kopimi => {
+                        svg class="symbol-mark" viewBox="0 0 24 24" width="1em" height="1em" aria-hidden="true" focusable="false" {
+                            path d="M12 4L22 23H2Z" fill="none" stroke="currentColor" stroke-width="1.5" {}
+                            text x="12" y="18" text-anchor="middle" dominant-baseline="middle" font-family="system-ui, sans-serif" font-size="11" fill="currentColor" { "C" }
+                        }
+                    }
+                }
+            }
+            " " (r.year) " " (r.organisation) "."
+            @if !r.statement.is_empty() { " " (r.statement) }
         }
     }
 }
@@ -323,6 +383,26 @@ pub(crate) mod tests {
         assert!(html.contains("#i-github"));
         assert!(html.contains("Report this page"));
         assert_eq!(html.matches("<h1").count(), 1);
+        assert!(!html.contains(" style="));
+    }
+
+    #[test]
+    fn draws_the_rights_notice_like_the_vue_sites() {
+        let doc = br#"{"schema":1,"identity":{"displayName":"Ada","handle":"ada"},"items":[]}"#;
+        let m = parse(doc, ParseOptions::default()).unwrap().manifest;
+        let mut c = cx();
+        c.footer.rights = Some(RightsNotice {
+            symbol: RightsSymbol::Kopimi,
+            href: "https://example.org/legal/powr.broccoli-kopimi.pdf".into(),
+            year: 2026,
+            organisation: "Meddleware".into(),
+            statement: "All jams preserved.".into(),
+        });
+        let html = render_page(&m, &c);
+        assert!(html.contains(r#"<a class="symbol-link" href="https://example.org/legal/powr.broccoli-kopimi.pdf" aria-label="Kopimi legal notice">"#));
+        // The Kopimi triangle of `CopyrightLine` (repos/ui src/components/CopyrightLine.vue): keep the two in step.
+        assert!(html.contains(r#"<path d="M12 4L22 23H2Z""#));
+        assert!(html.contains("</a> 2026 Meddleware. All jams preserved.</small>"));
         assert!(!html.contains(" style="));
     }
 

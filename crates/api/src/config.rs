@@ -5,7 +5,7 @@
 use serde::Deserialize;
 
 use link_in_bio_core::Owner;
-use link_in_bio_core::render::{Footer, FooterLink};
+use link_in_bio_core::render::{Footer, FooterLink, RightsNotice, RightsSymbol};
 use link_in_bio_core::safe_url;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +49,28 @@ pub struct FooterFile {
     pub note: Option<String>,
     pub attribution: Option<FooterLinkFile>,
     pub report_url: Option<String>,
+    /// The rights notice, drawn like the Vue sites' `CopyrightLine` (workspace docs/legal L-IP-1).
+    pub rights: Option<RightsFile>,
+}
+
+/// `footer.rights`: `{ "symbol": "kopimi", "href": "https://…/powr.broccoli-kopimi.pdf", "organisation": "Meddleware",
+/// "statement": "All jams preserved." }`. `year` defaults to the current year when the configuration is loaded.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RightsFile {
+    pub symbol: RightsSymbolName,
+    pub href: String,
+    pub organisation: String,
+    pub statement: Option<String>,
+    pub year: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RightsSymbolName {
+    Kopimi,
+    Copyleft,
+    Copyright,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +155,33 @@ impl SiteConfig {
             ),
             None => None,
         };
+        footer.rights = match &f.footer.rights {
+            Some(r) => {
+                let line = |field: &str, v: &str| {
+                    link_in_bio_core::text::clean_line(v, 120, false)
+                        .map_err(|e| ConfigError::Invalid(format!("footer.rights.{field}: {}", e.message())))
+                };
+                let year = r.year.unwrap_or_else(|| time::OffsetDateTime::now_utc().year());
+                if !(1970..=9999).contains(&year) {
+                    return Err(ConfigError::Invalid("footer.rights.year: must be a four-digit year".into()));
+                }
+                Some(RightsNotice {
+                    symbol: match r.symbol {
+                        RightsSymbolName::Kopimi => RightsSymbol::Kopimi,
+                        RightsSymbolName::Copyleft => RightsSymbol::Copyleft,
+                        RightsSymbolName::Copyright => RightsSymbol::Copyright,
+                    },
+                    href: https("footer.rights.href", &r.href)?,
+                    year,
+                    organisation: line("organisation", &r.organisation)?,
+                    statement: match &r.statement {
+                        Some(t) => line("statement", t)?,
+                        None => String::new(),
+                    },
+                })
+            }
+            None => None,
+        };
         footer.attribution = f.footer.attribution.as_ref().map(|a| link("footer.attribution", a)).transpose()?;
         footer.report_url = f.footer.report_url.as_deref().map(|u| https("footer.reportUrl", u)).transpose()?;
         let security_contact = match &f.security_contact {
@@ -185,6 +234,26 @@ impl SiteConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_rights_notice() {
+        let c = SiteConfig::from_json(
+            br#"{"baseUrl":"https://meddleware.link/","footer":{"rights":{"symbol":"kopimi","href":"https://meddleware.co.uk/legal/powr.broccoli-kopimi.pdf","organisation":"Meddleware","statement":"All jams preserved.","year":2026}}}"#,
+        )
+        .unwrap();
+        let r = c.footer.rights.unwrap();
+        assert_eq!(
+            (r.symbol, r.year, r.organisation.as_str(), r.statement.as_str()),
+            (RightsSymbol::Kopimi, 2026, "Meddleware", "All jams preserved.")
+        );
+        for bad in [
+            r#"{"baseUrl":"https://meddleware.link/","footer":{"rights":{"symbol":"kopimi","href":"http://x.example/","organisation":"M"}}}"#,
+            r#"{"baseUrl":"https://meddleware.link/","footer":{"rights":{"symbol":"other","href":"https://x.example/","organisation":"M"}}}"#,
+            r#"{"baseUrl":"https://meddleware.link/","footer":{"rights":{"symbol":"kopimi","href":"https://x.example/","organisation":"M","year":20}}}"#,
+        ] {
+            assert!(SiteConfig::from_json(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn parses_and_checks() {

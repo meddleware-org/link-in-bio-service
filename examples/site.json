@@ -6,8 +6,19 @@
   "federation": true,
   "brandIcons": true,
   "footer": {
-    "links": [{ "text": "Legal notice", "url": "https://example.org/legal/" }],
-    "note": "Example operator page."
+    "links": [
+      {
+        "text": "Legal notice",
+        "url": "https://example.org/legal/"
+      }
+    ],
+    "note": "Example operator page.",
+    "rights": {
+      "symbol": "kopimi",
+      "href": "https://example.org/legal/powr.broccoli-kopimi.pdf",
+      "organisation": "Example operator",
+      "statement": "All jams preserved."
+    }
   },
   "securityContact": "mailto:security@example.org",
   "hsts": true

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **One rights notice (workspace docs/legal L-IP-1).** `footer.rights` in the site configuration (`symbol`: `kopimi`, `copyleft` or
+  `copyright`; `href`, https; `organisation`; `statement`; optional `year`, default the current year) draws the notice exactly like
+  the Vue sites' `CopyrightLine`: the symbol as a link to its document, then the year, the organisation and the statement. It replaces
+  a footer link plus a `note`. The meddleware.link page lacked the Kopimi symbol for this reason.
 - **Pages store the colour choice only when asked (PECR Sch. A1 para 6).** The page's colour control gains a **Remember on this
   device** box: a choice applies for the visit and is kept in `localStorage` only while the box is ticked; unticking removes it.
 
