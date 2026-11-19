@@ -5,12 +5,14 @@ import { mkdirSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 
 export default function globalSetup() {
-  execFileSync('cargo', ['build', '-q', '-p', 'link-in-bio'], { stdio: 'inherit' })
+  // A prebuilt binary in CI's browser jobs (LIB_PAGE_BIN, from the page job); otherwise build it here.
+  const bin = process.env.LIB_PAGE_BIN ?? '../target/debug/link-in-bio'
+  if (!process.env.LIB_PAGE_BIN) execFileSync('cargo', ['build', '-q', '-p', 'link-in-bio'], { stdio: 'inherit' })
   const out = join('test-results', 'pages')
   mkdirSync(out, { recursive: true })
   for (const file of readdirSync(join('e2e', 'pages')).filter((f) => f.endsWith('.json'))) {
     const name = file.replace(/\.json$/, '')
-    execFileSync('../target/debug/link-in-bio', [
+    execFileSync(bin, [
       'render', join('e2e', 'pages', file), '--config', '../examples/site.json', '--assets', '../examples', '--out', join(out, name),
     ], { stdio: 'inherit' })
   }

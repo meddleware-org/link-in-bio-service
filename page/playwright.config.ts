@@ -3,11 +3,13 @@
 import { definePlaywrightConfig } from '@meddleware/frontend-config/playwright'
 
 export const PORT = 4298
-const bin = '../target/debug/link-in-bio'
+// CI's browser jobs run in Playwright's image with the binary the page job built (LIB_PAGE_BIN); locally it is built here.
+const bin = process.env.LIB_PAGE_BIN ?? '../target/debug/link-in-bio'
+const build = process.env.LIB_PAGE_BIN ? '' : 'cargo build -q -p link-in-bio && '
 
 export default definePlaywrightConfig({
   port: PORT,
-  command: `cargo build -q -p link-in-bio && ${bin} serve --mode static --config ../examples/site.json --manifest ../examples/manifest.json --listen 127.0.0.1:${PORT}`,
+  command: `${build}${bin} serve --mode static --config ../examples/site.json --manifest ../examples/manifest.json --listen 127.0.0.1:${PORT}`,
   extra: {
     globalSetup: './e2e/global-setup.ts',
     // The sweep injects a style (200% text); the page's strict CSP rightly refuses inline styles, so the browser is told to

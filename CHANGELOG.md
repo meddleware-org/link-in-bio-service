@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- CI: the page job builds the binary once and hands it to five browser jobs, one per Playwright project, in Playwright's
+  image with the runner's fonts (D129); no job installs browsers or compiles Rust twice. `page/` takes a prebuilt binary
+  from `LIB_PAGE_BIN` (local runs still build it).
+
 ## 0.0.7 — 2026-11-19
 
 - `SUI_RPC_URL`: the Sui full node the app's wallet uses, reported as `suiRpcUrl` by `GET /api/v1/instance` (by default the
