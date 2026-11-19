@@ -143,6 +143,8 @@ async fn instance(State(app): State<Shared>) -> Json<Value> {
         "federation": c.federation,
         "authenticators": ["passkey", "sui-wallet", "recovery-code"],
         "suiNetwork": c.sui_network,
+        // The full node the wallet uses for that network (SUI_RPC_URL; the public one by default; null for localnet).
+        "suiRpcUrl": c.sui_rpc_url,
     }))
 }
 

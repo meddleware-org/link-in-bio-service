@@ -51,6 +51,7 @@ in the environment. Every switch starts at its safest value, and each one can on
 | `THREATFOX_KEY_FILE` | unset | abuse.ch Auth-Key; when set, the worker syncs the last 7 days of ThreatFox indicators every 6 hours |
 | `FEDERATION` | `on` | WebFinger, the read-only ActivityPub actor and NIP-05 on tenant pages |
 | `SUI_NETWORK` | `testnet` | the chain id in the wallet sign-in message (`sui:<network>`) |
+| `SUI_RPC_URL` | the public full node of `SUI_NETWORK` (`https://fullnode.<network>.sui.io:443`; none for other networks) | the Sui full node (gRPC-web) the app's wallet uses, reported as `suiRpcUrl` by `GET /api/v1/instance`: a bare https origin (`https://host` or `https://host:port`), refused otherwise. The UI's CSP must allow the same origin: the deployment gives it to the UI container as `CSP_CONNECT_SRC_EXTRA` (static-server 0.1.13) from the same setting |
 | `ASSET_QUOTA_BYTES` | `524288` | bytes of pictures one account may store |
 | `SITE_CONFIG` | none | the page-site template for every tenant page (footer, `securityContact`, `securityPolicy`); `baseUrl` is replaced per tenant |
 | `PAGE_CACHE_SECS` | `30` | how long a built tenant page is reused (a suspension, a flagged link or a new version shows within this time) |

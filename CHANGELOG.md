@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.7 — 2026-11-19
+
+- `SUI_RPC_URL`: the Sui full node the app's wallet uses, reported as `suiRpcUrl` by `GET /api/v1/instance` (by default the
+  public full node of `SUI_NETWORK`; a bare https origin, refused otherwise; none for networks other than testnet and
+  mainnet). The deployment gives the same origin to the UI's CSP (FU-0144).
+
 ## 0.0.6 — 2026-11-18
 
 - Unpublishing a page is in the audit log (`unpublish`, like `publish`) and sets the page's `updated_at`, so the

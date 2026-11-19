@@ -74,6 +74,9 @@ pub struct HostedConfig {
     pub account_limits: AccountLimits,
     pub threatfox_key_file: Option<String>,
     pub sui_network: String,
+    /// The Sui full node (gRPC-web) the app's wallet uses for `sui_network`: `SUI_RPC_URL`, a bare https origin, by default the
+    /// public full node of testnet or mainnet; none for other networks. The UI's CSP allows the same origin (`CSP_CONNECT_SRC_EXTRA`).
+    pub sui_rpc_url: Option<String>,
     /// Bytes of pictures one account may store.
     pub asset_quota_bytes: i64,
     /// The page-site template (footer, contact, security policy) every tenant page uses.
@@ -217,6 +220,49 @@ fn host(var: &'static str, v: &str) -> Result<String, HostedConfigError> {
         && h.split('.')
             .all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
     if ok { Ok(h) } else { Err(HostedConfigError::Invalid(var, "not a host name".into())) }
+}
+
+/// The public full node of a network the wallet adapter knows (gRPC-web, port 443).
+fn public_full_node(network: &str) -> Option<&'static str> {
+    match network {
+        "testnet" => Some("https://fullnode.testnet.sui.io:443"),
+        "mainnet" => Some("https://fullnode.mainnet.sui.io:443"),
+        _ => None,
+    }
+}
+
+/// `SUI_RPC_URL`: a bare https origin (`https://host` or `https://host:port`), the same value the UI's CSP takes, so no path, query,
+/// credentials or anything that could add to a policy. Only testnet and mainnet take one (the wallet's override is for those).
+fn sui_rpc_url(network: &str, v: Option<String>) -> Result<Option<String>, HostedConfigError> {
+    let Some(v) = v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return Ok(public_full_node(network).map(str::to_string));
+    };
+    if public_full_node(network).is_none() {
+        return Err(HostedConfigError::Invalid(
+            "SUI_RPC_URL",
+            format!("only testnet and mainnet take a full node (SUI_NETWORK is {network})"),
+        ));
+    }
+    let bad =
+        || HostedConfigError::Invalid("SUI_RPC_URL", "a bare https origin (https://host or https://host:port)".into());
+    let rest = v.strip_prefix("https://").ok_or_else(bad)?;
+    let (h, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (rest, None),
+    };
+    if let Some(p) = port
+        && (p.is_empty()
+            || p.len() > 5
+            || !p.bytes().all(|b| b.is_ascii_digit())
+            || !(1..=65535).contains(&p.parse::<u32>().unwrap_or(0)))
+    {
+        return Err(bad());
+    }
+    let h = host("SUI_RPC_URL", h).map_err(|_| bad())?;
+    Ok(Some(match port {
+        Some(p) => format!("https://{h}:{p}"),
+        None => format!("https://{h}"),
+    }))
 }
 
 fn countries(v: &str) -> BTreeSet<String> {
@@ -546,6 +592,7 @@ impl HostedConfig {
             new_links_per_day: number(&get, "NEW_LINKS_PER_ACCOUNT_DAY", new_links, 0, 1_000_000)?,
         };
         let custom_hostname_cap = number(&get, "CUSTOM_HOSTNAME_CAP", 0i64, 0, 100)?;
+        let sui_network = get("SUI_NETWORK").unwrap_or_else(|| "testnet".into());
         Ok(Self {
             keys,
             web_risk_on: web_risk_set && web_risk_monthly_cap > 0,
@@ -568,7 +615,8 @@ impl HostedConfig {
             web_risk_max_entries,
             account_limits,
             threatfox_key_file: key_opt("THREATFOX_KEY_FILE"),
-            sui_network: get("SUI_NETWORK").unwrap_or_else(|| "testnet".into()),
+            sui_rpc_url: sui_rpc_url(&sui_network, get("SUI_RPC_URL"))?,
+            sui_network,
             asset_quota_bytes: number(&get, "ASSET_QUOTA_BYTES", 512 * 1024i64, 64 * 1024, 16 * 1024 * 1024)?,
             pages_domain,
             app_host,
@@ -637,6 +685,45 @@ mod tests {
         let s = c.site_for("alice", "alice.example.link").unwrap();
         assert_eq!(s.base_url, "https://alice.example.link/");
         assert_eq!(s.footer.report_url.as_deref(), Some("https://app.example.link/report?page=alice"));
+    }
+
+    #[test]
+    fn the_full_node_is_the_public_one_unless_set_and_only_a_bare_https_origin() {
+        let base = [("PAGES_DOMAIN", "example.link"), ("APP_HOST", "app.example.link")];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut v: Vec<(&str, &str)> = base.to_vec();
+            v.extend_from_slice(extra);
+            HostedConfig::from_env(env(Box::leak(v.into_boxed_slice())))
+        };
+        assert_eq!(with(&[]).unwrap().sui_rpc_url.as_deref(), Some("https://fullnode.testnet.sui.io:443"));
+        assert_eq!(
+            with(&[("SUI_NETWORK", "mainnet")]).unwrap().sui_rpc_url.as_deref(),
+            Some("https://fullnode.mainnet.sui.io:443")
+        );
+        assert_eq!(with(&[("SUI_NETWORK", "localnet")]).unwrap().sui_rpc_url, None);
+        assert_eq!(
+            with(&[("SUI_RPC_URL", " https://Sui.Example:8443 ")]).unwrap().sui_rpc_url.as_deref(),
+            Some("https://sui.example:8443")
+        );
+        assert_eq!(
+            with(&[("SUI_RPC_URL", "https://sui.example")]).unwrap().sui_rpc_url.as_deref(),
+            Some("https://sui.example")
+        );
+        for bad in [
+            "http://sui.example",
+            "https://sui.example/grpc",
+            "https://*.example",
+            "https://sui.example;script-src *",
+            "https://user@sui.example",
+            "https://sui.example:0",
+            "https://sui.example:99999",
+            "https://sui",
+            "sui.example",
+            "https://sui.example?x=1",
+        ] {
+            assert!(with(&[("SUI_RPC_URL", bad)]).is_err(), "{bad} must be refused");
+        }
+        assert!(with(&[("SUI_NETWORK", "localnet"), ("SUI_RPC_URL", "https://sui.example")]).is_err());
     }
 
     #[test]
