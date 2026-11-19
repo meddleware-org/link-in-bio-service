@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- CI: `HOME=/root` is set on the browser-test command only, not the whole job, so the runner no longer warns that it cannot read
+  `/root/.docker/config.json`.
+
 ## 0.0.8 — 2026-11-19
 
 - **One rights notice (workspace docs/legal L-IP-1).** `footer.rights` in the site configuration (`symbol`: `kopimi`, `copyleft` or
