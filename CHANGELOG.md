@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.8 — 2026-11-19
 
 - **One rights notice (workspace docs/legal L-IP-1).** `footer.rights` in the site configuration (`symbol`: `kopimi`, `copyleft` or
   `copyright`; `href`, https; `organisation`; `statement`; optional `year`, default the current year) draws the notice exactly like
