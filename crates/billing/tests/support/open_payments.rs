@@ -33,32 +33,47 @@ pub fn test_key_pem() -> String {
     )
 }
 
+/// The stand-in's state: the client it expects, its payments, tokens and quotes, and counters of what it has seen.
 #[derive(Default)]
 struct Inner {
+    /// Its own address.
     base: String,
+    /// The client's public key, which every signature must verify against.
     client_key: Vec<u8>,
+    /// The key id every signature must name.
     key_id: String,
+    /// The asset code and scale the wallets hold.
     asset: (String, u8),
     /// Incoming payments: id → (incoming value, received value, expiresAt).
     incoming: BTreeMap<String, (u128, u128, String)>,
+    /// The tokens it issued and what each is for.
     tokens: BTreeMap<String, &'static str>,
     /// The interactive grant waiting for the buyer: (client nonce, finish uri, server nonce, receiver).
     pending: Option<(String, String, String, String)>,
+    /// The interaction reference of the approved grant, until it is continued.
     interact_ref: Option<String>,
+    /// The quotes it issued: the receiver and the amount.
     quotes: BTreeMap<String, (String, u128)>,
     /// The buyer's wallet pays one unit less than asked (a short payment).
     pub underpay: bool,
+    /// How many requests it refused for a missing or bad signature.
     refused: u32,
+    /// How many requests carried a valid signature.
     signed_ok: u32,
+    /// A counter for the ids and tokens it makes.
     next: u32,
 }
 
+/// A running stand-in.
 #[derive(Clone)]
 pub struct Ase {
+    /// Its address.
     pub base: String,
+    /// Its state, shared with the server task.
     inner: Arc<Mutex<Inner>>,
 }
 
+/// An Open Payments style error answer.
 fn err(status: StatusCode, code: &str) -> Response {
     (status, axum::Json(json!({ "error": { "code": code, "description": code } }))).into_response()
 }
@@ -71,18 +86,22 @@ fn verify(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Option<String>, Box<Response>> {
+    // The request's headers with lower-case names, as the signature check wants them.
     let hs: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_ascii_lowercase(), v.to_string())))
         .collect();
+    // The signed address is the stand-in's own address plus the path and query.
     let target = format!("{}{}", s.base, uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"));
     let msg = Message { method: method.as_str(), target_uri: &target, headers: &hs };
     let Some(m) = httpsig::verify_ed25519(&msg, "sig1", &s.client_key) else {
         s.refused += 1;
         return Err(Box::new(err(StatusCode::UNAUTHORIZED, "invalid_client")));
     };
+    // Whether the signature covers a component.
     let covers = |c: &str| m.components.iter().any(|x| x == c);
     let auth = msg.component("authorization");
+    // The key id must be the client's, the signature must cover the method and address, the token when there is one, and the body's digest when there is a body.
     let ok = m.keyid.as_deref() == Some(s.key_id.as_str())
         && covers("@method")
         && covers("@target-uri")
@@ -95,9 +114,11 @@ fn verify(
         return Err(Box::new(err(StatusCode::UNAUTHORIZED, "invalid_client")));
     }
     s.signed_ok += 1;
+    // The GNAP token the request presented, if any.
     Ok(auth.and_then(|a| a.strip_prefix("GNAP ").map(String::from)))
 }
 
+/// Issue a token of a kind and remember it.
 fn token(s: &mut Inner, kind: &'static str) -> String {
     s.next += 1;
     let t = format!("{kind}-token-{}", s.next);
@@ -105,6 +126,7 @@ fn token(s: &mut Inner, kind: &'static str) -> String {
     t
 }
 
+/// A wallet address document: the same asset, and the stand-in's own authorization and resource servers.
 async fn wallet(State(a): State<Ase>, uri: Uri) -> Response {
     let s = a.inner.lock().unwrap();
     axum::Json(json!({
@@ -114,6 +136,7 @@ async fn wallet(State(a): State<Ase>, uri: Uri) -> Response {
     .into_response()
 }
 
+/// The grant endpoint: a verified request for an incoming-payment, quote or outgoing-payment grant. An outgoing one is interactive and answers with a redirect and the server's nonce.
 async fn grant(State(a): State<Ase>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let mut s = a.inner.lock().unwrap();
     if let Err(r) = verify(&mut s, &method, &uri, &headers, &body) {
@@ -153,6 +176,7 @@ async fn grant(State(a): State<Ase>, method: Method, uri: Uri, headers: HeaderMa
     }
 }
 
+/// The continuation endpoint: needs the continuation token and the interaction reference the buyer's approval produced, and answers with the outgoing-payment token.
 async fn continue_grant(State(a): State<Ase>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let mut s = a.inner.lock().unwrap();
     let presented = match verify(&mut s, &method, &uri, &headers, &body) {
@@ -171,10 +195,12 @@ async fn continue_grant(State(a): State<Ase>, method: Method, uri: Uri, headers:
     axum::Json(json!({ "access_token": { "value": t, "manage": format!("{}/auth/token/3", s.base) } })).into_response()
 }
 
+/// Whether a request presented a token of the given kind.
 fn needs(s: &Inner, t: &Option<String>, kind: &str) -> bool {
     t.as_ref().and_then(|t| s.tokens.get(t)).is_some_and(|k| *k == kind)
 }
 
+/// Create an incoming payment for the amount asked, with an incoming-payment token.
 async fn incoming_create(State(a): State<Ase>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let mut s = a.inner.lock().unwrap();
     let t = match verify(&mut s, &method, &uri, &headers, &body) {
@@ -193,6 +219,7 @@ async fn incoming_create(State(a): State<Ase>, method: Method, uri: Uri, headers
     (StatusCode::CREATED, axum::Json(incoming_json(&s, &id))).into_response()
 }
 
+/// An incoming payment as the resource server reports it.
 fn incoming_json(s: &Inner, id: &str) -> Value {
     let (want, got, expires) = &s.incoming[id];
     json!({
@@ -203,6 +230,7 @@ fn incoming_json(s: &Inner, id: &str) -> Value {
     })
 }
 
+/// Read an incoming payment, with an incoming-payment token.
 async fn incoming_get(State(a): State<Ase>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let mut s = a.inner.lock().unwrap();
     let t = match verify(&mut s, &method, &uri, &headers, &body) {
@@ -219,6 +247,7 @@ async fn incoming_get(State(a): State<Ase>, method: Method, uri: Uri, headers: H
     axum::Json(incoming_json(&s, &id)).into_response()
 }
 
+/// Quote an incoming payment: the amount still to be paid, in both directions.
 async fn quote(State(a): State<Ase>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let mut s = a.inner.lock().unwrap();
     let t = match verify(&mut s, &method, &uri, &headers, &body) {
@@ -241,6 +270,7 @@ async fn quote(State(a): State<Ase>, method: Method, uri: Uri, headers: HeaderMa
     (StatusCode::CREATED, axum::Json(json!({ "id": id, "walletAddress": b["walletAddress"], "receiver": receiver, "debitAmount": amount, "receiveAmount": amount, "method": "ilp" }))).into_response()
 }
 
+/// Create an outgoing payment from a quote: the receiver is credited (one unit short when told to underpay).
 async fn outgoing(State(a): State<Ase>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let mut s = a.inner.lock().unwrap();
     let t = match verify(&mut s, &method, &uri, &headers, &body) {
@@ -293,14 +323,17 @@ impl Ase {
         a
     }
 
+    /// The operator's wallet address.
     pub fn operator(&self) -> String {
         format!("{}/operator", self.base)
     }
 
+    /// The buyer's wallet address.
     pub fn buyer(&self) -> String {
         format!("{}/buyer", self.base)
     }
 
+    /// Make the buyer's wallet pay one unit less than asked, or stop.
     pub fn set_underpay(&self, on: bool) {
         self.inner.lock().unwrap().underpay = on;
     }
@@ -322,6 +355,7 @@ impl Ase {
         self.inner.lock().unwrap().pending.as_ref().map(|p| p.3.clone())
     }
 
+    /// The amount an incoming payment has received.
     pub fn received(&self, id: &str) -> u128 {
         self.inner.lock().unwrap().incoming.get(id).map(|p| p.1).unwrap_or(0)
     }

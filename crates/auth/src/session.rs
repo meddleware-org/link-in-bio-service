@@ -19,6 +19,7 @@ pub const ABSOLUTE: Duration = Duration::days(60);
 
 /// A new token: the cookie value and the hash to store.
 pub fn new_token() -> (String, Vec<u8>) {
+    // 256 random bits; the cookie carries them, the database holds only their hash.
     let raw = crate::random_bytes::<32>();
     let value = URL_SAFE_NO_PAD.encode(raw);
     let hash = hash(&value);
@@ -27,6 +28,7 @@ pub fn new_token() -> (String, Vec<u8>) {
 
 /// The stored form of a cookie value.
 pub fn hash(value: &str) -> Vec<u8> {
+    // The same hash for a cookie value as a recovery code gets: a stolen database holds nothing that signs in.
     Sha256::digest(value.as_bytes()).to_vec()
 }
 
@@ -48,10 +50,13 @@ pub fn from_cookie_header(header: &str) -> Option<&str> {
     header.split(';').map(str::trim).find_map(|c| c.strip_prefix(COOKIE)?.strip_prefix('=')).filter(|v| plausible(v))
 }
 
+/// Why a state-changing request failed the CSRF rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CsrfError {
+    /// The `Origin` header is missing or is not the app's origin.
     #[error("the request did not come from the app")]
     Origin,
+    /// The custom request header is missing.
     #[error("the request header {CSRF_HEADER} is missing")]
     Header,
 }
@@ -59,6 +64,7 @@ pub enum CsrfError {
 /// The CSRF rule for a state-changing method: `Origin` must be the app's origin exactly and the custom header must be
 /// present. (Safe methods are not checked; they change nothing.)
 pub fn check_csrf(origin: Option<&str>, has_header: bool, app_origin: &str) -> Result<(), CsrfError> {
+    // The origin must be present and equal: a missing one fails too.
     if origin != Some(app_origin) {
         return Err(CsrfError::Origin);
     }
@@ -68,16 +74,19 @@ pub fn check_csrf(origin: Option<&str>, has_header: bool, app_origin: &str) -> R
     Ok(())
 }
 
+/// Unit tests for sessions and the CSRF rule.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A new token is plausible, hashes to the value stored, differs from the next one and reads back from a `Cookie` header, while short values and a different cookie name do not; the cookie is strict and clearing it expires it.
     #[test]
     fn tokens_and_cookies() {
         let (v, h) = new_token();
         assert!(plausible(&v));
         assert_eq!(hash(&v), h);
         assert_ne!(new_token().0, v);
+        // Other cookies in the header are ignored.
         let header = format!("other=1; {COOKIE}={v}; x=y");
         assert_eq!(from_cookie_header(&header), Some(v.as_str()));
         assert_eq!(from_cookie_header(&format!("{COOKIE}=short")), None);
@@ -86,6 +95,7 @@ mod tests {
         assert!(set_cookie(None, 0).contains("Max-Age=0"));
     }
 
+    /// The origin must match exactly (a tenant's page or no origin fails) and the header must be present.
     #[test]
     fn csrf() {
         let app = "https://app.example.link";

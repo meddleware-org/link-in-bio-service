@@ -7,6 +7,7 @@ use link_in_bio_store::{CreateError, Criteria, NewAccount, PeriodChange, Store, 
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
 
+/// A store on a fresh, migrated database made for this test, or `None` (a logged skip) when no test database is configured; with `REQUIRE_TEST_DATABASE=1` a missing one is a failure.
 async fn store() -> Option<Store> {
     let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
         assert!(std::env::var("REQUIRE_TEST_DATABASE").as_deref() != Ok("1"), "TEST_DATABASE_URL is required");
@@ -25,6 +26,7 @@ async fn store() -> Option<Store> {
     Some(s)
 }
 
+/// A new-account request with the usual test values (a GB account on the 2026-11 terms and an empty page).
 fn new<'a>(handle: &'a str, skeleton: &'a str, billing_ref: &'a str, invite: Option<&'a [u8]>) -> NewAccount<'a> {
     NewAccount {
         id: uuid::Uuid::new_v4(),
@@ -39,11 +41,13 @@ fn new<'a>(handle: &'a str, skeleton: &'a str, billing_ref: &'a str, invite: Opt
     }
 }
 
+/// Accounts invites and handles.
 #[tokio::test]
 async fn accounts_invites_and_handles() {
     let Some(s) = store().await else { return };
     let now = OffsetDateTime::now_utc();
     let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
+    // A plain sign-up is neither free nor invited.
     assert!(!a.free && a.invited_by.is_none());
     assert!(matches!(
         s.create_account(&new("a1ice", "allce", "ref-alice-000000002", None), now).await,
@@ -107,33 +111,40 @@ async fn accounts_invites_and_handles() {
     ));
 }
 
+/// Sign in material sessions and challenges.
 #[tokio::test]
 async fn sign_in_material_sessions_and_challenges() {
     let Some(s) = store().await else { return };
     let now = OffsetDateTime::now_utc();
     let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
+    // A first sign-in method.
     s.add_passkey(a.id, &[7u8; 16], &json!({"cred": 1}), "Laptop").await.unwrap();
     assert_eq!(s.passkey_owner(&[7u8; 16]).await.unwrap().unwrap().0, a.id);
     assert!(!s.delete_passkey(a.id, &[7u8; 16]).await.unwrap(), "the last sign-in method stays");
+    // A wallet address, as the sign-in stores it.
     let addr = format!("0x{}", "ab".repeat(32));
     assert!(s.add_wallet(a.id, &addr).await.unwrap());
+    // A second account, which cannot link the same wallet.
     let b = s.create_account(&new("bob", "bob", "ref-bob-00000000001", None), now).await.unwrap();
     assert!(!s.add_wallet(b.id, &addr).await.unwrap(), "one account per wallet");
     assert!(s.delete_passkey(a.id, &[7u8; 16]).await.unwrap());
     assert_eq!(s.wallet_owner(&addr).await.unwrap(), Some(a.id));
 
+    // Two recovery codes, stored as hashes.
     s.set_recovery_codes(a.id, &[sha256(b"r1"), sha256(b"r2")]).await.unwrap();
     assert_eq!(s.use_recovery_code("alice", &sha256(b"r1"), now).await.unwrap(), Some(a.id));
     assert_eq!(s.use_recovery_code("alice", &sha256(b"r1"), now).await.unwrap(), None);
     assert_eq!(s.use_recovery_code("bob", &sha256(b"r2"), now).await.unwrap(), None);
     assert_eq!(s.recovery_codes_left(a.id).await.unwrap(), 1);
 
+    // A session, stored by the hash of its cookie value.
     let t = sha256(b"token");
     s.create_session(&t, a.id, now + Duration::hours(1)).await.unwrap();
     let idle = Duration::days(7);
     let abs = Duration::days(30);
     assert_eq!(s.session_account(&t, now, idle, abs).await.unwrap(), Some(a.id));
     assert_eq!(s.session_account(&t, now + Duration::days(31), idle, abs).await.unwrap(), None, "absolute limit");
+    // Suspending an account ends its sessions.
     s.suspend(a.id, "policy", "spam", None).await.unwrap();
     assert_eq!(s.session_account(&t, now, idle, abs).await.unwrap(), None, "suspension ends sessions");
 
@@ -146,40 +157,49 @@ async fn sign_in_material_sessions_and_challenges() {
     )
     .await
     .unwrap();
+    // A challenge of another kind is not taken.
     assert!(s.take_challenge("0123456789abcdef0123456789abcdef", "passkey-login", now).await.unwrap().is_none());
     assert!(s.take_challenge("0123456789abcdef0123456789abcdef", "wallet-login", now).await.unwrap().is_some());
     assert!(s.take_challenge("0123456789abcdef0123456789abcdef", "wallet-login", now).await.unwrap().is_none(), "once");
 }
 
+/// Pages versions views and screening.
 #[tokio::test]
 async fn pages_versions_views_and_screening() {
     let Some(s) = store().await else { return };
     let now = OffsetDateTime::now_utc();
     let a = s.create_account(&new("alice", "allce", "ref-alice-000000001", None), now).await.unwrap();
+    // A new page is not published.
     assert!(s.view_page("alice").await.unwrap().unwrap().published.is_none());
+    // Three publishes make versions 2, 3 and 4 (the page starts at 1).
     for i in 0..3 {
         assert_eq!(s.publish(a.id, &format!(r#"{{"v":{i}}}"#), now).await.unwrap(), i + 2);
     }
     assert_eq!(s.page_versions(a.id).await.unwrap().len(), 3);
+    // Keeping the newest two removes the oldest.
     assert_eq!(s.prune_versions(2).await.unwrap(), 1);
     assert_eq!(s.page_version(a.id, 4).await.unwrap().as_deref(), Some(r#"{"v":2}"#));
     let v = s.view_page("alice").await.unwrap().unwrap();
     assert_eq!(v.published.as_deref(), Some(r#"{"v":2}"#));
     assert_eq!(v.status, "active");
 
+    // A suspension that has already ended is lifted by the worker's sweep.
     s.suspend(a.id, "legal", "court order", Some(now - Duration::seconds(1))).await.unwrap();
     assert_eq!(s.view_page("alice").await.unwrap().unwrap().suspension_kind.as_deref(), Some("legal"));
     assert_eq!(s.lift_expired_suspensions(now).await.unwrap(), vec![a.id]);
     assert_eq!(s.view_page("alice").await.unwrap().unwrap().status, "active");
 
+    // A flagged link is visible to the page process by its hash only.
     let url = "https://bad.example/x";
     s.put_screen(url, "flagged", "webrisk", "SOCIAL_ENGINEERING", now + Duration::days(1), now).await.unwrap();
     let flagged = s.view_flagged(&[sha256(url.as_bytes()), sha256(b"https://ok.example/")]).await.unwrap();
     assert_eq!(flagged.len(), 1);
+    // An operator's verdict holds against a later automatic one.
     s.override_screen(url, Some("clean"), "operator", now).await.unwrap();
     s.put_screen(url, "flagged", "webrisk", "again", now + Duration::days(1), now).await.unwrap();
     assert!(s.view_flagged(&[sha256(url.as_bytes())]).await.unwrap().is_empty(), "the operator's verdict holds");
 
+    // The blocklist and the ThreatFox indicators are searched together.
     s.add_block("evil.example", "host", "phishing kit", "operator").await.unwrap();
     s.replace_iocs(&[("malware.example".into(), "host".into(), "botnet_cc".into())]).await.unwrap();
     let hosts = |h: &str| vec![h.to_string()];
@@ -187,12 +207,14 @@ async fn pages_versions_views_and_screening() {
     assert_eq!(s.blocked("https://malware.example/", &hosts("malware.example")).await.unwrap().unwrap().0, "threatfox");
     assert!(s.blocked("https://fine.example/", &hosts("fine.example")).await.unwrap().is_none());
 
+    // A counter with a cap of three: two fit, a second two do not, and one more does.
     assert!(s.take_from_counter("webrisk", "2026-11", 2, 3).await.unwrap());
     assert!(!s.take_from_counter("webrisk", "2026-11", 2, 3).await.unwrap(), "the cap holds");
     assert!(s.take_from_counter("webrisk", "2026-11", 1, 3).await.unwrap());
     assert_eq!(s.counter("webrisk", "2026-11").await.unwrap(), 3);
 }
 
+/// Billing periods are idempotent.
 #[tokio::test]
 async fn billing_periods_are_idempotent() {
     let Some(s) = store().await else { return };
@@ -210,19 +232,24 @@ async fn billing_periods_are_idempotent() {
         checkout_id: None,
         refund_of: None,
     };
+    // A purchase extends the period from now.
     let until = s.change_period(&change("s1", "purchase", 3), now).await.unwrap().unwrap();
     assert_eq!(until, now + link_in_bio_store::MONTH * 3);
     assert!(s.change_period(&change("s1", "purchase", 3), now).await.unwrap().is_none(), "applied once");
+    // A grant extends it from the current end.
     let until2 = s.change_period(&change("g1", "grant", 1), now).await.unwrap().unwrap();
     assert_eq!(until2, until + link_in_bio_store::MONTH);
+    // A refund larger than what is held stops at now.
     let until3 = s.change_period(&change("r1", "refund", -10), now).await.unwrap().unwrap();
     assert_eq!(until3, now, "a refund never ends the period in the past");
     assert_eq!(s.billing_events(a.id).await.unwrap().len(), 3);
+    // Entitlement allows a grace period after the end.
     let acct = s.account(a.id).await.unwrap().unwrap();
     assert!(!acct.entitled(now + Duration::days(8), Duration::days(7)));
     assert!(acct.entitled(now + Duration::days(6), Duration::days(7)), "within the grace period");
 }
 
+/// Open payments grants are used once.
 #[tokio::test]
 async fn open_payments_grants_are_used_once() {
     let Some(s) = store().await else { return };
@@ -244,32 +271,41 @@ async fn open_payments_grants_are_used_once() {
         fee_fixed_pence: None,
         fee_percent_bps: None,
     };
+    // A checkout for the grant to belong to.
     s.create_checkout(&c).await.unwrap();
     assert!(s.open_payments_grant(c.id).await.unwrap().is_none());
+    // A pending grant, which a second put replaces.
     assert!(s.put_open_payments_grant(c.id, "https://wallet.example/bob", &json!({"n": 1})).await.unwrap());
     assert!(s.put_open_payments_grant(c.id, "https://wallet.example/bob", &json!({"n": 2})).await.unwrap(), "replaced");
     assert_eq!(s.open_payments_grant(c.id).await.unwrap(), Some(("pending".into(), json!({"n": 2}))));
+    // Taking it once moves it to finishing.
     assert_eq!(s.take_open_payments_grant(c.id).await.unwrap(), Some(json!({"n": 2})));
     assert!(s.take_open_payments_grant(c.id).await.unwrap().is_none(), "taken once");
+    // A failed grant loses what was pending.
     s.finish_open_payments_grant(c.id, None, now).await.unwrap();
     assert_eq!(s.open_payments_grant(c.id).await.unwrap(), Some(("failed".into(), json!({}))), "pending removed");
     assert!(s.put_open_payments_grant(c.id, "https://wallet.example/bob", &json!({"n": 3})).await.unwrap(), "retry");
     s.take_open_payments_grant(c.id).await.unwrap();
+    // A sent grant is final.
     s.finish_open_payments_grant(c.id, Some("https://wallet.example/rs/outgoing-payments/9"), now).await.unwrap();
     assert_eq!(s.open_payments_grant(c.id).await.unwrap().unwrap().0, "sent");
     assert!(!s.put_open_payments_grant(c.id, "https://wallet.example/eve", &json!({})).await.unwrap(), "sent is final");
 }
 
+/// Bank feed cursors.
 #[tokio::test]
 async fn bank_feed_cursors() {
     let Some(s) = store().await else { return };
     let now = OffsetDateTime::now_utc();
     assert!(s.bank_feed("bunq").await.unwrap().is_none());
+    // A first failure creates the feed's row with no cursor.
     s.bank_feed_failed("bunq", "bunq answered HTTP 503", now).await.unwrap();
     let r = s.bank_feed("bunq").await.unwrap().unwrap();
     assert_eq!((r.cursor, r.last_error.as_deref(), r.credits_seen), (None, Some("bunq answered HTTP 503"), 0));
+    // Two successful polls add up the credits seen.
     s.save_bank_feed("bunq", Some(r#"{"7":103}"#), &json!({"device": true}), 2, now).await.unwrap();
     s.save_bank_feed("bunq", Some(r#"{"7":104}"#), &json!({"device": true}), 1, now).await.unwrap();
+    // A long error is cut to 500 characters.
     s.bank_feed_failed("bunq", &"x".repeat(900), now).await.unwrap();
     let r = s.bank_feed("bunq").await.unwrap().unwrap();
     assert_eq!(r.cursor.as_deref(), Some(r#"{"7":104}"#), "a failure keeps the cursor");
@@ -278,6 +314,7 @@ async fn bank_feed_cursors() {
     assert_eq!(s.bank_feeds().await.unwrap().iter().map(|r| r.feed.as_str()).collect::<Vec<_>>(), vec!["bunq", "wise"]);
 }
 
+/// Refund requests take months back once.
 #[tokio::test]
 async fn refund_requests_take_months_back_once() {
     let Some(s) = store().await else { return };
@@ -296,6 +333,7 @@ async fn refund_requests_take_months_back_once() {
         refund_of: None,
     };
     s.change_period(&change("paid:s1", false), now).await.unwrap().unwrap();
+    // A late payment is credited like any other, and marked in its evidence.
     let credited = s.change_period(&change("unapplied:w1", true), now).await.unwrap().unwrap();
     let events = s.billing_events(a.id).await.unwrap();
     let late = events.iter().find(|e| e.unapplied).unwrap().clone();
@@ -303,12 +341,14 @@ async fn refund_requests_take_months_back_once() {
     let detail = s.billing_event(late.id).await.unwrap().unwrap();
     assert_eq!((detail.account_id, detail.months, detail.evidence["digest"].as_str()), (a.id, 3, Some("D2")));
 
+    // A holder asks for the late payment back; a second ask about it is refused.
     let r = s.create_refund_request(late.id, a.id, "two tabs").await.unwrap().unwrap();
     assert!(s.create_refund_request(late.id, a.id, "again").await.unwrap().is_none(), "one request per event");
     let queue = s.refund_requests("open", 10).await.unwrap();
     assert_eq!((queue.len(), queue[0].handle.as_str(), queue[0].months), (1, "alice", Some(3)));
     assert_eq!(s.refund_requests_of(a.id).await.unwrap()[0].id, r);
 
+    // The operator sends it and records the reference; the months come back.
     let done = s.record_refund(r, "9xRefundDigest", "operator:op-1", "", now).await.unwrap().unwrap();
     assert_eq!((done.account_id, done.months), (a.id, 3));
     assert_eq!(done.paid_until, credited - link_in_bio_store::MONTH * 3, "the three months taken back");
@@ -324,6 +364,7 @@ async fn refund_requests_take_months_back_once() {
     assert_eq!(s.account(a.id).await.unwrap().unwrap().paid_until, Some(done.paid_until));
 }
 
+/// Selections reports appeals and housekeeping.
 #[tokio::test]
 async fn selections_reports_appeals_and_housekeeping() {
     let Some(s) = store().await else { return };
@@ -333,6 +374,7 @@ async fn selections_reports_appeals_and_housekeeping() {
     let b = s.create_account(&new("bob", "bob", "ref-bob-00000000001", None), now).await.unwrap();
     s.publish(a.id, "{}", now).await.unwrap();
     s.set_flags(b.id, false, false, true, &["beta".into()]).await.unwrap();
+    // A selection of accounts at least 30 days old with a published page.
     let old_published = Criteria { min_age_days: Some(30), published: Some(true), ..Default::default() };
     assert_eq!(
         s.match_selection(&old_published, now).await.unwrap().iter().map(|x| x.id).collect::<Vec<_>>(),
@@ -347,7 +389,9 @@ async fn selections_reports_appeals_and_housekeeping() {
         .create_report("alice", Some("https://x.example/"), "fraud", "fake shop", None, now - Duration::hours(25))
         .await
         .unwrap();
+    // A report about a page that does not exist is kept with its handle.
     s.create_report("nobody", None, "other", "", Some("me@example.org"), now).await.unwrap();
+    // Two open reports, one older than a day.
     let st = s.stats(now).await.unwrap();
     assert_eq!((st.reports_open, st.reports_open_over_24h, st.accounts_active, st.pages_published), (2, 1, 2, 1));
     assert!(
@@ -355,16 +399,21 @@ async fn selections_reports_appeals_and_housekeeping() {
             .await
             .unwrap()
     );
+    // A decided report cannot be decided again.
     assert!(!s.decide_report(r, "dismissed", "operator", "x", None, now).await.unwrap(), "decided once");
     assert_eq!(s.statements_for(a.id).await.unwrap().len(), 1);
+    // The holder appeals; the decision returns the account to tell.
     let ap = s.create_appeal(a.id, Some(r), "The shop is real.").await.unwrap();
     assert_eq!(s.decide_appeal(ap, "rejected", "operator", "Checked again.", now).await.unwrap(), Some(a.id));
 
+    // An audit entry for the account.
     s.audit("operator", "suspend", &a.id.to_string(), &json!({"kind": "policy"})).await.unwrap();
     assert_eq!(s.audit_log(Some(&a.id.to_string()), 10).await.unwrap().len(), 1);
     s.create_session(&sha256(b"old"), b.id, now - Duration::seconds(1)).await.unwrap();
+    // Pruning removes at least the expired session.
     assert!(s.prune(now, Duration::days(730), Duration::days(730)).await.unwrap() >= 1);
 
+    // Deleting an account erases its page and sign-in material but keeps the handle taken.
     assert!(s.delete_account(a.id, now).await.unwrap());
     let gone = s.account(a.id).await.unwrap().unwrap();
     assert_eq!(gone.status, "deleted");
@@ -372,6 +421,7 @@ async fn selections_reports_appeals_and_housekeeping() {
     assert!(!s.handle_available("alice", "allce").await.unwrap(), "a deleted handle is not reissued");
 }
 
+/// Two accounts can each use the same picture.
 #[tokio::test]
 async fn two_accounts_can_each_use_the_same_picture() {
     let Some(s) = store().await else { return };
@@ -399,6 +449,7 @@ async fn two_accounts_can_each_use_the_same_picture() {
     assert!(s.view_asset(&pic.sha256).await.unwrap().is_some());
 }
 
+/// The months a refund gives back, as the billing crate computes them (pro rata, rounded down, all of them for the whole amount), written out here so the store's test does not depend on that crate.
 fn months_refunded(months: u32, paid: u64, refunded: u64) -> u32 {
     if paid == 0 || refunded >= paid {
         months
@@ -407,6 +458,7 @@ fn months_refunded(months: u32, paid: u64, refunded: u64) -> u32 {
     }
 }
 
+/// Refunds take months back pro rata and never more than bought.
 #[tokio::test]
 async fn refunds_take_months_back_pro_rata_and_never_more_than_bought() {
     let Some(s) = store().await else { return };
@@ -486,6 +538,7 @@ async fn refunds_take_months_back_pro_rata_and_never_more_than_bought() {
     assert_eq!(r.months_taken, 0);
 }
 
+/// Refund lines take back exactly their months once.
 #[tokio::test]
 async fn refund_lines_take_back_exactly_their_months_once() {
     let Some(s) = store().await else { return };
@@ -596,6 +649,7 @@ async fn refund_lines_take_back_exactly_their_months_once() {
     assert_eq!(s.extensions(a.id).await.unwrap()[0].held, 6);
 }
 
+/// Counters are taken all or none and web risk lists are kept.
 #[tokio::test]
 async fn counters_are_taken_all_or_none_and_web_risk_lists_are_kept() {
     let Some(s) = store().await else { return };
@@ -642,6 +696,7 @@ struct Roles {
 }
 
 impl Roles {
+    /// A fresh database with the schema, and a handle to make roles on it; `None` (a logged skip) when no test database is configured.
     async fn new() -> Option<(Store, Roles)> {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
             assert!(std::env::var("REQUIRE_TEST_DATABASE").as_deref() != Ok("1"), "TEST_DATABASE_URL is required");
@@ -677,6 +732,7 @@ impl Roles {
         DatabaseSettings::parse(&url, false).unwrap().lazy_pool(2, access).unwrap()
     }
 
+    /// Drop the roles this test made, ignoring any that are already gone.
     async fn drop_all(self) {
         for r in &self.created {
             for q in [format!("DROP OWNED BY {r}"), format!("DROP ROLE {r}")] {
@@ -702,6 +758,7 @@ const PAGES: &[&str] = &[
     "ALTER ROLE {role} SET default_transaction_read_only = on",
 ];
 
+/// Whether the database refused a statement for lack of privilege (42501) or because the session is read-only (25006).
 async fn refused(pool: &sqlx::PgPool, q: &str) -> bool {
     match sqlx::query(sqlx::AssertSqlSafe(q.to_string())).execute(pool).await {
         Err(sqlx::Error::Database(e)) => {
@@ -713,6 +770,7 @@ async fn refused(pool: &sqlx::PgPool, q: &str) -> bool {
     }
 }
 
+/// The pages role reads only the public views and writes nothing.
 #[tokio::test]
 async fn the_pages_role_reads_only_the_public_views_and_writes_nothing() {
     let Some((s, mut roles)) = Roles::new().await else { return };
@@ -739,6 +797,7 @@ async fn the_pages_role_reads_only_the_public_views_and_writes_nothing() {
     roles.drop_all().await;
 }
 
+/// A writer cannot rewrite the audit log or change the schema.
 #[tokio::test]
 async fn a_writer_cannot_rewrite_the_audit_log_or_change_the_schema() {
     let Some((s, mut roles)) = Roles::new().await else { return };

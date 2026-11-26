@@ -2,10 +2,13 @@
 //! to its safest value and each one can only close the service further: nobody else can sign up, no third-party page
 //! is served, no payment is taken, unless a switch says so.
 
+// Ordered maps and sets, so the configuration prints and compares the same way every time.
 use std::collections::{BTreeMap, BTreeSet};
 
+// The site configuration is the static mode's, reused for every tenant page.
 use crate::config::{SiteConfig, SiteConfigFile};
 
+/// Who may create an account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SignupMode {
@@ -17,10 +20,13 @@ pub enum SignupMode {
     Open,
 }
 
+/// Why the configuration was refused. Each message names the setting, and never repeats a credential or an address.
 #[derive(Debug, thiserror::Error)]
 pub enum HostedConfigError {
+    /// A required setting is not set.
     #[error("{0} is not set")]
     Missing(&'static str),
+    /// A setting has a value that is not allowed: its name and what is wrong.
     #[error("{0}: {1}")]
     Invalid(&'static str, String),
 }
@@ -34,6 +40,7 @@ pub enum Keys {
     DisplayOnly,
 }
 
+/// The whole configuration of the hosted service, read once at start-up.
 #[derive(Debug, Clone)]
 pub struct HostedConfig {
     /// Whether this process holds key files ([`Keys`]).
@@ -45,18 +52,29 @@ pub struct HostedConfig {
     pub pages_domain: String,
     /// The app host (the passkey RP ID), e.g. `app.meddleware.link`.
     pub app_host: String,
+    /// The app's origin, `https://<app host>`, which every state-changing request must come from.
     pub app_origin: String,
+    /// The product's name shown to people.
     pub product_name: String,
+    /// Who may create an account.
     pub signup: SignupMode,
+    /// Whether tenant pages are served (off: only the operator's own).
     pub third_party_pages: bool,
+    /// Whether the ActivityPub actor is served.
     pub federation: bool,
+    /// The version of the terms an account accepts; `unset` keeps sign-up closed.
     pub terms_version: String,
+    /// The price of one month, in pence.
     pub price_pence: u32,
+    /// Days after the paid period ends that a page stays online.
     pub grace_days: i64,
+    /// The payment providers that are switched on (`manual` is always one).
     pub billing_providers: BTreeSet<String>,
+    /// For each provider that sells as the operator, the countries it may sell to.
     pub billing_countries: BTreeMap<String, BTreeSet<String>>,
     /// Custom domains allowed in total (0 = custom domains off). Hard stop at 100.
     pub custom_hostname_cap: i64,
+    /// The file holding the Web Risk key, if configured.
     pub web_risk_key_file: Option<String>,
     /// Which Web Risk API screens links ([`WebRiskMode`]).
     pub web_risk_mode: WebRiskMode,
@@ -72,7 +90,9 @@ pub struct HostedConfig {
     pub web_risk_max_entries: u32,
     /// How much one account may change its page ([`AccountLimits`]).
     pub account_limits: AccountLimits,
+    /// The file holding the ThreatFox key, if configured.
     pub threatfox_key_file: Option<String>,
+    /// The Sui network the app's wallet uses.
     pub sui_network: String,
     /// The Sui full node (gRPC-web) the app's wallet uses for `sui_network`: `SUI_RPC_URL`, a bare https origin, by default the
     /// public full node of testnet or mainnet; none for other networks. The UI's CSP allows the same origin (`CSP_CONNECT_SRC_EXTRA`).
@@ -81,15 +101,23 @@ pub struct HostedConfig {
     pub asset_quota_bytes: i64,
     /// The page-site template (footer, contact, security policy) every tenant page uses.
     pub site: SiteConfigFile,
+    /// Chain Payments settings, when switched on.
     pub chain_payments: Option<ChainPaymentsEnv>,
+    /// Square settings, when switched on.
     pub square: Option<SquareEnv>,
+    /// GoCardless settings, when switched on.
     pub gocardless: Option<GoCardlessEnv>,
+    /// Paddle settings, when switched on.
     pub paddle: Option<PaddleEnv>,
+    /// Bank transfer settings, when switched on.
     pub bank_transfer: Option<BankTransferEnv>,
+    /// Open Payments settings, when switched on.
     pub open_payments: Option<OpenPaymentsEnv>,
     /// The receiving banks' APIs the worker polls for bank-transfer credits (`BANK_FEEDS`); none by default.
     pub bank_feeds: Vec<BankFeedEnv>,
+    /// Seconds between polls of the bank feeds.
     pub bank_feed_poll_secs: u64,
+    /// The operator console's sign-in settings, when configured.
     pub access: Option<AccessEnv>,
 }
 
@@ -110,6 +138,7 @@ pub enum WebRiskMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountLimits {
+    /// The preset the values started from.
     pub preset: LimitsPreset,
     /// Changes an hour (`CHANGES_PER_ACCOUNT_HOUR`): publishes and picture uploads, counted together.
     pub changes_per_hour: i64,
@@ -117,10 +146,13 @@ pub struct AccountLimits {
     pub new_links_per_day: i64,
 }
 
+/// The named sets of account limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LimitsPreset {
+    /// 30 changes an hour and 120 new links a day.
     Standard,
+    /// Ten times the standard limits.
     Generous,
 }
 
@@ -137,36 +169,58 @@ impl LimitsPreset {
 /// Provider credentials are files (mounted from Secrets); the API bases default to each provider's sandbox.
 #[derive(Debug, Clone)]
 pub struct SquareEnv {
+    /// The API's base address (the sandbox by default).
     pub api_base: String,
+    /// The file holding the access token.
     pub access_token_file: String,
+    /// The Square location payments are made at.
     pub location_id: String,
+    /// The file holding the webhook signature key.
     pub signature_key_file: String,
+    /// The fixed fee in pence.
     pub fixed_pence: u32,
+    /// The percentage fee in basis points.
     pub percent_bps: u32,
 }
 
+/// GoCardless's settings.
 #[derive(Debug, Clone)]
 pub struct GoCardlessEnv {
+    /// The API's base address (the sandbox by default).
     pub api_base: String,
+    /// The file holding the access token.
     pub access_token_file: String,
+    /// The file holding the webhook secret.
     pub webhook_secret_file: String,
+    /// The fixed fee in pence.
     pub fixed_pence: u32,
+    /// The percentage fee in basis points.
     pub percent_bps: u32,
 }
 
+/// Paddle's settings.
 #[derive(Debug, Clone)]
 pub struct PaddleEnv {
+    /// The API's base address (the sandbox by default).
     pub api_base: String,
+    /// The file holding the API key.
     pub api_key_file: String,
+    /// The file holding the webhook secret.
     pub webhook_secret_file: String,
+    /// The catalog price of one month.
     pub price_id: String,
+    /// The fixed fee in pence.
     pub fixed_pence: u32,
+    /// The percentage fee in basis points.
     pub percent_bps: u32,
 }
 
+/// Bank transfer settings.
 #[derive(Debug, Clone)]
 pub struct BankTransferEnv {
+    /// The name payments are made out to.
     pub payee: String,
+    /// SEPA or Faster Payments, with the account details.
     pub scheme: link_in_bio_billing::bank_transfer::Scheme,
     /// What sending one refund by bank transfer costs the operator, in pence (`BANK_TRANSFER_REFUND_FEE_PENCE`).
     pub refund_fee_pence: u32,
@@ -175,44 +229,98 @@ pub struct BankTransferEnv {
 /// One bank feed's settings (keys and tokens are files; the API bases default to each bank's sandbox).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BankFeedEnv {
-    Wise { api_base: String, api_version: String, token_file: String, profile_id: u64, sca_key_file: Option<String> },
-    Bunq { api_base: String, api_key_file: String, key_file: String, permitted_ips: Vec<String> },
-    Revolut { api_base: String, client_id: String, issuer: String, key_file: String, refresh_token_file: String },
+    /// The Wise feed: its address, API version, token file, profile and optional SCA key file.
+    Wise {
+        /// The Wise API base address.
+        api_base: String,
+        /// The Wise API version path segment.
+        api_version: String,
+        /// The file holding the Wise API token.
+        token_file: String,
+        /// The Wise profile whose balances are read.
+        profile_id: u64,
+        /// The file holding the optional strong-customer-authentication signing key.
+        sca_key_file: Option<String>,
+    },
+    /// The bunq feed: its address, API key file, key file and permitted addresses.
+    Bunq {
+        /// The bunq API base address.
+        api_base: String,
+        /// The file holding the bunq API key.
+        api_key_file: String,
+        /// The file holding the installation's signing key.
+        key_file: String,
+        /// The addresses the API key is permitted to be used from.
+        permitted_ips: Vec<String>,
+    },
+    /// The Revolut Business feed: its address, client, issuer, key file and refresh-token file.
+    Revolut {
+        /// The Revolut Business API base address.
+        api_base: String,
+        /// The OAuth client identifier.
+        client_id: String,
+        /// The issuer named in the client assertion.
+        issuer: String,
+        /// The file holding the client-assertion signing key.
+        key_file: String,
+        /// The file holding the refresh token.
+        refresh_token_file: String,
+    },
 }
 
 /// Open Payments: the operator's wallet address (the payee and the client), the client key's id at the wallet provider
 /// and its file, and the wallet's asset.
 #[derive(Debug, Clone)]
 pub struct OpenPaymentsEnv {
+    /// The operator's wallet address.
     pub wallet_address: String,
+    /// The key id the wallet provider lists for the client key.
     pub key_id: String,
+    /// The file holding the client's private key.
     pub key_file: String,
+    /// The wallet's asset code.
     pub asset_code: String,
+    /// The asset's decimals.
     pub asset_scale: u8,
+    /// The price of a month in the asset's smallest unit, required unless the asset is pounds.
     pub minor_per_month: Option<u64>,
     /// What sending one refund from the operator's wallet costs, in pence (`OPEN_PAYMENTS_REFUND_FEE_PENCE`).
     pub refund_fee_pence: u32,
 }
 
+/// Chain Payments settings.
 #[derive(Debug, Clone)]
 pub struct ChainPaymentsEnv {
+    /// The merchant API, inside the cluster.
     pub merchant_api: String,
+    /// The public session API, as this process reaches it.
     pub public_api: String,
+    /// The origin the buyer's browser calls.
     pub checkout_origin: String,
+    /// The file holding the merchant API key.
     pub api_key_file: String,
+    /// The methods to offer, as id and label.
     pub methods: Vec<(String, String)>,
+    /// The webhook public key, if set.
     pub webhook_key: Option<String>,
 }
 
+/// The operator console's sign-in settings.
 #[derive(Debug, Clone)]
 pub struct AccessEnv {
+    /// The Access team domain, an https address, which is both the token issuer and where its keys come from.
     pub team_domain: String,
+    /// The audience tag the tokens must carry.
     pub audience: String,
+    /// Keto's read address, for the role check.
     pub keto_read_url: String,
+    /// The console's origin.
     pub admin_origin: String,
 }
 
+/// A host name, lower-cased and checked; the error names the setting, not the value.
 fn host(var: &'static str, v: &str) -> Result<String, HostedConfigError> {
+    // A host name: at least two labels of letters, digits and hyphens, each up to 63 characters.
     let h = v.trim().trim_end_matches('.').to_ascii_lowercase();
     let ok = !h.is_empty()
         && h.len() <= 253
@@ -234,6 +342,7 @@ fn public_full_node(network: &str) -> Option<&'static str> {
 /// `SUI_RPC_URL`: a bare https origin (`https://host` or `https://host:port`), the same value the UI's CSP takes, so no path, query,
 /// credentials or anything that could add to a policy. Only testnet and mainnet take one (the wallet's override is for those).
 fn sui_rpc_url(network: &str, v: Option<String>) -> Result<Option<String>, HostedConfigError> {
+    // Unset means the network's public full node.
     let Some(v) = v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
         return Ok(public_full_node(network).map(str::to_string));
     };
@@ -245,6 +354,7 @@ fn sui_rpc_url(network: &str, v: Option<String>) -> Result<Option<String>, Hoste
     }
     let bad =
         || HostedConfigError::Invalid("SUI_RPC_URL", "a bare https origin (https://host or https://host:port)".into());
+    // Only a bare https origin: no path, query or credentials.
     let rest = v.strip_prefix("https://").ok_or_else(bad)?;
     let (h, port) = match rest.rsplit_once(':') {
         Some((h, p)) => (h, Some(p)),
@@ -265,22 +375,27 @@ fn sui_rpc_url(network: &str, v: Option<String>) -> Result<Option<String>, Hoste
     }))
 }
 
+/// A comma-separated list of two-letter country codes, upper-cased; anything else is dropped.
 fn countries(v: &str) -> BTreeSet<String> {
     v.split(',')
         .map(|c| c.trim().to_ascii_uppercase())
+        // Only two-letter country codes are kept.
         .filter(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()))
         .collect()
 }
 
+/// A switch: on or off (also true/false and 1/0), with a default.
 fn on(get: &impl Fn(&str) -> Option<String>, var: &str, default: bool) -> Result<bool, HostedConfigError> {
     match get(var).as_deref().map(str::trim) {
         None | Some("") => Ok(default),
+        // Both words and digits are accepted for a switch; anything else is an error.
         Some("on" | "true" | "1") => Ok(true),
         Some("off" | "false" | "0") => Ok(false),
         Some(_) => Err(HostedConfigError::Invalid("switch", format!("{var} must be on or off"))),
     }
 }
 
+/// A number within bounds, with a default; an out-of-range value is an error that names the setting.
 fn number<T: std::str::FromStr + PartialOrd>(
     get: &impl Fn(&str) -> Option<String>,
     var: &'static str,
@@ -298,6 +413,7 @@ fn number<T: std::str::FromStr + PartialOrd>(
 }
 
 impl HostedConfig {
+    /// The configuration of a process that holds key files (`Keys::Read`), read through `get`, which is the environment in production and a map in tests.
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, HostedConfigError> {
         Self::from_env_with(get, Keys::Read)
     }
@@ -307,7 +423,9 @@ impl HostedConfig {
     /// providers and feeds are on, whether Web Risk is), but no `*_FILE` setting is required or kept, so nothing reads
     /// one.
     pub fn from_env_with(get: impl Fn(&str) -> Option<String>, keys: Keys) -> Result<Self, HostedConfigError> {
+        // A process without keys still parses every switch, but requires and keeps no key file.
         let display_only = keys == Keys::DisplayOnly;
+        // A required key file: its path, or nothing for a process that holds no keys.
         let key = |v: &'static str| -> Result<String, HostedConfigError> {
             if display_only {
                 Ok(String::new())
@@ -315,13 +433,17 @@ impl HostedConfig {
                 get(v).filter(|x| !x.trim().is_empty()).ok_or(HostedConfigError::Missing(v))
             }
         };
+        // An optional key file, with the same rule.
         let key_opt = |v: &'static str| -> Option<String> {
             if display_only { None } else { get(v).filter(|x| !x.trim().is_empty()) }
         };
+        // Whether Web Risk is on is shown even to a process that does not hold the key.
         let web_risk_set = get("WEB_RISK_KEY_FILE").is_some_and(|v| !v.trim().is_empty());
         let pages_domain =
             host("PAGES_DOMAIN", &get("PAGES_DOMAIN").ok_or(HostedConfigError::Missing("PAGES_DOMAIN"))?)?;
+        // The app host is the passkey relying-party id and the app's origin.
         let app_host = host("APP_HOST", &get("APP_HOST").ok_or(HostedConfigError::Missing("APP_HOST"))?)?;
+        // Sign-up is closed unless a setting opens it.
         let signup = match get("SIGNUP_MODE").as_deref().map(str::trim) {
             None | Some("") | Some("closed") => SignupMode::Closed,
             Some("invite") => SignupMode::Invite,
@@ -336,7 +458,9 @@ impl HostedConfig {
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty())
             .collect();
+        // The manual provider is always on: it is how the operator grants months.
         billing_providers.insert("manual".into());
+        // Only the built-in providers are accepted, so a typo cannot silently turn nothing on.
         for p in &billing_providers {
             if !["manual", "chain-payments", "square", "gocardless", "paddle", "bank-transfer", "open-payments"]
                 .contains(&p.as_str())
@@ -346,12 +470,15 @@ impl HostedConfig {
         }
         let mut billing_countries = BTreeMap::new();
         for p in &billing_providers {
+            // Each provider's own list of countries, such as `SQUARE_COUNTRIES`.
             let var = format!("{}_COUNTRIES", p.to_ascii_uppercase().replace('-', "_"));
             if let Some(v) = get(&var) {
                 billing_countries.insert(p.clone(), countries(&v));
             }
         }
+        // Chain Payments needs its methods, its origin and its API addresses.
         let chain_payments = if billing_providers.contains("chain-payments") {
+            // A required value of this provider.
             let need = |v: &'static str| get(v).ok_or(HostedConfigError::Missing(v));
             let methods: Vec<(String, String)> = need("CHAIN_PAYMENTS_METHODS")?
                 .split(',')
@@ -365,6 +492,7 @@ impl HostedConfig {
                 ));
             }
             let checkout_origin = need("CHAIN_PAYMENTS_ORIGIN")?;
+            // The buyer's browser calls this origin, so it must be https.
             if !checkout_origin.starts_with("https://") {
                 return Err(HostedConfigError::Invalid("CHAIN_PAYMENTS_ORIGIN", "must be https".into()));
             }
@@ -379,7 +507,9 @@ impl HostedConfig {
         } else {
             None
         };
+        // A required value, which may not be blank.
         let need = |v: &'static str| get(v).filter(|x| !x.trim().is_empty()).ok_or(HostedConfigError::Missing(v));
+        // An API base address defaults to the provider's sandbox and must be https (or the loopback address of a test).
         let base = |v: &'static str, sandbox: &str| -> Result<String, HostedConfigError> {
             let b = get(v).unwrap_or_else(|| sandbox.to_string());
             if b.starts_with("https://") || b.starts_with("http://127.0.0.1:") {
@@ -388,6 +518,7 @@ impl HostedConfig {
                 Err(HostedConfigError::Invalid(v, "must be https".into()))
             }
         };
+        // Each provider's settings exist only when it is switched on.
         let square = if billing_providers.contains("square") {
             Some(SquareEnv {
                 api_base: base("SQUARE_API_BASE", "https://connect.squareupsandbox.com")?,
@@ -400,6 +531,7 @@ impl HostedConfig {
         } else {
             None
         };
+        // GoCardless: sandbox by default, fees overridable.
         let gocardless = if billing_providers.contains("gocardless") {
             Some(GoCardlessEnv {
                 api_base: base("GOCARDLESS_API_BASE", "https://api-sandbox.gocardless.com")?,
@@ -411,6 +543,7 @@ impl HostedConfig {
         } else {
             None
         };
+        // Paddle: sandbox by default, its price id required.
         let paddle = if billing_providers.contains("paddle") {
             Some(PaddleEnv {
                 api_base: base("PADDLE_API_BASE", "https://sandbox-api.paddle.com")?,
@@ -423,8 +556,10 @@ impl HostedConfig {
         } else {
             None
         };
+        // Bank transfer: the scheme and the account.
         let bank_transfer = if billing_providers.contains("bank-transfer") {
             use link_in_bio_billing::bank_transfer::Scheme;
+            // The scheme decides which account details are required.
             let scheme = match need("BANK_TRANSFER_SCHEME")?.as_str() {
                 "sepa" => Scheme::Sepa {
                     iban: need("BANK_TRANSFER_IBAN")?,
@@ -450,8 +585,10 @@ impl HostedConfig {
         } else {
             None
         };
+        // Open Payments: the wallet address and key.
         let open_payments = if billing_providers.contains("open-payments") {
             let wallet_address = need("OPEN_PAYMENTS_WALLET_ADDRESS")?;
+            // The wallet address must be https (or a loopback test address).
             if !(wallet_address.starts_with("https://") || wallet_address.starts_with("http://127.0.0.1:")) {
                 return Err(HostedConfigError::Invalid("OPEN_PAYMENTS_WALLET_ADDRESS", "must be https".into()));
             }
@@ -471,6 +608,7 @@ impl HostedConfig {
         } else {
             None
         };
+        // The feeds the worker will poll.
         let mut bank_feeds = Vec::new();
         let feeds: BTreeSet<String> = get("BANK_FEEDS")
             .unwrap_or_default()
@@ -478,12 +616,14 @@ impl HostedConfig {
             .map(|f| f.trim().to_string())
             .filter(|f| !f.is_empty())
             .collect();
+        // Bank feeds only reconcile bank transfers, so they need that provider on.
         if !feeds.is_empty() && bank_transfer.is_none() {
             return Err(HostedConfigError::Invalid(
                 "BANK_FEEDS",
                 "bank feeds reconcile bank transfers: add bank-transfer to BILLING_PROVIDERS".into(),
             ));
         }
+        // Each named feed needs its own settings.
         for f in &feeds {
             bank_feeds.push(match f.as_str() {
                 "wise" => BankFeedEnv::Wise {
@@ -519,10 +659,13 @@ impl HostedConfig {
         if bank_feeds.iter().any(|f| matches!(f, BankFeedEnv::Wise { profile_id: 0, .. })) {
             return Err(HostedConfigError::Missing("WISE_PROFILE_ID"));
         }
+        // Between five minutes and a day, fifteen minutes by default.
         let bank_feed_poll_secs = number(&get, "BANK_FEED_POLL_SECS", 900u64, 300, 86_400)?;
+        // The console's sign-in is configured only when both the team domain and the audience are set.
         let access = match (get("ACCESS_TEAM_DOMAIN"), get("ACCESS_AUD")) {
             // The team domain is both the token issuer and where its signing keys are fetched: https only, or the keys
             // could be swapped on the way.
+            // The identity keys come from this address, so it must be https.
             (Some(team), Some(_)) if !team.trim().starts_with("https://") => {
                 return Err(HostedConfigError::Invalid("ACCESS_TEAM_DOMAIN", "must be https".into()));
             }
@@ -534,6 +677,7 @@ impl HostedConfig {
             }),
             _ => None,
         };
+        // The site template every tenant page uses, from a file, or a minimal one.
         let site: SiteConfigFile = match get("SITE_CONFIG") {
             Some(path) => {
                 let bytes =
@@ -543,15 +687,18 @@ impl HostedConfig {
             None => serde_json::from_value(serde_json::json!({ "baseUrl": format!("https://{pages_domain}/") }))
                 .map_err(|e| HostedConfigError::Invalid("SITE_CONFIG", e.to_string()))?,
         };
+        // Lookup is the default; update is opt-in.
         let web_risk_mode = match get("WEB_RISK_MODE").as_deref().map(str::trim) {
             None | Some("") | Some("lookup") => WebRiskMode::Lookup,
             Some("update") => WebRiskMode::Update,
             Some(o) => return Err(HostedConfigError::Invalid("WEB_RISK_MODE", format!("{o} is not lookup or update"))),
         };
+        // The free allowance with a margin, at most the hard stop.
         let web_risk_monthly_cap = number(&get, "WEB_RISK_MONTHLY_CAP", 90_000i64, 0, 100_000)?;
         let web_risk_paid_monthly_calls = number(&get, "WEB_RISK_PAID_MONTHLY_CALLS", 0i64, 0, 9_900_000)?;
         let web_risk_confirm_monthly_cap = number(&get, "WEB_RISK_CONFIRM_MONTHLY_CAP", 0i64, 0, 100_000)?;
         // Each mode's own budget only: a value meant for the other mode would not do what it says.
+        // Each mode takes only its own budget, so a value meant for the other mode is an error, not a silent no-op.
         if web_risk_mode == WebRiskMode::Update && web_risk_paid_monthly_calls > 0 {
             return Err(HostedConfigError::Invalid(
                 "WEB_RISK_PAID_MONTHLY_CALLS",
@@ -565,6 +712,7 @@ impl HostedConfig {
                 "applies to WEB_RISK_MODE=update only (lookup mode never calls hashes.search)".into(),
             ));
         }
+        // Confirmations are counted in the call cap too, so they cannot exceed it.
         if web_risk_confirm_monthly_cap > web_risk_monthly_cap {
             return Err(HostedConfigError::Invalid(
                 "WEB_RISK_CONFIRM_MONTHLY_CAP",
@@ -572,6 +720,7 @@ impl HostedConfig {
             ));
         }
         let web_risk_max_entries = number(&get, "WEB_RISK_MAX_ENTRIES", 262_144u32, 1024, 1_048_576)?;
+        // Web Risk accepts only powers of two for the list size.
         if !web_risk_max_entries.is_power_of_two() {
             return Err(HostedConfigError::Invalid(
                 "WEB_RISK_MAX_ENTRIES",
@@ -585,20 +734,26 @@ impl HostedConfig {
                 return Err(HostedConfigError::Invalid("ACCOUNT_LIMITS", format!("{o} is not standard or generous")));
             }
         };
+        // The preset gives the defaults; each value can be overridden on its own.
         let (publishes, new_links) = preset.values();
+        // The preset's values, each overridable.
         let account_limits = AccountLimits {
             preset,
             changes_per_hour: number(&get, "CHANGES_PER_ACCOUNT_HOUR", publishes, 0, 100_000)?,
             new_links_per_day: number(&get, "NEW_LINKS_PER_ACCOUNT_DAY", new_links, 0, 1_000_000)?,
         };
+        // Off by default, and never more than 100.
         let custom_hostname_cap = number(&get, "CUSTOM_HOSTNAME_CAP", 0i64, 0, 100)?;
+        // Testnet unless told otherwise.
         let sui_network = get("SUI_NETWORK").unwrap_or_else(|| "testnet".into());
         Ok(Self {
             keys,
+            // Web Risk counts as on when a key is configured and the cap is above zero.
             web_risk_on: web_risk_set && web_risk_monthly_cap > 0,
             app_origin: format!("https://{app_host}"),
             product_name: get("PRODUCT_NAME").unwrap_or_else(|| "Link in Bio".into()),
             signup,
+            // Off by default: only the operator's pages are served.
             third_party_pages: on(&get, "THIRD_PARTY_PAGES", false)?,
             federation: on(&get, "FEDERATION", true)?,
             terms_version: get("TERMS_VERSION").unwrap_or_else(|| "unset".into()),
@@ -617,6 +772,7 @@ impl HostedConfig {
             threatfox_key_file: key_opt("THREATFOX_KEY_FILE"),
             sui_rpc_url: sui_rpc_url(&sui_network, get("SUI_RPC_URL"))?,
             sui_network,
+            // Half a mebibyte of pictures by default.
             asset_quota_bytes: number(&get, "ASSET_QUOTA_BYTES", 512 * 1024i64, 64 * 1024, 16 * 1024 * 1024)?,
             pages_domain,
             app_host,
@@ -635,11 +791,13 @@ impl HostedConfig {
 
     /// A refusal to sign up is the default: an instance that has not chosen its terms cannot take accounts.
     pub fn signup_open_to_public(&self) -> bool {
+        // Both a mode and chosen terms.
         self.signup != SignupMode::Closed && self.terms_version != "unset"
     }
 
     /// The page-site configuration of one tenant page.
     pub fn site_for(&self, handle: &str, host: &str) -> Result<SiteConfig, crate::config::ConfigError> {
+        // The shared template, with this page's address, federation and report link.
         let mut f = self.site.clone();
         f.base_url = format!("https://{host}/");
         f.federation = self.federation && f.federation;
@@ -649,19 +807,23 @@ impl HostedConfig {
 
     /// The handle a page host names (`<handle>.<pages_domain>`), if it is one.
     pub fn handle_of_host<'a>(&self, host: &'a str) -> Option<&'a str> {
+        // One label under the pages domain is a handle; more labels are not.
         let h = host.strip_suffix(&self.pages_domain)?.strip_suffix('.')?;
         (!h.is_empty() && !h.contains('.')).then_some(h)
     }
 }
 
+/// Unit tests for the configuration.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A lookup over a fixed list of settings, for the tests.
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
     }
 
+    /// With only the two required settings everything is closed: no sign-up, no third-party pages, only the manual provider, no custom domains, no feeds, no billed Web Risk calls and the standard limits; hosts resolve to handles only one label deep.
     #[test]
     fn defaults_are_closed() {
         let c =
@@ -687,6 +849,7 @@ mod tests {
         assert_eq!(s.footer.report_url.as_deref(), Some("https://app.example.link/report?page=alice"));
     }
 
+    /// The full node is the network's public one unless set, and a set value must be a bare https origin; paths, queries, credentials, wildcards, policy injection and bad ports are refused.
     #[test]
     fn the_full_node_is_the_public_one_unless_set_and_only_a_bare_https_origin() {
         let base = [("PAGES_DOMAIN", "example.link"), ("APP_HOST", "app.example.link")];
@@ -726,6 +889,7 @@ mod tests {
         assert!(with(&[("SUI_NETWORK", "localnet"), ("SUI_RPC_URL", "https://sui.example")]).is_err());
     }
 
+    /// Bank feeds read their settings and default to each bank's sandbox, polling every 15 minutes.
     #[test]
     fn bank_feeds_default_to_the_sandboxes() {
         let c = HostedConfig::from_env(env(&[
@@ -767,6 +931,7 @@ mod tests {
         assert_eq!(c.bank_feed_poll_secs, 900);
     }
 
+    /// Doubtful values are refused: unknown modes and providers, a provider without its settings, feeds without bank transfer, values past a hard stop, an http identity address and a pages domain with no dot.
     #[test]
     fn refuses_doubtful_values() {
         let base = [("PAGES_DOMAIN", "example.link"), ("APP_HOST", "app.example.link")];
@@ -806,6 +971,7 @@ mod tests {
         assert!(HostedConfig::from_env(env(&[("PAGES_DOMAIN", "x"), ("APP_HOST", "app.example.link")])).is_err());
     }
 
+    /// A preset sets the limits, each can be overridden (zero means none), and confirmations may not exceed the monthly cap.
     #[test]
     fn account_limits_are_a_preset_with_each_value_overridable() {
         let base = [("PAGES_DOMAIN", "example.link"), ("APP_HOST", "app.example.link")];
@@ -824,6 +990,7 @@ mod tests {
         assert!(HostedConfig::from_env(env(&both)).is_err(), "confirmations are part of the monthly cap");
     }
 
+    /// Lookup mode takes paid calls and refuses confirmations; update mode takes confirmations and refuses paid calls; the free allowance is at most 100 000.
     #[test]
     fn each_web_risk_mode_takes_only_its_own_budget() {
         let base = [("PAGES_DOMAIN", "example.link"), ("APP_HOST", "app.example.link")];

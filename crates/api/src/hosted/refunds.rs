@@ -21,6 +21,8 @@ use crate::time::rfc3339_full as ts;
 /// A method's fees as configured now (what the providers keep when a payment is refunded): the fallback for checkouts
 /// made before schema 6 recorded their own.
 pub fn fees_for(config: &HostedConfig, provider: &str) -> Fees {
+    // Square, GoCardless and Paddle use their configured fees; Chain Payments' is the platform fee; any other provider has none.
+    // No fees, for providers that have none.
     let none = Fees { fixed_pence: 0, percent_bps: 0 };
     match provider {
         "square" => {
@@ -48,16 +50,21 @@ pub fn refund_charge_for(config: &HostedConfig, provider: &str) -> u64 {
 
 /// An account's purchases and grants as refund entries, newest first.
 pub async fn history(app: &Shared, a: &Account) -> ApiResult<Vec<Entry>> {
+    // Each ledger row becomes a refund entry: what it received, how many months it still gives, when its first month started, its fees and where a refund would go.
+    // Every purchase and grant, with the months each still gives.
     let rows = app.store.extensions(a.id).await?;
     Ok(rows
         .into_iter()
         .map(|e| {
+            // The months and the amount, as unsigned numbers.
             let months = u32::try_from(e.months).unwrap_or(0);
             let pence = u64::try_from(e.amount_pence).unwrap_or(0);
+            // What the purchase received, from the provider's evidence, or worked out for Open Payments.
             let received = refunds::received(&e.provider, &e.evidence, pence).or_else(|| {
                 // An Open Payments purchase settled by a poll has no amount in its evidence: the checkout's, in the
                 // configured asset.
                 let op = app.config.open_payments.as_ref().filter(|_| e.provider == open_payments::ID)?;
+                // The configured price per month, or the pence price when the asset is pounds.
                 let minor = match op.minor_per_month {
                     Some(m) => m.checked_mul(u64::from(months))?,
                     None if op.asset_code == "GBP" && op.asset_scale == 2 => pence,
@@ -70,9 +77,12 @@ pub async fn history(app: &Shared, a: &Account) -> ApiResult<Vec<Entry>> {
                 provider: e.provider.clone(),
                 kind: e.kind.clone(),
                 months,
+                // The months still given, never below zero or above what was bought.
                 held: u32::try_from(e.held.clamp(0, i64::from(e.months))).unwrap_or(0),
                 at: e.created_at,
+                // Its first month began one purchase-length before the period ended after it.
                 start: e.paid_until_after.map_or(e.created_at, |u| u - refunds::MONTH * months),
+                // A late payment is marked in its evidence.
                 unapplied: e.evidence["unapplied"].as_bool().unwrap_or(false),
                 amount_pence: pence,
                 received,
@@ -93,8 +103,11 @@ pub async fn history(app: &Shared, a: &Account) -> ApiResult<Vec<Entry>> {
 
 /// `minor` in units of `scale` decimals (`3494`, 2 → `34.94`).
 pub fn decimal(minor: i64, scale: Option<i32>) -> String {
+    // The amount is written with the unit's decimals; a scale of zero or an unknown one leaves the whole number.
+    // A usable scale is 1 to 18 decimals.
     match scale.and_then(|s| u32::try_from(s).ok()).filter(|s| *s > 0 && *s <= 18) {
         Some(s) => {
+            // The power of ten that separates whole units from the fraction.
             let d = 10i128.pow(s);
             let m = i128::from(minor);
             format!("{}{}.{:0width$}", if m < 0 { "-" } else { "" }, m.abs() / d, m.abs() % d, width = s as usize)
@@ -103,7 +116,9 @@ pub fn decimal(minor: i64, scale: Option<i32>) -> String {
     }
 }
 
+/// One line of an offer as the API answers it, with the amount as an exact decimal string.
 pub fn offer_line_json(l: &Line) -> Value {
+    // The scale as the formatter takes it.
     let scale = l.scale.map(|s| s as i32);
     json!({
         "purchase": l.purchase, "provider": l.provider, "months": l.months,
@@ -113,6 +128,7 @@ pub fn offer_line_json(l: &Line) -> Value {
     })
 }
 
+/// An offer as the API answers it: the kind, the months, until when it holds and its lines.
 pub fn offer_json(o: &Offer) -> Value {
     json!({
         "kind": o.kind, "months": o.months, "until": o.until.map(ts),
@@ -120,6 +136,7 @@ pub fn offer_json(o: &Offer) -> Value {
     })
 }
 
+/// A recorded refund line as the API answers it, with its status and the months its purchase still gives.
 pub fn line_json(l: &RefundLine) -> Value {
     json!({
         "purchase": l.purchase_id, "checkout": l.checkout_id, "provider": l.provider, "months": l.months,
@@ -133,9 +150,11 @@ pub fn line_json(l: &RefundLine) -> Value {
     })
 }
 
+/// The lines of an offer as rows to store, with every amount that cannot fit capped rather than wrapped.
 pub fn new_lines(o: &Offer) -> Vec<NewRefundLine> {
     o.lines
         .iter()
+        // One row to store for each line of the offer.
         .map(|l| NewRefundLine {
             purchase_id: l.purchase,
             checkout_id: l.checkout,
@@ -156,6 +175,7 @@ pub fn new_lines(o: &Offer) -> Vec<NewRefundLine> {
 
 /// What a request's details record: when it was worked out and until when it holds.
 pub fn details(o: &Offer, at: OffsetDateTime) -> Value {
+    // When the offer was worked out, and until when it holds.
     json!({ "computedAt": ts(at), "until": o.until.map(ts), "months": o.months })
 }
 
@@ -169,7 +189,10 @@ pub async fn match_provider_refund(
     checkout: uuid::Uuid,
     e: &ProviderEvent,
 ) -> ApiResult<bool> {
+    // A refund of any amount other than exactly the line's is not matched: it is audited once for the operator and applied pro rata by the caller.
+    // No open request names this purchase: not matched.
     let Some(line) = app.store.open_refund_line_for_checkout(checkout).await? else { return Ok(false) };
+    // A refund with no amount cannot be matched to a line.
     let Some(r) = e.refunded else { return Ok(false) };
     if i64::try_from(r.minor).ok() != Some(line.amount_minor) {
         app.store
@@ -195,6 +218,7 @@ pub async fn match_provider_refund(
             now(),
         )
         .await?;
+    // Already applied before: it counts as matched, so it is not applied again.
     let Some(done) = done else { return Ok(true) };
     app.store
         .audit(
@@ -206,14 +230,17 @@ pub async fn match_provider_refund(
                      "paidUntil": done.paid_until.map(ts) }),
         )
         .await?;
+    // The account's page is forgotten at once so a changed period shows.
     if let Some(a) = app.store.account(done.account_id).await? {
         app.pages.forget(&format!("{}.{}", a.handle, app.config.pages_domain)).await;
     }
     Ok(true)
 }
 
+/// Unit tests for the amount formatting.
 #[cfg(test)]
 mod tests {
+    /// Amounts are written with the right number of decimals for the unit.
     #[test]
     fn decimals() {
         assert_eq!(super::decimal(3494, Some(2)), "34.94");

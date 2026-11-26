@@ -4,6 +4,7 @@
 //! The writer role (app, admin, worker) uses the `lib.*` tables; the page process uses only the `public.*_v1` views
 //! ([`Store::view_page`] and the other `view_*` methods), which the read-only role can read and nothing else.
 
+/// The connection settings.
 pub mod config;
 
 use std::collections::HashSet;
@@ -15,8 +16,10 @@ use sqlx::{Postgres, Row, Transaction};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
+/// The database error type, as `sqlx` defines it.
 pub use sqlx::Error as DbError;
 
+/// The embedded migrations, checked by checksum and run by the `migrate` subcommand.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// SHA-256, the only form a secret (session cookie, invite code, recovery code) or a link URL is stored or looked up in.
@@ -33,28 +36,47 @@ pub fn day(t: OffsetDateTime) -> String {
     format!("{:04}-{:02}-{:02}", t.year(), u8::from(t.month()), t.day())
 }
 
+/// The database handle: every statement of the hosted service is a method of it. It owns a connection pool and nothing else.
 #[derive(Clone)]
 pub struct Store {
+    /// The pool of connections, created lazily by the settings.
     pool: PgPool,
 }
 
+/// An account as the writer role reads it (`lib.accounts`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Account {
+    /// The account's id.
     pub id: Uuid,
+    /// The handle, which is also the page's host name.
     pub handle: String,
+    /// `active`, `suspended` or `deleted`.
     pub status: String,
+    /// `legal` (a page withheld on legal grounds, 451) or `policy` (removed under the acceptable use policy, 410) when suspended.
     pub suspension_kind: Option<String>,
+    /// The reason given to the account holder, up to 2000 characters.
     pub suspension_reason: Option<String>,
+    /// When the suspension ends, if it does.
     pub suspended_until: Option<OffsetDateTime>,
+    /// A free account (from an operator-issued invite); a paid one carries `paid_until` instead.
     pub free: bool,
+    /// One of the operator's own accounts: the only tenant pages served while third-party pages are off.
     pub operator: bool,
+    /// Whether invite codes the operator gave this account may still be redeemed.
     pub may_share_invites: bool,
+    /// The account that invited this one.
     pub invited_by: Option<Uuid>,
+    /// Free-form tags the operator attaches.
     pub tags: Vec<String>,
+    /// The version of the terms accepted at sign-up.
     pub terms_version: String,
+    /// The country the holder declared (ISO 3166-1 alpha-2), kept as tax evidence.
     pub country_declared: Option<String>,
+    /// The opaque reference given to payment providers, never the handle or the id.
     pub billing_ref: String,
+    /// The end of the paid period.
     pub paid_until: Option<OffsetDateTime>,
+    /// When the account was made.
     pub created_at: OffsetDateTime,
 }
 
@@ -65,6 +87,7 @@ impl Account {
     }
 }
 
+/// The column list that [`Account`] reads, written once so every query selects the same columns.
 macro_rules! account_columns {
     () => {
         "id, handle, status, suspension_kind, suspension_reason, suspended_until, free, operator, may_share_invites, \
@@ -72,15 +95,22 @@ macro_rules! account_columns {
     };
 }
 
+/// What creating an account needs.
 #[derive(Debug, Clone)]
 pub struct NewAccount<'a> {
     /// Chosen before the account exists (a passkey ceremony needs the user id first).
     pub id: Uuid,
+    /// The chosen handle.
     pub handle: &'a str,
+    /// The handle's confusable skeleton: two handles that look alike cannot both exist.
     pub handle_skeleton: &'a str,
+    /// The version of the terms accepted.
     pub terms_version: &'a str,
+    /// The country the holder declared.
     pub country_declared: Option<&'a str>,
+    /// The opaque reference for payment providers.
     pub billing_ref: &'a str,
+    /// Whether this is an operator account.
     pub operator: bool,
     /// The initial (unpublished) page document.
     pub draft: &'a str,
@@ -88,69 +118,112 @@ pub struct NewAccount<'a> {
     pub invite_hash: Option<&'a [u8]>,
 }
 
+/// Why an account could not be created.
 #[derive(Debug, thiserror::Error)]
 pub enum CreateError {
+    /// The handle exists or is too close to one that does.
     #[error("that handle is taken or too close to one that exists")]
     HandleTaken,
+    /// The invite code does not exist, is used, is revoked or has expired.
     #[error("that invite code is not valid")]
     InviteInvalid,
+    /// The database failed.
     #[error(transparent)]
     Db(#[from] DbError),
 }
 
+/// A page as its owner sees it (`lib.pages`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct PageRow {
+    /// The draft document, canonical JSON.
     pub draft: String,
+    /// The published document, if any.
     pub published: Option<String>,
+    /// The number of the current version.
     pub version: i32,
+    /// When the draft last changed.
     pub updated_at: OffsetDateTime,
+    /// When it was last published.
     pub published_at: Option<OffsetDateTime>,
 }
 
 /// What the page process reads about a handle (`public.page_v1`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct PublicPage {
+    /// The handle.
     pub handle: String,
+    /// The account's status.
     pub status: String,
+    /// The kind of suspension, if any.
     pub suspension_kind: Option<String>,
+    /// When the suspension ends.
     pub suspended_until: Option<OffsetDateTime>,
+    /// Whether the account is free.
     pub free: bool,
+    /// Whether it is an operator account.
     pub operator: bool,
+    /// The end of the paid period.
     pub paid_until: Option<OffsetDateTime>,
+    /// The published document.
     pub published: Option<String>,
+    /// When it was published.
     pub published_at: Option<OffsetDateTime>,
 }
 
+/// A stored picture (`lib.assets`), addressed by its content hash.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct AssetRow {
+    /// The hex SHA-256 of the bytes.
     pub sha256: String,
+    /// The media type.
     pub mime: String,
+    /// The file extension.
     pub ext: String,
+    /// The width in pixels.
     pub width: i32,
+    /// The height in pixels.
     pub height: i32,
+    /// The re-encoded picture.
     pub bytes: Vec<u8>,
 }
 
+/// An invite code's record (`lib.invites`); the code itself is looked up by its hash.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Invite {
+    /// The invite's id.
     pub id: Uuid,
+    /// The account the operator gave the code to, to pass on.
     pub held_by: Option<Uuid>,
+    /// The saved selection the code was issued for.
     pub selection_id: Option<Uuid>,
+    /// The operator's note.
     pub note: Option<String>,
+    /// Who issued it.
     pub created_by: String,
+    /// When it was issued.
     pub created_at: OffsetDateTime,
+    /// When it stops being valid.
     pub expires_at: OffsetDateTime,
+    /// The account that used it.
     pub redeemed_by: Option<Uuid>,
+    /// When it was used.
     pub redeemed_at: Option<OffsetDateTime>,
+    /// When it was revoked.
     pub revoked_at: Option<OffsetDateTime>,
 }
 
+/// A saved set of criteria for issuing invites to a group of accounts (`lib.selections`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Selection {
+    /// The selection's id.
     pub id: Uuid,
+    /// Its unique name.
     pub name: String,
+    /// The criteria as JSON (see [`Criteria`]).
     pub criteria: Value,
+    /// Who saved it.
     pub created_by: String,
+    /// When it was saved.
     pub created_at: OffsetDateTime,
 }
 
@@ -170,34 +243,57 @@ pub struct Criteria {
     pub tag: Option<String>,
 }
 
+/// A started purchase (`lib.checkouts`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Checkout {
+    /// The checkout's id.
     pub id: Uuid,
+    /// The buyer's account.
     pub account_id: Uuid,
+    /// The payment provider.
     pub provider: String,
+    /// The provider's reference for it.
     pub provider_ref: String,
+    /// The method the buyer chose.
     pub method: String,
+    /// The months being bought.
     pub months: i32,
+    /// The price in pence.
     pub amount_pence: i64,
+    /// `open`, `paid`, `expired` or `cancelled`.
     pub status: String,
+    /// The buyer's declared country, as tax evidence.
     pub country_declared: Option<String>,
+    /// The country of the request (`CF-IPCountry`), as tax evidence.
     pub country_request: Option<String>,
+    /// When it was started.
     pub created_at: OffsetDateTime,
+    /// When it was paid or closed.
     pub completed_at: Option<OffsetDateTime>,
     /// The method's fees when the checkout was made (`None` before schema 6).
     pub fee_fixed_pence: Option<i32>,
+    /// The method's percentage fee in basis points when the checkout was made (`None` before schema 6).
     pub fee_percent_bps: Option<i32>,
 }
 
+/// One change to an account's paid period (`lib.billing_events`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct BillingEvent {
+    /// The event's id.
     pub id: Uuid,
+    /// The provider the change came from.
     pub provider: String,
+    /// The provider's id of the event, unique per provider, which makes a change apply once.
     pub provider_event: String,
+    /// `purchase`, `grant` or `refund`.
     pub kind: String,
+    /// The months added (negative for a refund).
     pub months: i32,
+    /// The amount in pence.
     pub amount_pence: i64,
+    /// The end of the paid period after the change.
     pub paid_until_after: Option<OffsetDateTime>,
+    /// When it was recorded.
     pub created_at: OffsetDateTime,
     /// A payment that arrived after its checkout was paid or closed (credited as months; refundable on request).
     pub unapplied: bool,
@@ -206,13 +302,21 @@ pub struct BillingEvent {
 /// One billing event with its account and evidence.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct BillingEventDetail {
+    /// The event's id.
     pub id: Uuid,
+    /// The account whose period changed.
     pub account_id: Uuid,
+    /// The provider.
     pub provider: String,
+    /// `purchase`, `grant` or `refund`.
     pub kind: String,
+    /// The months added (negative for a refund).
     pub months: i32,
+    /// The amount in pence.
     pub amount_pence: i64,
+    /// What the provider said about the payment, as JSON.
     pub evidence: Value,
+    /// When it was recorded.
     pub created_at: OffsetDateTime,
 }
 
@@ -220,23 +324,41 @@ pub struct BillingEventDetail {
 /// a [`RefundLine`]; a request made before schema 6 has none and names its one payment (`event_id`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct RefundRequest {
+    /// The request's id.
     pub id: Uuid,
+    /// The one payment a request made before schema 6 named.
     pub event_id: Option<Uuid>,
+    /// The account asking.
     pub account_id: Uuid,
+    /// The account's handle.
     pub handle: String,
+    /// `cancel`, `unstarted` or `unapplied`.
     pub kind: String,
+    /// The holder's reason.
     pub reason: String,
+    /// The request's status.
     pub status: String,
+    /// What the request was worked out from, as JSON.
     pub details: Value,
+    /// The operator's reference for the refund they sent.
     pub refund_reference: Option<String>,
+    /// The billing event that took the months back.
     pub refund_event: Option<Uuid>,
+    /// Who decided.
     pub decided_by: Option<String>,
+    /// When it was decided.
     pub decided_at: Option<OffsetDateTime>,
+    /// When it was asked.
     pub created_at: OffsetDateTime,
+    /// The provider of the one payment (older requests).
     pub provider: Option<String>,
+    /// The months of the one payment (older requests).
     pub months: Option<i32>,
+    /// The amount of the one payment (older requests).
     pub amount_pence: Option<i64>,
+    /// The evidence of the one payment (older requests).
     pub evidence: Option<Value>,
+    /// When the one payment was made (older requests).
     pub paid_at: Option<OffsetDateTime>,
 }
 
@@ -244,23 +366,41 @@ pub struct RefundRequest {
 /// `destination`, and the ledger takes back `months`.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct RefundLine {
+    /// The request it belongs to.
     pub request_id: Uuid,
+    /// The purchase it refunds.
     pub purchase_id: Uuid,
+    /// The purchase's checkout.
     pub checkout_id: Option<Uuid>,
+    /// The provider of the purchase.
     pub provider: String,
+    /// The months taken back.
     pub months: i32,
+    /// What to send, in the unit's smallest denomination.
     pub amount_minor: i64,
+    /// The unit of the amounts (a currency code or a coin type).
     pub unit: String,
+    /// The unit's decimals, when known.
     pub scale: Option<i32>,
+    /// The provider's fee share, in the same unit.
     pub fee_minor: i64,
+    /// The cost of sending the refund, in the same unit.
     pub charge_minor: i64,
+    /// The value of the days used, in the same unit.
     pub used_minor: i64,
+    /// The days begun since the purchase's first month started.
     pub days_used: i32,
+    /// The refund's value in pence, for the ledger.
     pub amount_pence: i64,
+    /// Where and how to send it, as JSON.
     pub destination: Value,
+    /// The line's status.
     pub status: String,
+    /// The operator's reference.
     pub refund_reference: Option<String>,
+    /// The billing event that took the months back.
     pub refund_event: Option<Uuid>,
+    /// When it was refunded.
     pub refunded_at: Option<OffsetDateTime>,
     /// The months its purchase still gives now.
     pub held: i64,
@@ -269,18 +409,31 @@ pub struct RefundLine {
 /// A line to record with a new refund request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewRefundLine {
+    /// The purchase to refund.
     pub purchase_id: Uuid,
+    /// Its checkout.
     pub checkout_id: Option<Uuid>,
+    /// Its provider.
     pub provider: String,
+    /// The months to take back.
     pub months: i32,
+    /// What to send, in the unit's smallest denomination.
     pub amount_minor: i64,
+    /// The unit of the amounts.
     pub unit: String,
+    /// The unit's decimals, when known.
     pub scale: Option<i32>,
+    /// The provider's fee share.
     pub fee_minor: i64,
+    /// The cost of sending.
     pub charge_minor: i64,
+    /// The value of the days used.
     pub used_minor: i64,
+    /// The days begun.
     pub days_used: i32,
+    /// The value in pence.
     pub amount_pence: i64,
+    /// Where and how to send it.
     pub destination: Value,
 }
 
@@ -296,43 +449,69 @@ pub enum RefundConflict {
 /// A line refunded: whose period changed, how many months it took back, and whether the request is now closed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LineRefunded {
+    /// The account whose period changed.
     pub account_id: Uuid,
+    /// The billing event of the refund.
     pub event_id: Uuid,
+    /// The months it took back.
     pub months_taken: u32,
+    /// The paid period after it.
     pub paid_until: Option<OffsetDateTime>,
+    /// Whether every line of the request is now refunded.
     pub request_closed: bool,
 }
 
 /// A purchase or grant with the months it still gives (its months plus its refunds'), for refunds on request.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Extension {
+    /// The purchase or grant's event id.
     pub id: Uuid,
+    /// Its provider.
     pub provider: String,
+    /// `purchase` or `grant`.
     pub kind: String,
+    /// The months it added.
     pub months: i32,
+    /// The months it still gives (its months less what refunds took back).
     pub held: i64,
+    /// The amount in pence.
     pub amount_pence: i64,
+    /// The provider's evidence, as JSON.
     pub evidence: Value,
+    /// When it was made.
     pub created_at: OffsetDateTime,
+    /// The end of the paid period after it.
     pub paid_until_after: Option<OffsetDateTime>,
+    /// Its checkout, if any.
     pub checkout_id: Option<Uuid>,
+    /// The checkout's method.
     pub method: Option<String>,
+    /// The checkout's provider reference.
     pub provider_ref: Option<String>,
     /// The method's fees recorded on its checkout (`None` before schema 6).
     pub fee_fixed_pence: Option<i32>,
+    /// The method's percentage fee recorded on its checkout.
     pub fee_percent_bps: Option<i32>,
 }
 
 /// One Web Risk threat list as the worker keeps it (`prefixes`: sorted, each a length byte and its bytes).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct WebRiskList {
+    /// The list's threat type.
     pub threat_type: String,
+    /// The version token for the next `computeDiff`.
     pub version_token: String,
+    /// How many prefixes it holds.
     pub entries: i32,
+    /// The prefixes, sorted, each as a length byte and its bytes.
     pub prefixes: Vec<u8>,
+    /// The checksum of the list, base64.
     pub checksum: String,
+    /// When Web Risk may next be asked.
     pub next_diff_at: Option<OffsetDateTime>,
+    /// When the list last changed.
     pub updated_at: OffsetDateTime,
+    /// The last failure's reason, if the last update failed.
     pub last_error: Option<String>,
 }
 
@@ -340,33 +519,49 @@ pub struct WebRiskList {
 /// shows).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct WebRiskListState {
+    /// The list's threat type.
     pub threat_type: String,
+    /// The version token.
     pub version_token: String,
+    /// How many prefixes it holds.
     pub entries: i32,
+    /// When Web Risk may next be asked.
     pub next_diff_at: Option<OffsetDateTime>,
+    /// When the list last changed.
     pub updated_at: OffsetDateTime,
+    /// The last failure's reason.
     pub last_error: Option<String>,
 }
 
 /// A recorded refund: whose period changed, to when, and the refund's own billing event.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefundDone {
+    /// The account whose period changed.
     pub account_id: Uuid,
+    /// The refund's billing event.
     pub event_id: Uuid,
+    /// The months taken back.
     pub months: i32,
+    /// The end of the paid period after it.
     pub paid_until: OffsetDateTime,
 }
 
 /// One change to an account's paid period.
 #[derive(Debug, Clone)]
 pub struct PeriodChange<'a> {
+    /// The account whose period changes.
     pub account_id: Uuid,
+    /// The provider.
     pub provider: &'a str,
+    /// The provider's id of the event, which makes the change apply once.
     pub provider_event: &'a str,
     /// `purchase`, `grant` (positive months) or `refund` (negative months).
     pub kind: &'a str,
+    /// The months to add (negative for a refund).
     pub months: i32,
+    /// The amount in pence.
     pub amount_pence: i64,
+    /// What the provider said, as JSON.
     pub evidence: Value,
     /// The checkout this settles, if any (marked paid in the same transaction).
     pub checkout: Option<Uuid>,
@@ -379,144 +574,229 @@ pub struct PeriodChange<'a> {
 /// A refund of (part of) a purchase made through a checkout ([`Store::refund_purchase`]).
 #[derive(Debug, Clone)]
 pub struct RefundChange<'a> {
+    /// The account whose period changes.
     pub account_id: Uuid,
+    /// The provider.
     pub provider: &'a str,
+    /// The provider's id of the refund event, which makes it apply once.
     pub provider_event: &'a str,
+    /// The purchase's checkout.
     pub checkout: Uuid,
     /// The months the purchase bought.
     pub months: u32,
     /// What the purchase was paid and what this refund gives back, in the provider's minor units of one currency.
     pub paid_minor: u64,
+    /// What this refund gives back, in the same unit.
     pub refunded_minor: u64,
     /// The checkout's amount in pence (the ledger's amount column is in pence).
     pub amount_pence: i64,
+    /// What the provider said, as JSON.
     pub evidence: Value,
 }
 
 /// What a refund changed: the months it took back (possibly 0) and the paid period after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefundApplied {
+    /// The months it took back, possibly none.
     pub months_taken: u32,
+    /// The paid period after it.
     pub paid_until: Option<OffsetDateTime>,
 }
 
 /// Where a bank feed left off (`state` holds credentials of the feed's own; never show it).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct BankFeedRow {
+    /// The feed's id.
     pub feed: String,
+    /// The opaque position to resume from.
     pub cursor: Option<String>,
+    /// The feed's own state, as JSON.
     pub state: Value,
+    /// When it was last polled.
     pub polled_at: Option<OffsetDateTime>,
+    /// The last failure's reason.
     pub last_error: Option<String>,
+    /// How many credits it has read in all.
     pub credits_seen: i64,
 }
 
+/// A custom domain an account asked for (`lib.domains`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Domain {
+    /// The host name.
     pub hostname: String,
+    /// The account it belongs to.
     pub account_id: Uuid,
+    /// How it is verified: `dns-txt` or `cloudflare-saas`.
     pub method: String,
+    /// The token to publish for the verification.
     pub token: String,
+    /// `pending`, `verified` or `failed`.
     pub status: String,
+    /// When it was last checked.
     pub checked_at: Option<OffsetDateTime>,
+    /// When it was verified.
     pub verified_at: Option<OffsetDateTime>,
 }
 
+/// A report about a page or a link (`lib.reports`); no account is needed to make one.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Report {
+    /// The report's id.
     pub id: Uuid,
+    /// The page's handle.
     pub handle: String,
+    /// The account, if it still exists.
     pub account_id: Option<Uuid>,
+    /// The link reported, if one.
     pub url: Option<String>,
+    /// The category of the report.
     pub reason: String,
+    /// What the reporter wrote.
     pub details: String,
+    /// An optional way to answer the reporter.
     pub contact: Option<String>,
+    /// `open`, `actioned` or `dismissed`.
     pub status: String,
+    /// When it was made.
     pub created_at: OffsetDateTime,
+    /// When it was decided.
     pub decided_at: Option<OffsetDateTime>,
+    /// Who decided.
     pub decided_by: Option<String>,
+    /// A short note of the decision.
     pub decision: Option<String>,
+    /// The statement of reasons sent to the account holder when content is restricted.
     pub statement: Option<String>,
 }
 
+/// An account holder's appeal against a decision (`lib.appeals`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Appeal {
+    /// The appeal's id.
     pub id: Uuid,
+    /// The account appealing.
     pub account_id: Uuid,
+    /// The report it is about.
     pub report_id: Option<Uuid>,
+    /// What the holder wrote.
     pub text: String,
+    /// `open`, `upheld` or `rejected`.
     pub status: String,
+    /// When it was made.
     pub created_at: OffsetDateTime,
+    /// When it was decided.
     pub decided_at: Option<OffsetDateTime>,
+    /// Who decided.
     pub decided_by: Option<String>,
+    /// The reasons given to the holder.
     pub statement: Option<String>,
 }
 
+/// One row of the audit log: who did what to whom (`lib.audit_log`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct AuditEntry {
+    /// The row's number.
     pub id: i64,
+    /// When it happened.
     pub at: OffsetDateTime,
+    /// Who did it.
     pub actor: String,
+    /// What was done.
     pub action: String,
+    /// What it was done to.
     pub subject: String,
+    /// More, as JSON.
     pub details: Value,
 }
 
+/// The screening verdict of one link (`lib.link_screens`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Screen {
+    /// The SHA-256 of the canonical URL.
     pub url_hash: Vec<u8>,
+    /// The URL.
     pub url: String,
+    /// `clean`, `flagged` or `unknown`.
     pub verdict: String,
+    /// The layer that decided.
     pub source: String,
+    /// What it found.
     pub detail: String,
+    /// When it was checked.
     pub checked_at: OffsetDateTime,
+    /// When it is checked again.
     pub next_check_at: OffsetDateTime,
+    /// The operator whose decision overrides every automatic source until it is cleared.
     pub overridden_by: Option<String>,
 }
 
+/// An entry of the operator's blocklist (`lib.blocklist`).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct BlockEntry {
+    /// The host or URL blocked.
     pub pattern: String,
+    /// `host` or `url`.
     pub kind: String,
+    /// Why.
     pub reason: String,
+    /// Who added it.
     pub added_by: String,
+    /// When.
     pub added_at: OffsetDateTime,
 }
 
 /// Figures for `/metrics` and the admin overview.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Stats {
+    /// Accounts that are active.
     pub accounts_active: i64,
+    /// Accounts that are suspended.
     pub accounts_suspended: i64,
+    /// Active accounts that are free.
     pub accounts_free: i64,
+    /// Active accounts that are paid up.
     pub accounts_paid: i64,
+    /// Pages that are published.
     pub pages_published: i64,
+    /// Reports not yet decided.
     pub reports_open: i64,
+    /// Open reports older than a day.
     pub reports_open_over_24h: i64,
+    /// Appeals not yet decided.
     pub appeals_open: i64,
+    /// Links flagged.
     pub links_flagged: i64,
+    /// Links that could not be checked.
     pub links_unknown: i64,
+    /// Bytes of pictures stored.
     pub storage_bytes: i64,
+    /// Checkouts still open.
     pub checkouts_open: i64,
 }
 
+/// Whether an error is a unique-constraint violation (PostgreSQL code 23505).
 fn unique_violation(e: &DbError) -> bool {
     matches!(e, DbError::Database(d) if d.code().as_deref() == Some("23505"))
 }
 
 impl Store {
+    /// A store over a pool.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
+    /// The pool, for the pieces that run their own statements in tests.
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
+    /// Run the embedded migrations.
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
         MIGRATOR.run(&self.pool).await
     }
 
+    /// Whether the database answers: the readiness check.
     pub async fn ping(&self) -> Result<(), DbError> {
         sqlx::query("SELECT 1").execute(&self.pool).await.map(|_| ())
     }
@@ -525,6 +805,7 @@ impl Store {
 
     /// Creates an account and its (unpublished) page; redeems the invite in the same transaction when one is given.
     pub async fn create_account(&self, n: &NewAccount<'_>, now: OffsetDateTime) -> Result<Account, CreateError> {
+        // The invite, if any, is checked and locked first, so two sign-ups cannot use one code; the account, its page and the redemption are one transaction.
         let mut tx = self.pool.begin().await?;
         let id = n.id;
         let mut invited_by = None;
@@ -566,6 +847,7 @@ impl Store {
         Ok(self.account(id).await?.ok_or(DbError::RowNotFound)?)
     }
 
+    /// An account by id.
     pub async fn account(&self, id: Uuid) -> Result<Option<Account>, DbError> {
         sqlx::query_as(concat!("SELECT ", account_columns!(), " FROM lib.accounts WHERE id = $1"))
             .bind(id)
@@ -573,6 +855,7 @@ impl Store {
             .await
     }
 
+    /// An account by handle.
     pub async fn account_by_handle(&self, handle: &str) -> Result<Option<Account>, DbError> {
         sqlx::query_as(concat!("SELECT ", account_columns!(), " FROM lib.accounts WHERE handle = $1"))
             .bind(handle)
@@ -580,7 +863,9 @@ impl Store {
             .await
     }
 
+    /// Whether neither the handle nor its skeleton is taken, so no look-alike can be registered.
     pub async fn handle_available(&self, handle: &str, skeleton: &str) -> Result<bool, DbError> {
+        // Either the handle or its confusable skeleton existing makes it unavailable.
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM lib.accounts WHERE handle = $1 OR handle_skeleton = $2")
             .bind(handle)
             .bind(skeleton)
@@ -591,6 +876,8 @@ impl Store {
 
     /// Accounts for the admin list: by handle prefix (or all), newest first.
     pub async fn accounts(&self, prefix: &str, limit: i64, offset: i64) -> Result<Vec<Account>, DbError> {
+        // Newest first, with a limit and an offset for paging.
+        // The prefix is stripped of `%`, `_` and backslashes, so it cannot act as a pattern.
         sqlx::query_as(concat!(
             "SELECT ",
             account_columns!(),
@@ -603,7 +890,9 @@ impl Store {
         .await
     }
 
+    /// Record the country the account holder declared, or clear it.
     pub async fn set_country(&self, id: Uuid, country: Option<&str>) -> Result<(), DbError> {
+        // A null clears the declaration.
         sqlx::query("UPDATE lib.accounts SET country_declared = $2 WHERE id = $1")
             .bind(id)
             .bind(country)
@@ -643,6 +932,7 @@ impl Store {
         reason: &str,
         until: Option<OffsetDateTime>,
     ) -> Result<bool, DbError> {
+        // The suspension and the end of the account's sessions are one transaction, so a suspended account cannot stay signed in.
         let mut tx = self.pool.begin().await?;
         let r = sqlx::query(
             "UPDATE lib.accounts SET status = 'suspended', suspension_kind = $2, suspension_reason = $3,
@@ -660,7 +950,9 @@ impl Store {
         Ok(r.rows_affected() == 1)
     }
 
+    /// Lift a suspension by hand; false if the account was not suspended.
     pub async fn unsuspend(&self, id: Uuid) -> Result<bool, DbError> {
+        // Clears every suspension field together, so the table's check constraint holds.
         let r = sqlx::query(
             "UPDATE lib.accounts SET status = 'active', suspension_kind = NULL, suspension_reason = NULL,
                     suspended_until = NULL
@@ -674,6 +966,7 @@ impl Store {
 
     /// Lifts suspensions whose end has passed; returns the accounts reinstated.
     pub async fn lift_expired_suspensions(&self, now: OffsetDateTime) -> Result<Vec<Uuid>, DbError> {
+        // Returns the ids so each reinstated account can be audited.
         sqlx::query_scalar(
             "UPDATE lib.accounts SET status = 'active', suspension_kind = NULL, suspension_reason = NULL,
                     suspended_until = NULL
@@ -688,6 +981,7 @@ impl Store {
     /// Erases an account at its holder's request: sign-in methods, sessions, pictures, domains and the page go; the
     /// row stays as `deleted` (the handle is not reissued) with the billing records the law requires to be kept.
     pub async fn delete_account(&self, id: Uuid, now: OffsetDateTime) -> Result<bool, DbError> {
+        // Everything a person put in or signed in with goes in one transaction; the row stays so the handle is not issued again and the records the law requires are kept.
         let mut tx = self.pool.begin().await?;
         for q in [
             "DELETE FROM lib.sessions WHERE account_id = $1",
@@ -717,6 +1011,7 @@ impl Store {
 
     /// The accounts an account invited (one level of the invite tree).
     pub async fn invitees(&self, id: Uuid) -> Result<Vec<Account>, DbError> {
+        // The accounts that name this one as their inviter, oldest first.
         sqlx::query_as(concat!(
             "SELECT ",
             account_columns!(),
@@ -729,6 +1024,7 @@ impl Store {
 
     // ── passkeys, wallets, recovery codes ──────────────────────────────────
 
+    /// Store a new passkey for an account (its public key and counter; no secret).
     pub async fn add_passkey(
         &self,
         account: Uuid,
@@ -736,6 +1032,7 @@ impl Store {
         passkey: &Value,
         name: &str,
     ) -> Result<(), DbError> {
+        // The passkey is the public key and counter, so a stolen database holds nothing that signs in.
         sqlx::query("INSERT INTO lib.passkeys (credential_id, account_id, passkey, name) VALUES ($1, $2, $3, $4)")
             .bind(credential_id)
             .bind(account)
@@ -746,6 +1043,7 @@ impl Store {
             .map(|_| ())
     }
 
+    /// An account's passkeys, oldest first: credential id, passkey and name.
     pub async fn passkeys(&self, account: Uuid) -> Result<Vec<(Vec<u8>, Value, String)>, DbError> {
         let rows = sqlx::query(
             "SELECT credential_id, passkey, name FROM lib.passkeys WHERE account_id = $1 ORDER BY created_at",
@@ -756,7 +1054,9 @@ impl Store {
         rows.iter().map(|r| Ok((r.try_get("credential_id")?, r.try_get("passkey")?, r.try_get("name")?))).collect()
     }
 
+    /// The account and the passkey a credential id belongs to.
     pub async fn passkey_owner(&self, credential_id: &[u8]) -> Result<Option<(Uuid, Value)>, DbError> {
+        // A passkey's credential id is unique, so at most one account matches.
         let r = sqlx::query("SELECT account_id, passkey FROM lib.passkeys WHERE credential_id = $1")
             .bind(credential_id)
             .fetch_optional(&self.pool)
@@ -764,12 +1064,14 @@ impl Store {
         r.map(|r| Ok((r.try_get("account_id")?, r.try_get("passkey")?))).transpose()
     }
 
+    /// Store a passkey after a sign-in (its counter changed) and note when it was used.
     pub async fn update_passkey(
         &self,
         credential_id: &[u8],
         passkey: &Value,
         now: OffsetDateTime,
     ) -> Result<(), DbError> {
+        // The counter changes with each use, so the stored passkey is replaced as a whole.
         sqlx::query("UPDATE lib.passkeys SET passkey = $2, last_used_at = $3 WHERE credential_id = $1")
             .bind(credential_id)
             .bind(passkey)
@@ -781,6 +1083,7 @@ impl Store {
 
     /// Removes a passkey unless it is the account's last way to sign in.
     pub async fn delete_passkey(&self, account: Uuid, credential_id: &[u8]) -> Result<bool, DbError> {
+        // The subquery refuses to remove the last way to sign in, so an account cannot lock itself out.
         let r = sqlx::query(
             "DELETE FROM lib.passkeys WHERE account_id = $1 AND credential_id = $2
                AND ((SELECT count(*) FROM lib.passkeys WHERE account_id = $1)
@@ -795,6 +1098,7 @@ impl Store {
 
     /// Links a wallet address; false when another account already has it.
     pub async fn add_wallet(&self, account: Uuid, address: &str) -> Result<bool, DbError> {
+        // A wallet address belongs to one account; a second link is a unique violation, which is the answer `false`.
         match sqlx::query("INSERT INTO lib.wallets (address, account_id) VALUES ($1, $2)")
             .bind(address)
             .bind(account)
@@ -807,21 +1111,27 @@ impl Store {
         }
     }
 
+    /// The account a wallet address is linked to.
     pub async fn wallet_owner(&self, address: &str) -> Result<Option<Uuid>, DbError> {
+        // The account a wallet address signs in to.
         sqlx::query_scalar("SELECT account_id FROM lib.wallets WHERE address = $1")
             .bind(address)
             .fetch_optional(&self.pool)
             .await
     }
 
+    /// An account's linked wallet addresses, oldest first.
     pub async fn wallets(&self, account: Uuid) -> Result<Vec<String>, DbError> {
+        // In the order they were linked.
         sqlx::query_scalar("SELECT address FROM lib.wallets WHERE account_id = $1 ORDER BY created_at")
             .bind(account)
             .fetch_all(&self.pool)
             .await
     }
 
+    /// Unlinks a wallet unless it is the account's last way to sign in.
     pub async fn delete_wallet(&self, account: Uuid, address: &str) -> Result<bool, DbError> {
+        // The same last-method rule as for passkeys: one count across both kinds.
         let r = sqlx::query(
             "DELETE FROM lib.wallets WHERE account_id = $1 AND address = $2
                AND ((SELECT count(*) FROM lib.passkeys WHERE account_id = $1)
@@ -836,6 +1146,7 @@ impl Store {
 
     /// Replaces the account's recovery codes (SHA-256 of each).
     pub async fn set_recovery_codes(&self, account: Uuid, hashes: &[Vec<u8>]) -> Result<(), DbError> {
+        // The old codes are deleted and the new ones inserted in one transaction, so there is never a mix.
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM lib.recovery_codes WHERE account_id = $1").bind(account).execute(&mut *tx).await?;
         for h in hashes {
@@ -855,6 +1166,7 @@ impl Store {
         hash: &[u8],
         now: OffsetDateTime,
     ) -> Result<Option<Uuid>, DbError> {
+        // Marks the code used only for an active account and only if it was unused, so one code works once.
         sqlx::query_scalar(
             "UPDATE lib.recovery_codes r SET used_at = $3
                FROM lib.accounts a
@@ -869,6 +1181,7 @@ impl Store {
         .await
     }
 
+    /// How many recovery codes an account has not used.
     pub async fn recovery_codes_left(&self, account: Uuid) -> Result<i64, DbError> {
         sqlx::query_scalar("SELECT count(*) FROM lib.recovery_codes WHERE account_id = $1 AND used_at IS NULL")
             .bind(account)
@@ -878,6 +1191,7 @@ impl Store {
 
     // ── sessions and challenges ────────────────────────────────────────────
 
+    /// Store a session by the hash of its cookie value; the value itself is never kept.
     pub async fn create_session(
         &self,
         token_hash: &[u8],
@@ -902,6 +1216,7 @@ impl Store {
         idle: Duration,
         absolute: Duration,
     ) -> Result<Option<Uuid>, DbError> {
+        // Looking a session up slides its idle expiry forward but never past the absolute limit, and an account that is not active has no session.
         sqlx::query_scalar(
             "UPDATE lib.sessions s SET last_seen_at = $2,
                     expires_at = least(s.created_at + $4, $2 + $3)
@@ -917,6 +1232,7 @@ impl Store {
         .await
     }
 
+    /// End one session (sign out).
     pub async fn delete_session(&self, token_hash: &[u8]) -> Result<(), DbError> {
         sqlx::query("DELETE FROM lib.sessions WHERE token_hash = $1")
             .bind(token_hash)
@@ -925,6 +1241,7 @@ impl Store {
             .map(|_| ())
     }
 
+    /// End every session of an account, returning how many there were.
     pub async fn delete_sessions(&self, account: Uuid) -> Result<u64, DbError> {
         Ok(sqlx::query("DELETE FROM lib.sessions WHERE account_id = $1")
             .bind(account)
@@ -933,6 +1250,7 @@ impl Store {
             .rows_affected())
     }
 
+    /// Store the server-side state of a passkey or wallet ceremony until it expires.
     pub async fn put_challenge(
         &self,
         id: &str,
@@ -959,6 +1277,7 @@ impl Store {
         kind: &str,
         now: OffsetDateTime,
     ) -> Result<Option<(Option<Uuid>, Value)>, DbError> {
+        // Delete-and-return in one statement, so a challenge is answered at most once.
         let r = sqlx::query(
             "DELETE FROM lib.challenges WHERE id = $1 AND kind = $2 AND expires_at > $3 RETURNING account_id, state",
         )
@@ -972,6 +1291,7 @@ impl Store {
 
     // ── pages and pictures ─────────────────────────────────────────────────
 
+    /// An account's page: draft, published document and versions.
     pub async fn page(&self, account: Uuid) -> Result<Option<PageRow>, DbError> {
         sqlx::query_as(
             "SELECT draft, published, version, updated_at, published_at FROM lib.pages WHERE account_id = $1",
@@ -981,6 +1301,7 @@ impl Store {
         .await
     }
 
+    /// Save the draft document (already checked by the parser) without publishing it.
     pub async fn save_draft(&self, account: Uuid, manifest: &str, now: OffsetDateTime) -> Result<(), DbError> {
         sqlx::query("UPDATE lib.pages SET draft = $2, updated_at = $3 WHERE account_id = $1")
             .bind(account)
@@ -993,6 +1314,7 @@ impl Store {
 
     /// Publishes a checked manifest as the next version (the draft becomes the same document). Returns the version.
     pub async fn publish(&self, account: Uuid, manifest: &str, now: OffsetDateTime) -> Result<i32, DbError> {
+        // The page row and the version history change in one transaction.
         let mut tx = self.pool.begin().await?;
         let version: i32 = sqlx::query_scalar(
             "UPDATE lib.pages SET draft = $2, published = $2, version = version + 1, updated_at = $3, published_at = $3
@@ -1018,6 +1340,7 @@ impl Store {
 
     /// Takes the page offline (the draft and the versions stay); `updated_at` records when.
     pub async fn unpublish(&self, account: Uuid) -> Result<(), DbError> {
+        // The draft and the kept versions stay; only the published document is cleared.
         sqlx::query(
             "UPDATE lib.pages SET published = NULL, published_at = NULL, updated_at = now() WHERE account_id = $1",
         )
@@ -1027,7 +1350,9 @@ impl Store {
         .map(|_| ())
     }
 
+    /// The numbers and times of an account's kept versions, newest first.
     pub async fn page_versions(&self, account: Uuid) -> Result<Vec<(i32, OffsetDateTime)>, DbError> {
+        // Newest first.
         let rows = sqlx::query(
             "SELECT version, created_at FROM lib.page_versions WHERE account_id = $1 ORDER BY version DESC",
         )
@@ -1037,7 +1362,9 @@ impl Store {
         rows.iter().map(|r| Ok((r.try_get("version")?, r.try_get("created_at")?))).collect()
     }
 
+    /// The document of one kept version.
     pub async fn page_version(&self, account: Uuid, version: i32) -> Result<Option<String>, DbError> {
+        // The stored document of one version.
         sqlx::query_scalar("SELECT manifest FROM lib.page_versions WHERE account_id = $1 AND version = $2")
             .bind(account)
             .bind(version)
@@ -1047,6 +1374,7 @@ impl Store {
 
     /// Keeps the newest `keep` versions of every page.
     pub async fn prune_versions(&self, keep: i64) -> Result<u64, DbError> {
+        // Numbers the versions of each page from the newest and deletes those past `keep`.
         Ok(sqlx::query(
             "DELETE FROM lib.page_versions v USING (
                 SELECT account_id, version, row_number() OVER (PARTITION BY account_id ORDER BY version DESC) AS n
@@ -1059,7 +1387,9 @@ impl Store {
         .rows_affected())
     }
 
+    /// Store a picture for an account; the same picture stored again is ignored.
     pub async fn put_asset(&self, account: Uuid, a: &AssetRow) -> Result<(), DbError> {
+        // Pictures are addressed by content, so the same file uploaded twice is stored once per account.
         sqlx::query(
             "INSERT INTO lib.assets (sha256, account_id, mime, ext, width, height, bytes)
              VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (sha256, account_id) DO NOTHING",
@@ -1078,6 +1408,7 @@ impl Store {
 
     /// Whether this account stored the picture (a page may only use its own pictures).
     pub async fn owns_asset(&self, account: Uuid, sha256: &str) -> Result<bool, DbError> {
+        // A page may use only its own account's pictures.
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM lib.assets WHERE sha256 = $1 AND account_id = $2)")
             .bind(sha256)
             .bind(account)
@@ -1087,6 +1418,7 @@ impl Store {
 
     /// Bytes of pictures an account stored (its quota).
     pub async fn asset_bytes(&self, account: Uuid) -> Result<i64, DbError> {
+        // The sum of the stored picture sizes, which is the account's quota use.
         sqlx::query_scalar("SELECT coalesce(sum(length(bytes)), 0)::bigint FROM lib.assets WHERE account_id = $1")
             .bind(account)
             .fetch_one(&self.pool)
@@ -1095,6 +1427,7 @@ impl Store {
 
     /// Deletes an account's pictures no draft, published page or kept version refers to.
     pub async fn prune_assets(&self) -> Result<u64, DbError> {
+        // A picture goes when it is more than a day old and no draft, published page or kept version names its hash.
         Ok(sqlx::query(
             "DELETE FROM lib.assets a
               WHERE a.created_at < now() - interval '1 day'
@@ -1110,7 +1443,9 @@ impl Store {
 
     // ── the page process (read-only role, public views only) ──────────────
 
+    /// A page for the page process, from the public view only.
     pub async fn view_page(&self, handle: &str) -> Result<Option<PublicPage>, DbError> {
+        // Reads the public view, which holds only what a page host may know.
         sqlx::query_as(
             "SELECT handle, status, suspension_kind, suspended_until, free, operator, paid_until, published, published_at
                FROM public.page_v1 WHERE handle = $1",
@@ -1120,14 +1455,18 @@ impl Store {
         .await
     }
 
+    /// A picture for the page process, from the public view only.
     pub async fn view_asset(&self, sha256: &str) -> Result<Option<AssetRow>, DbError> {
+        // The public view of a picture.
         sqlx::query_as("SELECT sha256, mime, ext, width, height, bytes FROM public.asset_v1 WHERE sha256 = $1")
             .bind(sha256)
             .fetch_optional(&self.pool)
             .await
     }
 
+    /// The handle behind a verified custom domain, from the public view only.
     pub async fn view_domain(&self, hostname: &str) -> Result<Option<String>, DbError> {
+        // Only a verified domain is in the view.
         sqlx::query_scalar("SELECT handle FROM public.domain_v1 WHERE hostname = $1")
             .bind(hostname)
             .fetch_optional(&self.pool)
@@ -1136,6 +1475,7 @@ impl Store {
 
     /// Which of these link URL hashes are flagged.
     pub async fn view_flagged(&self, hashes: &[Vec<u8>]) -> Result<HashSet<Vec<u8>>, DbError> {
+        // Only the flagged hashes of the ones asked about come back; the page process never sees the screening table.
         if hashes.is_empty() {
             return Ok(HashSet::new());
         }
@@ -1160,6 +1500,7 @@ impl Store {
         created_by: &str,
         expires_at: OffsetDateTime,
     ) -> Result<Vec<Uuid>, DbError> {
+        // All codes of one issue are inserted in one transaction. Only a code given to an account keeps its text.
         let mut tx = self.pool.begin().await?;
         let mut ids = Vec::with_capacity(codes.len());
         for (h, code) in codes {
@@ -1190,6 +1531,7 @@ impl Store {
         account: Uuid,
         now: OffsetDateTime,
     ) -> Result<(Vec<(String, OffsetDateTime)>, i64), DbError> {
+        // The codes an account may still pass on, and then how many of its codes were used.
         let rows = sqlx::query(
             "SELECT code, expires_at FROM lib.invites
               WHERE held_by = $1 AND code IS NOT NULL AND redeemed_by IS NULL AND revoked_at IS NULL AND expires_at > $2
@@ -1211,7 +1553,9 @@ impl Store {
         Ok((codes, used))
     }
 
+    /// The invites an operator issued, newest first, for one holder or for all (the code itself is never returned).
     pub async fn invites(&self, held_by: Option<Uuid>, limit: i64) -> Result<Vec<Invite>, DbError> {
+        // A null holder means every invite.
         sqlx::query_as(
             "SELECT id, held_by, selection_id, note, created_by, created_at, expires_at, redeemed_by, redeemed_at,
                     revoked_at
@@ -1223,6 +1567,7 @@ impl Store {
         .await
     }
 
+    /// Revoke an invite that is neither used nor already revoked, and forget its readable code; false if it was not open.
     pub async fn revoke_invite(&self, id: Uuid, now: OffsetDateTime) -> Result<bool, DbError> {
         let r = sqlx::query(
             "UPDATE lib.invites SET revoked_at = $2, code = NULL WHERE id = $1 AND redeemed_by IS NULL AND revoked_at IS NULL",
@@ -1234,7 +1579,9 @@ impl Store {
         Ok(r.rows_affected() == 1)
     }
 
+    /// Save a named set of criteria; names are unique.
     pub async fn create_selection(&self, name: &str, criteria: &Criteria, by: &str) -> Result<Uuid, DbError> {
+        // The criteria are stored as JSON, as `Criteria` serialises them.
         let id = Uuid::new_v4();
         sqlx::query("INSERT INTO lib.selections (id, name, criteria, created_by) VALUES ($1, $2, $3, $4)")
             .bind(id)
@@ -1246,26 +1593,33 @@ impl Store {
         Ok(id)
     }
 
+    /// Every saved selection, by name.
     pub async fn selections(&self) -> Result<Vec<Selection>, DbError> {
+        // By name.
         sqlx::query_as("SELECT id, name, criteria, created_by, created_at FROM lib.selections ORDER BY name")
             .fetch_all(&self.pool)
             .await
     }
 
+    /// One saved selection.
     pub async fn selection(&self, id: Uuid) -> Result<Option<Selection>, DbError> {
+        // One selection by id.
         sqlx::query_as("SELECT id, name, criteria, created_by, created_at FROM lib.selections WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
     }
 
+    /// Delete a saved selection; invites already issued for it stay, without the link.
     pub async fn delete_selection(&self, id: Uuid) -> Result<bool, DbError> {
+        // The invites keep their codes; the link to the selection is set to null by the schema.
         Ok(sqlx::query("DELETE FROM lib.selections WHERE id = $1").bind(id).execute(&self.pool).await?.rows_affected()
             == 1)
     }
 
     /// The active accounts a selection's criteria match now.
     pub async fn match_selection(&self, c: &Criteria, now: OffsetDateTime) -> Result<Vec<Account>, DbError> {
+        // Each criterion that is not null must hold; null ones are ignored. Only active accounts match.
         sqlx::query_as(concat!(
             "SELECT ",
             account_columns!(),
@@ -1289,7 +1643,9 @@ impl Store {
 
     // ── billing ────────────────────────────────────────────────────────────
 
+    /// Record a started purchase, open, with the method's fees as they are now.
     pub async fn create_checkout(&self, c: &Checkout) -> Result<(), DbError> {
+        // Always inserted as open; closing it is a separate, conditional step.
         sqlx::query(
             "INSERT INTO lib.checkouts (id, account_id, provider, provider_ref, method, months, amount_pence, status,
                                         country_declared, country_request, created_at, fee_fixed_pence, fee_percent_bps)
@@ -1312,7 +1668,9 @@ impl Store {
         .map(|_| ())
     }
 
+    /// A checkout by id.
     pub async fn checkout(&self, id: Uuid) -> Result<Option<Checkout>, DbError> {
+        // All the columns a purchase flow needs, including the fees recorded when it was made.
         sqlx::query_as(
             "SELECT id, account_id, provider, provider_ref, method, months, amount_pence, status, country_declared,
                     country_request, created_at, completed_at, fee_fixed_pence, fee_percent_bps FROM lib.checkouts WHERE id = $1",
@@ -1322,7 +1680,9 @@ impl Store {
         .await
     }
 
+    /// A checkout by its provider and the provider's reference, which is how a notification finds it.
     pub async fn checkout_by_ref(&self, provider: &str, provider_ref: &str) -> Result<Option<Checkout>, DbError> {
+        // The pair of provider and reference is unique, so at most one row matches.
         sqlx::query_as(
             "SELECT id, account_id, provider, provider_ref, method, months, amount_pence, status, country_declared,
                     country_request, created_at, completed_at, fee_fixed_pence, fee_percent_bps FROM lib.checkouts WHERE provider = $1 AND provider_ref = $2",
@@ -1335,6 +1695,7 @@ impl Store {
 
     /// Open checkouts created before `before` (the worker asks their providers how they ended).
     pub async fn stale_checkouts(&self, before: OffsetDateTime, limit: i64) -> Result<Vec<Checkout>, DbError> {
+        // Oldest first, so the worker reconciles the longest-waiting checkouts first.
         sqlx::query_as(
             "SELECT id, account_id, provider, provider_ref, method, months, amount_pence, status, country_declared,
                     country_request, created_at, completed_at, fee_fixed_pence, fee_percent_bps
@@ -1346,7 +1707,9 @@ impl Store {
         .await
     }
 
+    /// Close an open checkout as expired or cancelled; false if it was not open.
     pub async fn close_checkout(&self, id: Uuid, status: &str, now: OffsetDateTime) -> Result<bool, DbError> {
+        // Only an open checkout can be closed, so a paid one is never reopened or overwritten.
         let r =
             sqlx::query("UPDATE lib.checkouts SET status = $2, completed_at = $3 WHERE id = $1 AND status = 'open'")
                 .bind(id)
@@ -1365,6 +1728,7 @@ impl Store {
         c: &PeriodChange<'_>,
         now: OffsetDateTime,
     ) -> Result<Option<OffsetDateTime>, DbError> {
+        // One transaction: the event is recorded, the account's period moves, and the checkout is settled, or none of it happens.
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
         let applied = Self::change_period_in(&mut tx, c, now).await?;
         tx.commit().await?;
@@ -1378,6 +1742,7 @@ impl Store {
         c: &PeriodChange<'_>,
         now: OffsetDateTime,
     ) -> Result<Option<(Uuid, OffsetDateTime)>, DbError> {
+        // The event's unique key (provider and provider event) makes this idempotent: a repeated notification inserts nothing and changes nothing.
         let id = Uuid::new_v4();
         let inserted = sqlx::query(
             "INSERT INTO lib.billing_events (id, account_id, provider, provider_event, kind, months, amount_pence, evidence,
@@ -1499,6 +1864,7 @@ impl Store {
         share: fn(u32, u64, u64) -> u32,
         now: OffsetDateTime,
     ) -> Result<Option<RefundApplied>, DbError> {
+        // The checkout row is locked first, so two refunds of one purchase are counted one after the other and never take back more than it bought.
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM lib.checkouts WHERE id = $1 FOR UPDATE")
             .bind(r.checkout)
@@ -1573,7 +1939,9 @@ impl Store {
         .await
     }
 
+    /// An account's billing events, newest first.
     pub async fn billing_events(&self, account: Uuid) -> Result<Vec<BillingEvent>, DbError> {
+        // Whether an event was a late payment is read out of its evidence, so the app can offer it back whole.
         sqlx::query_as(
             "SELECT id, provider, provider_event, kind, months, amount_pence, paid_until_after, created_at,
                     coalesce((evidence->>'unapplied')::boolean, false) AS unapplied
@@ -1584,7 +1952,9 @@ impl Store {
         .await
     }
 
+    /// One billing event with its account and evidence.
     pub async fn billing_event(&self, id: Uuid) -> Result<Option<BillingEventDetail>, DbError> {
+        // One event with its evidence, for the operator's view.
         sqlx::query_as(
             "SELECT id, account_id, provider, kind, months, amount_pence, evidence, created_at
                FROM lib.billing_events WHERE id = $1",
@@ -1604,6 +1974,7 @@ impl Store {
         account: Uuid,
         reason: &str,
     ) -> Result<Option<Uuid>, DbError> {
+        // The unique indexes decide: `DO NOTHING` returns no row when either already exists.
         let r = sqlx::query_scalar(
             "INSERT INTO lib.refund_requests (id, event_id, account_id, reason) VALUES ($1, $2, $3, $4)
              ON CONFLICT DO NOTHING RETURNING id",
@@ -1630,6 +2001,7 @@ impl Store {
         lines: &[NewRefundLine],
         now: OffsetDateTime,
     ) -> Result<Result<Uuid, RefundConflict>, DbError> {
+        // The request and its lines go in together; the unique indexes turn a second open request, or a second ask about one late payment, into a conflict instead of an error.
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
         let id = Uuid::new_v4();
         let inserted = sqlx::query(
@@ -1683,6 +2055,7 @@ impl Store {
         Ok(Ok(id))
     }
 
+    /// The columns of a refund request, with its late payment (if it names one) and its account's handle; each query adds its own `WHERE`.
     const REFUND_SELECT: &'static str =
         "SELECT r.id, r.event_id, r.account_id, a.handle, r.kind, r.reason, r.status, r.details, r.refund_reference,
                 r.refund_event, r.decided_by, r.decided_at, r.created_at, e.provider, e.months, e.amount_pence,
@@ -1713,13 +2086,16 @@ impl Store {
         .await
     }
 
+    /// One refund request.
     pub async fn refund_request(&self, id: Uuid) -> Result<Option<RefundRequest>, DbError> {
+        // A request with its late payment and account joined in.
         sqlx::query_as(sqlx::AssertSqlSafe(format!("{} WHERE r.id = $1", Self::REFUND_SELECT)))
             .bind(id)
             .fetch_optional(&self.pool)
             .await
     }
 
+    /// The columns of a refund line, with the months its purchase still gives; each query adds its own `WHERE`.
     const LINE_SELECT: &'static str =
         "SELECT l.request_id, l.purchase_id, l.checkout_id, l.provider, l.months, l.amount_minor, l.unit, l.scale,
                 l.fee_minor, l.charge_minor, l.used_minor, l.days_used, l.amount_pence, l.destination, l.status, l.refund_reference,
@@ -1767,6 +2143,7 @@ impl Store {
         evidence: Value,
         now: OffsetDateTime,
     ) -> Result<Option<LineRefunded>, DbError> {
+        // The request and the purchase's checkout are locked first, so this and a provider's own refund notification are counted one after the other.
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
         let account: Option<Uuid> = sqlx::query_scalar(
             "SELECT account_id FROM lib.refund_requests WHERE id = $1 AND status = 'open' FOR UPDATE",
@@ -1872,6 +2249,7 @@ impl Store {
         note: &str,
         now: OffsetDateTime,
     ) -> Result<bool, DbError> {
+        // A holder may only withdraw their own request; the operator may only decline.
         let r = sqlx::query(
             "UPDATE lib.refund_requests SET status = $2, decided_by = $3, decided_at = $4,
                     details = details || jsonb_build_object('note', $5::text)
@@ -1981,6 +2359,7 @@ impl Store {
 
     /// Takes a pending grant to continue it (once: a second caller gets `None`).
     pub async fn take_open_payments_grant(&self, checkout: Uuid) -> Result<Option<Value>, DbError> {
+        // Moves the grant from pending to finishing in the same statement that reads it, so only one caller can continue it.
         sqlx::query_scalar(
             "UPDATE lib.open_payments_grants SET status = 'finishing'
               WHERE checkout_id = $1 AND status = 'pending' RETURNING pending",
@@ -1997,6 +2376,7 @@ impl Store {
         outgoing_payment: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<(), DbError> {
+        // The pending data holds a continuation token, so it is cleared whether the grant was sent or failed.
         sqlx::query(
             "UPDATE lib.open_payments_grants
                 SET status = CASE WHEN $2::text IS NULL THEN 'failed' ELSE 'sent' END, outgoing_payment = $2,
@@ -2013,7 +2393,9 @@ impl Store {
 
     // ── bank feeds ─────────────────────────────────────────────────────────
 
+    /// One bank feed's cursor and state.
     pub async fn bank_feed(&self, feed: &str) -> Result<Option<BankFeedRow>, DbError> {
+        // One feed's row.
         sqlx::query_as(
             "SELECT feed, cursor, state, polled_at, last_error, credits_seen FROM lib.bank_feeds WHERE feed = $1",
         )
@@ -2022,7 +2404,9 @@ impl Store {
         .await
     }
 
+    /// Every bank feed, by name.
     pub async fn bank_feeds(&self) -> Result<Vec<BankFeedRow>, DbError> {
+        // Every feed, by name.
         sqlx::query_as(
             "SELECT feed, cursor, state, polled_at, last_error, credits_seen FROM lib.bank_feeds ORDER BY feed",
         )
@@ -2039,6 +2423,7 @@ impl Store {
         credits: i64,
         now: OffsetDateTime,
     ) -> Result<(), DbError> {
+        // The credits read are added to the running total; a successful poll clears the last error.
         sqlx::query(
             "INSERT INTO lib.bank_feeds (feed, cursor, state, polled_at, last_error, credits_seen)
              VALUES ($1, $2, $3, $4, NULL, $5)
@@ -2058,6 +2443,7 @@ impl Store {
 
     /// A failed poll: the cursor and state stay as they were.
     pub async fn bank_feed_failed(&self, feed: &str, error: &str, now: OffsetDateTime) -> Result<(), DbError> {
+        // The error is cut to 500 characters, and the cursor and state are left alone, so the next poll resumes where this one should have.
         let error: String = error.chars().take(500).collect();
         sqlx::query(
             "INSERT INTO lib.bank_feeds (feed, polled_at, last_error) VALUES ($1, $2, $3)
@@ -2073,7 +2459,9 @@ impl Store {
 
     // ── domains ────────────────────────────────────────────────────────────
 
+    /// Register a custom domain for an account, pending verification; false when the host name is taken.
     pub async fn add_domain(&self, account: Uuid, hostname: &str, method: &str, token: &str) -> Result<bool, DbError> {
+        // A host name is unique across accounts; the unique violation is the answer `false`.
         match sqlx::query("INSERT INTO lib.domains (hostname, account_id, method, token) VALUES ($1, $2, $3, $4)")
             .bind(hostname)
             .bind(account)
@@ -2088,7 +2476,9 @@ impl Store {
         }
     }
 
+    /// An account's domains, oldest first.
     pub async fn domains(&self, account: Uuid) -> Result<Vec<Domain>, DbError> {
+        // Oldest first.
         sqlx::query_as(
             "SELECT hostname, account_id, method, token, status, checked_at, verified_at
                FROM lib.domains WHERE account_id = $1 ORDER BY created_at",
@@ -2098,12 +2488,15 @@ impl Store {
         .await
     }
 
+    /// How many domains exist, for the cap on custom domains.
     pub async fn count_domains(&self) -> Result<i64, DbError> {
+        // A count over every account, for the cap on custom domains.
         sqlx::query_scalar("SELECT count(*) FROM lib.domains").fetch_one(&self.pool).await
     }
 
     /// Domains to (re)check: pending ones, and verified ones last checked before `before`.
     pub async fn domains_due(&self, before: OffsetDateTime, limit: i64) -> Result<Vec<Domain>, DbError> {
+        // Pending domains, never-checked ones, and verified ones last checked before the cut-off.
         sqlx::query_as(
             "SELECT hostname, account_id, method, token, status, checked_at, verified_at FROM lib.domains
               WHERE status = 'pending' OR checked_at IS NULL OR checked_at < $1 ORDER BY checked_at NULLS FIRST LIMIT $2",
@@ -2114,7 +2507,9 @@ impl Store {
         .await
     }
 
+    /// Record a check's result; the verification time is set the first time a domain verifies and cleared when it stops.
     pub async fn set_domain_status(&self, hostname: &str, status: &str, now: OffsetDateTime) -> Result<(), DbError> {
+        // Only the first verification sets the verified time.
         sqlx::query(
             "UPDATE lib.domains SET status = $2, checked_at = $3,
                     verified_at = CASE WHEN $2 = 'verified' THEN coalesce(verified_at, $3) ELSE NULL END
@@ -2128,7 +2523,9 @@ impl Store {
         .map(|_| ())
     }
 
+    /// Remove an account's domain; false if it was not theirs.
     pub async fn delete_domain(&self, account: Uuid, hostname: &str) -> Result<bool, DbError> {
+        // Scoped to the account, so one account cannot remove another's domain.
         Ok(sqlx::query("DELETE FROM lib.domains WHERE account_id = $1 AND hostname = $2")
             .bind(account)
             .bind(hostname)
@@ -2140,6 +2537,7 @@ impl Store {
 
     // ── reports, appeals, audit ────────────────────────────────────────────
 
+    /// Record a report about a page or a link; the account is looked up by handle when it exists.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_report(
         &self,
@@ -2150,6 +2548,7 @@ impl Store {
         contact: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<Uuid, DbError> {
+        // The account is looked up by handle in the same statement, so a report about a deleted page keeps the handle.
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO lib.reports (id, handle, account_id, url, reason, details, contact, created_at)
@@ -2167,7 +2566,9 @@ impl Store {
         Ok(id)
     }
 
+    /// Reports with this status, oldest first.
     pub async fn reports(&self, status: &str, limit: i64) -> Result<Vec<Report>, DbError> {
+        // Oldest first, so the queue is worked in order.
         sqlx::query_as(
             "SELECT id, handle, account_id, url, reason, details, contact, status, created_at, decided_at, decided_by,
                     decision, statement
@@ -2179,6 +2580,7 @@ impl Store {
         .await
     }
 
+    /// One report.
     pub async fn report(&self, id: Uuid) -> Result<Option<Report>, DbError> {
         sqlx::query_as(
             "SELECT id, handle, account_id, url, reason, details, contact, status, created_at, decided_at, decided_by,
@@ -2199,6 +2601,7 @@ impl Store {
         statement: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<bool, DbError> {
+        // Only an open report can be decided, and only once.
         let r = sqlx::query(
             "UPDATE lib.reports SET status = $2, decided_by = $3, decision = $4, statement = $5, decided_at = $6
               WHERE id = $1 AND status = 'open'",
@@ -2216,6 +2619,7 @@ impl Store {
 
     /// Reports decided about this account that carried a statement (what the holder is shown and may appeal).
     pub async fn statements_for(&self, account: Uuid) -> Result<Vec<Report>, DbError> {
+        // The reporter's contact and details are not returned: the holder sees the decision and the statement, not who reported.
         sqlx::query_as(
             "SELECT id, handle, account_id, url, reason, '' AS details, NULL::text AS contact, status, created_at,
                     decided_at, NULL::text AS decided_by, decision, statement
@@ -2226,7 +2630,9 @@ impl Store {
         .await
     }
 
+    /// Record an account holder's appeal, about a report or in general.
     pub async fn create_appeal(&self, account: Uuid, report: Option<Uuid>, text: &str) -> Result<Uuid, DbError> {
+        // A new appeal starts open.
         let id = Uuid::new_v4();
         sqlx::query("INSERT INTO lib.appeals (id, account_id, report_id, text) VALUES ($1, $2, $3, $4)")
             .bind(id)
@@ -2238,7 +2644,9 @@ impl Store {
         Ok(id)
     }
 
+    /// Appeals with this status, oldest first.
     pub async fn appeals(&self, status: &str, limit: i64) -> Result<Vec<Appeal>, DbError> {
+        // Oldest first, so the queue is worked in order.
         sqlx::query_as(
             "SELECT id, account_id, report_id, text, status, created_at, decided_at, decided_by, statement
                FROM lib.appeals WHERE status = $1 ORDER BY created_at LIMIT $2",
@@ -2249,7 +2657,9 @@ impl Store {
         .await
     }
 
+    /// An account's own appeals, newest first, without who decided.
     pub async fn appeals_of(&self, account: Uuid) -> Result<Vec<Appeal>, DbError> {
+        // Without who decided: the holder sees the outcome, not the person.
         sqlx::query_as(
             "SELECT id, account_id, report_id, text, status, created_at, decided_at, NULL::text AS decided_by, statement
                FROM lib.appeals WHERE account_id = $1 ORDER BY created_at DESC",
@@ -2259,6 +2669,7 @@ impl Store {
         .await
     }
 
+    /// Record the decision on an open appeal; returns the account so it can be told.
     pub async fn decide_appeal(
         &self,
         id: Uuid,
@@ -2267,6 +2678,7 @@ impl Store {
         statement: &str,
         now: OffsetDateTime,
     ) -> Result<Option<Uuid>, DbError> {
+        // Returns the account so the holder can be told.
         sqlx::query_scalar(
             "UPDATE lib.appeals SET status = $2, decided_by = $3, statement = $4, decided_at = $5
               WHERE id = $1 AND status = 'open' RETURNING account_id",
@@ -2280,6 +2692,7 @@ impl Store {
         .await
     }
 
+    /// Append a row to the audit log.
     pub async fn audit(&self, actor: &str, action: &str, subject: &str, details: &Value) -> Result<(), DbError> {
         sqlx::query("INSERT INTO lib.audit_log (actor, action, subject, details) VALUES ($1, $2, $3, $4)")
             .bind(actor)
@@ -2310,7 +2723,9 @@ impl Store {
         Ok(r.rows_affected() == 1)
     }
 
+    /// The audit log, newest first, for one subject or for all.
     pub async fn audit_log(&self, subject: Option<&str>, limit: i64) -> Result<Vec<AuditEntry>, DbError> {
+        // A null subject means every subject.
         sqlx::query_as(
             "SELECT id, at, actor, action, subject, details FROM lib.audit_log
               WHERE ($1::text IS NULL OR subject = $1) ORDER BY id DESC LIMIT $2",
@@ -2323,7 +2738,9 @@ impl Store {
 
     // ── screening ──────────────────────────────────────────────────────────
 
+    /// The stored verdicts of these link hashes.
     pub async fn screens(&self, hashes: &[Vec<u8>]) -> Result<Vec<Screen>, DbError> {
+        // The verdicts for a set of link hashes in one query.
         sqlx::query_as(
             "SELECT url_hash, url, verdict, source, detail, checked_at, next_check_at, overridden_by
                FROM lib.link_screens WHERE url_hash = ANY($1)",
@@ -2343,6 +2760,7 @@ impl Store {
         next_check_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DbError> {
+        // The `WHERE` on the conflict keeps an operator's override: an automatic verdict never replaces it.
         sqlx::query(
             "INSERT INTO lib.link_screens (url_hash, url, verdict, source, detail, checked_at, next_check_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -2371,6 +2789,7 @@ impl Store {
         by: &str,
         now: OffsetDateTime,
     ) -> Result<(), DbError> {
+        // An operator's decision has a next check ten years away, so no automatic source revisits it until it is cleared.
         let h = sha256(url.as_bytes());
         match verdict {
             Some(v) => sqlx::query(
@@ -2399,7 +2818,9 @@ impl Store {
         }
     }
 
+    /// Screens that are due and not overridden, oldest first.
     pub async fn screens_due(&self, now: OffsetDateTime, limit: i64) -> Result<Vec<Screen>, DbError> {
+        // Operator overrides are never rechecked automatically.
         sqlx::query_as(
             "SELECT url_hash, url, verdict, source, detail, checked_at, next_check_at, overridden_by
                FROM lib.link_screens WHERE next_check_at <= $1 AND overridden_by IS NULL ORDER BY next_check_at LIMIT $2",
@@ -2419,6 +2840,7 @@ impl Store {
         limit: i64,
         defer_until: OffsetDateTime,
     ) -> Result<Vec<Screen>, DbError> {
+        // One statement finds the due screens, defers those no published page shows, and returns the rest, so no link is checked for nothing.
         sqlx::query_as(
             "WITH due AS (
                 SELECT s.url_hash,
@@ -2450,6 +2872,7 @@ impl Store {
 
     /// Screened links no page (draft or published) contains any more.
     pub async fn prune_screens(&self) -> Result<u64, DbError> {
+        // A verdict goes when no draft or published page contains its link any more, a week after it was last checked.
         Ok(sqlx::query(
             "DELETE FROM lib.link_screens s WHERE s.overridden_by IS NULL AND s.checked_at < now() - interval '7 days'
                 AND NOT EXISTS (SELECT 1 FROM lib.pages p
@@ -2460,7 +2883,9 @@ impl Store {
         .rows_affected())
     }
 
+    /// Add a host or URL to the blocklist, or change its reason.
     pub async fn add_block(&self, pattern: &str, kind: &str, reason: &str, by: &str) -> Result<(), DbError> {
+        // Adding a pattern again updates its kind, reason and who added it.
         sqlx::query(
             "INSERT INTO lib.blocklist (pattern, kind, reason, added_by) VALUES ($1, $2, $3, $4)
              ON CONFLICT (pattern) DO UPDATE SET kind = $2, reason = $3, added_by = $4, added_at = now()",
@@ -2474,7 +2899,9 @@ impl Store {
         .map(|_| ())
     }
 
+    /// Remove a blocklist entry; false if there was none.
     pub async fn remove_block(&self, pattern: &str) -> Result<bool, DbError> {
+        // The row count says whether there was an entry.
         Ok(sqlx::query("DELETE FROM lib.blocklist WHERE pattern = $1")
             .bind(pattern)
             .execute(&self.pool)
@@ -2483,7 +2910,9 @@ impl Store {
             == 1)
     }
 
+    /// The whole blocklist.
     pub async fn blocklist(&self) -> Result<Vec<BlockEntry>, DbError> {
+        // Sorted by pattern, for a stable listing.
         sqlx::query_as("SELECT pattern, kind, reason, added_by, added_at FROM lib.blocklist ORDER BY pattern")
             .fetch_all(&self.pool)
             .await
@@ -2491,6 +2920,7 @@ impl Store {
 
     /// The blocklist entry or ThreatFox indicator matching a URL: the URL itself, its host, or a parent domain of it.
     pub async fn blocked(&self, url: &str, hosts: &[String]) -> Result<Option<(String, String)>, DbError> {
+        // The operator's blocklist and the ThreatFox indicators are searched together; the first match wins.
         let r = sqlx::query(
             "SELECT 'blocklist' AS source, reason FROM lib.blocklist
               WHERE (kind = 'url' AND pattern = $1) OR (kind = 'host' AND pattern = ANY($2))
@@ -2508,6 +2938,7 @@ impl Store {
 
     /// Replaces the ThreatFox indicators with a fresh set (one transaction: matching never sees half a set).
     pub async fn replace_iocs(&self, iocs: &[(String, String, String)]) -> Result<u64, DbError> {
+        // Deleting and inserting in one transaction means matching never sees an empty or half-filled set.
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM lib.threat_iocs").execute(&mut *tx).await?;
         let mut n = 0;
@@ -2528,6 +2959,7 @@ impl Store {
 
     /// Adds `by` to a counter unless that would pass `cap`; returns whether it was added. Atomic across processes.
     pub async fn take_from_counter(&self, name: &str, period: &str, by: i64, cap: i64) -> Result<bool, DbError> {
+        // One statement: the insert applies only if the amount fits under the cap, and the update only if the new total does, so concurrent callers cannot pass it.
         let v: Option<i64> = sqlx::query_scalar(
             "INSERT INTO lib.counters (name, period, value) SELECT $1, $2, $3 WHERE $3 <= $4
              ON CONFLICT (name, period) DO UPDATE SET value = lib.counters.value + $3
@@ -2543,7 +2975,9 @@ impl Store {
         Ok(v.is_some())
     }
 
+    /// The value of a counter in a period (zero if it has none).
     pub async fn counter(&self, name: &str, period: &str) -> Result<i64, DbError> {
+        // A counter that was never taken from reads as zero.
         Ok(sqlx::query_scalar("SELECT value FROM lib.counters WHERE name = $1 AND period = $2")
             .bind(name)
             .bind(period)
@@ -2555,6 +2989,7 @@ impl Store {
     /// Takes from several counters at once, all or none (in one transaction): `None` when every take fitted under its
     /// cap, or the index of the first that did not (nothing is taken then). Each take is `(name, period, by, cap)`.
     pub async fn take_from_counters(&self, takes: &[(String, String, i64, i64)]) -> Result<Option<usize>, DbError> {
+        // All or none: the first take that does not fit rolls everything back and names its index.
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
         for (i, (name, period, by, cap)) in takes.iter().enumerate() {
             let v: Option<i64> = sqlx::query_scalar(
@@ -2582,6 +3017,7 @@ impl Store {
 
     /// Every list's state, without its prefixes.
     pub async fn web_risk_lists(&self) -> Result<Vec<WebRiskListState>, DbError> {
+        // Without the prefixes, which are large.
         sqlx::query_as(
             "SELECT threat_type, version_token, entries, next_diff_at, updated_at, last_error
                FROM lib.web_risk_lists ORDER BY threat_type",
@@ -2590,7 +3026,9 @@ impl Store {
         .await
     }
 
+    /// One Web Risk list with its prefixes.
     pub async fn web_risk_list(&self, threat_type: &str) -> Result<Option<WebRiskList>, DbError> {
+        // With the prefixes, for loading into memory.
         sqlx::query_as(
             "SELECT threat_type, version_token, entries, prefixes, checksum, next_diff_at, updated_at, last_error
                FROM lib.web_risk_lists WHERE threat_type = $1",
@@ -2602,6 +3040,7 @@ impl Store {
 
     /// Stores a list after a verified update (the worker only).
     pub async fn put_web_risk_list(&self, l: &WebRiskList) -> Result<(), DbError> {
+        // Upsert by threat type; this is the worker's write after a verified update.
         sqlx::query(
             "INSERT INTO lib.web_risk_lists (threat_type, version_token, entries, prefixes, checksum, next_diff_at,
                                              updated_at, last_error)
@@ -2631,6 +3070,7 @@ impl Store {
         next: OffsetDateTime,
         full: bool,
     ) -> Result<(), DbError> {
+        // The prefixes and `updated_at` are left alone so nobody reloads a list that did not change; a mismatch also clears the version so the next ask is for the whole list.
         sqlx::query(
             "INSERT INTO lib.web_risk_lists (threat_type, next_diff_at, last_error, updated_at)
              VALUES ($1, $3, $2, 'epoch')
@@ -2651,6 +3091,7 @@ impl Store {
     /// Deletes expired sessions, challenges, invites (90 days after expiry), audit entries older than `audit_keep`,
     /// and decided reports and appeals older than `cases_keep`. Returns the rows removed.
     pub async fn prune(&self, now: OffsetDateTime, audit_keep: Duration, cases_keep: Duration) -> Result<u64, DbError> {
+        // Each kind of old row goes by its own rule; the total number removed is returned.
         let mut n = 0;
         n += sqlx::query("DELETE FROM lib.sessions WHERE expires_at <= $1")
             .bind(now)
@@ -2692,7 +3133,9 @@ impl Store {
         Ok(n)
     }
 
+    /// The figures for the overview and `/metrics`, in one query.
     pub async fn stats(&self, now: OffsetDateTime) -> Result<Stats, DbError> {
+        // One round trip: every figure is a sub-select, and storage is the pictures, the drafts and published documents, and the kept versions.
         let r = sqlx::query(
             "SELECT
                (SELECT count(*) FROM lib.accounts WHERE status = 'active') AS active,
@@ -2731,12 +3174,14 @@ impl Store {
 
     /// The worker's single-writer lock (held for the life of the returned connection).
     pub async fn try_worker_lock(&self) -> Result<Option<sqlx::pool::PoolConnection<Postgres>>, DbError> {
+        // A session-level advisory lock: held for as long as the returned connection lives, so only one worker runs the housekeeping at a time.
         let mut c = self.pool.acquire().await?;
         let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(7_301_516_041)").fetch_one(&mut *c).await?;
         Ok(got.then_some(c))
     }
 }
 
+/// Insert an account row inside the caller's transaction: a unique violation means the handle or its skeleton is taken.
 async fn insert_account(
     tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
@@ -2745,6 +3190,7 @@ async fn insert_account(
     invited_by: Option<Uuid>,
     now: OffsetDateTime,
 ) -> Result<(), CreateError> {
+    // The terms and the age declaration are accepted at the moment of sign-up, so one time stamps all of them.
     let r = sqlx::query(
         "INSERT INTO lib.accounts (id, handle, handle_skeleton, free, operator, invited_by, age_confirmed_at,
                                    terms_version, terms_accepted_at, country_declared, billing_ref, created_at)

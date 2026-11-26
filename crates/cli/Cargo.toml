@@ -1,17 +1,24 @@
+# Link in Bio's one binary: it serves a page, runs the editor's backend, checks and renders a document, prints the limits and the contrast table, and
+# runs every role of the hosted service (pages, app, console, worker, migrations and the operator's own accounts). One image serves every role.
+# The package is named like the binary it builds.
 [package]
 name = "link-in-bio"
 description = "Link in Bio: the one binary (serve, render, check, schema, theme-table, worker, migrate, account)."
+# Version, edition, minimum Rust, licence and repository come from the workspace manifest.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Inherited: no crate here is published to crates.io.
 publish.workspace = true
 
+# The image's entry point, `link-in-bio`, with the subcommands as arguments.
 [[bin]]
 name = "link-in-bio"
 path = "src/main.rs"
 
+# Runtime dependencies are versioned once, in the workspace manifest. The workspace crates come first; the rest is the command line, the runtime and logging.
 [dependencies]
 link-in-bio-core.workspace = true
 link-in-bio-assets.workspace = true
@@ -23,10 +30,12 @@ time.workspace = true
 uuid.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "time", "macros", "sync"] }
+# `clap` parses the subcommands and reads settings from the environment too.
 clap.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The workspace's lint set, including the documentation lints.
 [lints]
 workspace = true

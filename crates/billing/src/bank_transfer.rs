@@ -22,27 +22,51 @@ use crate::{
     BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, ProviderEvent, Seller,
 };
 
+/// The provider id recorded in the ledger and used as the prefix of the method ids.
 pub const ID: &str = "bank-transfer";
 
+/// The payment scheme the operator receives on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scheme {
-    Sepa { iban: String, bic: Option<String>, eur_cents_per_month: u64 },
-    FasterPayments { sort_code: String, account_number: String },
+    /// A SEPA account: its IBAN, optionally its BIC, and the price of a month in euro cents (which the pound price cannot give).
+    Sepa {
+        /// The account's IBAN.
+        iban: String,
+        /// The bank's BIC, if it is to appear in the QR code.
+        bic: Option<String>,
+        /// The price of one month in euro cents.
+        eur_cents_per_month: u64,
+    },
+    /// A UK account, by sort code and account number.
+    FasterPayments {
+        /// The sort code, six digits (hyphens allowed).
+        sort_code: String,
+        /// The account number, eight digits.
+        account_number: String,
+    },
 }
 
+/// Who is paid and how.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// The name the payment is made out to.
     pub payee: String,
+    /// The scheme and account details.
     pub scheme: Scheme,
 }
 
+/// The adapter. It makes no requests: the buyer pays from their own bank, and the credits arrive as statements.
 pub struct BankTransfer {
+    /// The settings.
     config: Config,
 }
 
 impl BankTransfer {
+    /// An adapter from its settings, which are checked now so a mistake stops the start-up: the payee, the IBAN and BIC, the euro price or the sort code and account number.
     pub fn new(config: Config) -> Result<Self, BillingError> {
+        // Each check has its own fixed message that never repeats the value.
         let bad = |m: &str| Err(BillingError::Malformed(m.into()));
+        // A payee name is required and at most 70 characters, the EPC limit.
         if config.payee.trim().is_empty() || config.payee.chars().count() > 70 {
             return bad("the payee name is 1 to 70 characters");
         }
@@ -57,27 +81,32 @@ impl BankTransfer {
                 {
                     return bad("the BIC is 8 or 11 letters and digits");
                 }
+                // A price of nothing would sell months for free.
                 if *eur_cents_per_month == 0 {
                     return bad("the EUR price of a month is not set");
                 }
             }
             Scheme::FasterPayments { sort_code, account_number } => {
+                // The sort code may be written with hyphens; it must have six digits.
                 let sc: String = sort_code.chars().filter(char::is_ascii_digit).collect();
                 if sc.len() != 6 || account_number.len() != 8 || !account_number.bytes().all(|b| b.is_ascii_digit()) {
                     return bad("a sort code has 6 digits and an account number 8");
                 }
             }
         }
+        // All checks passed.
         Ok(Self { config })
     }
 }
 
+/// The remainder modulo 97 of a string of digits, computed digit by digit so it never overflows.
 fn mod97(digits: &str) -> u32 {
     digits.bytes().fold(0u32, |acc, b| (acc * 10 + u32::from(b - b'0')) % 97)
 }
 
 /// Letters as numbers (A = 10 … Z = 35), digits as themselves (the ISO 7064 MOD 97-10 conversion).
 fn numeric(s: &str) -> Option<String> {
+    // Each letter becomes two digits, so the output is at most twice as long.
     let mut out = String::with_capacity(s.len() * 2);
     for c in s.chars() {
         match c {
@@ -95,31 +124,39 @@ pub fn creditor_reference(body: &str) -> Option<String> {
     if body.is_empty() || body.len() > 21 || !body.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return None;
     }
+    // The check digits are computed over the body, the letters RF and two zeros.
     let n = numeric(&format!("{body}RF00"))?;
     Some(format!("RF{:02}{body}", 98 - mod97(&n)))
 }
 
 /// Whether a creditor reference is well formed and its check digits hold.
 pub fn reference_valid(r: &str) -> bool {
+    // Spaces are allowed in a printed reference, so they are removed before the check.
     let r: String = r.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_uppercase();
     if !r.starts_with("RF") || r.len() < 5 || r.len() > 25 {
         return false;
     }
+    // `RF`, the two check digits, then the body: the first four characters move to the end before the check.
     let (head, body) = r.split_at(4);
     numeric(&format!("{body}{head}")).is_some_and(|n| mod97(&n) == 1)
 }
 
+/// Whether an IBAN has a plausible length and its check digits hold (ISO 7064 MOD 97-10); spaces are ignored.
 pub fn iban_valid(iban: &str) -> bool {
+    // Spaces and case are ignored.
     let i: String = iban.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_uppercase();
+    // IBANs are 15 to 34 characters and start with two letters.
     if i.len() < 15 || i.len() > 34 || !i[..2].bytes().all(|b| b.is_ascii_uppercase()) {
         return false;
     }
+    // The country code and check digits move to the end before the check.
     let (head, rest) = i.split_at(4);
     numeric(&format!("{rest}{head}")).is_some_and(|n| mod97(&n) == 1)
 }
 
 /// The EPC QR code payload (EPC069-12 version 002, UTF-8, SEPA Credit Transfer) with a structured reference.
 pub fn epc_payload(payee: &str, iban: &str, bic: Option<&str>, amount_cents: u64, reference: &str) -> String {
+    // The payload carries the IBAN without spaces.
     let iban: String = iban.chars().filter(|c| !c.is_whitespace()).collect();
     format!(
         "BCD\n002\n1\nSCT\n{}\n{}\n{}\nEUR{}.{:02}\n\n{}\n\n",
@@ -134,10 +171,12 @@ pub fn epc_payload(payee: &str, iban: &str, bic: Option<&str>, amount_cents: u64
 
 #[async_trait::async_trait]
 impl BillingProvider for BankTransfer {
+    /// The provider id.
     fn id(&self) -> &'static str {
         ID
     }
 
+    /// One method for the scheme, sold by the operator, with no fixed fee (the receiving bank's fees are not known).
     fn methods(&self) -> Vec<Method> {
         let (id, label) = match self.config.scheme {
             Scheme::Sepa { .. } => ("sepa", "Bank transfer (SEPA, scan with your banking app)"),
@@ -153,15 +192,20 @@ impl BillingProvider for BankTransfer {
         }]
     }
 
+    /// Make the checkout the buyer's payment instructions: the payee, the account, the amount and a creditor reference made from the checkout id. For SEPA there is an EPC QR code payload as well.
     async fn create_checkout(&self, req: &CheckoutRequest) -> Result<CheckoutStart, BillingError> {
         if !self.methods().iter().any(|m| m.id == req.method) {
             return Err(BillingError::NotOffered);
         }
         // 20 characters of the checkout id: unique, and short enough to type.
+        // The reference body is 20 characters of the checkout id, upper-cased: unique, and short enough to type.
         let body: String = req.checkout_id.simple().to_string().to_ascii_uppercase().chars().take(20).collect();
+        // The reference is the checkout's identity on the bank statement.
         let reference = creditor_reference(&body).ok_or_else(|| BillingError::Malformed("reference".into()))?;
+        // What the buyer's page shows depends on the scheme.
         let client = match &self.config.scheme {
             Scheme::Sepa { iban, bic, eur_cents_per_month } => {
+                // SEPA is priced in euros, so the amount is the euro price of a month times the months.
                 let cents = eur_cents_per_month * u64::from(req.months);
                 json!({
                     "kind": "bank-transfer", "scheme": "sepa", "payee": self.config.payee, "iban": iban, "bic": bic,
@@ -180,6 +224,7 @@ impl BillingProvider for BankTransfer {
         Ok(CheckoutStart { provider_ref: reference, client })
     }
 
+    /// Always refused: bank transfers arrive as statements, never as notifications.
     async fn verify_notification(
         &self,
         _: &BTreeMap<String, String>,
@@ -190,6 +235,7 @@ impl BillingProvider for BankTransfer {
         Err(BillingError::Unauthentic)
     }
 
+    /// Always open: only a credit that names the reference pays it.
     async fn checkout_outcome(&self, _: &str) -> Result<Outcome, BillingError> {
         Ok(Outcome::Open)
     }
@@ -198,9 +244,13 @@ impl BillingProvider for BankTransfer {
 /// One incoming credit from a statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credit {
+    /// The creditor reference the payment carries, which names the checkout.
     pub reference: String,
+    /// The amount in minor units.
     pub amount_minor: u64,
+    /// The currency code.
     pub currency: String,
+    /// The booking date as the statement writes it.
     pub booked: Option<String>,
     /// The bank's own id of the entry (the account servicer reference), for the ledger.
     pub entry: String,
@@ -212,22 +262,26 @@ pub struct Credit {
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Debtor {
+    /// The paying party's name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The IBAN, or the account's other id (a UK sort code and account number).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// The paying bank's BIC.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bic: Option<String>,
 }
 
-/// The debtor of one statement entry or transaction (camt.053/054 of any version: `Dbtr/Nm` or `Dbtr/Pty/Nm`,
-/// `DbtrAcct/Id/IBAN` or `DbtrAcct/Id/Othr/Id`, `DbtrAgt/FinInstnId/BICFI` or `BIC`).
+/// The first element below a node with this local name (statements are matched by local name, so every version works).
 fn find<'a, 'i>(n: roxmltree::Node<'a, 'i>, local: &str) -> Option<roxmltree::Node<'a, 'i>> {
     n.descendants().find(|c| c.is_element() && c.tag_name().name() == local)
 }
 
+/// The debtor of one statement entry or transaction (camt.053/054 of any version: `Dbtr/Nm` or `Dbtr/Pty/Nm`,
+/// `DbtrAcct/Id/IBAN` or `DbtrAcct/Id/Othr/Id`, `DbtrAgt/FinInstnId/BICFI` or `BIC`), or `None` when it names nobody.
 fn debtor_of(part: roxmltree::Node) -> Option<Debtor> {
+    // The trimmed text of an element, if it has any and is not absurdly long.
     let text = |n: Option<roxmltree::Node>| {
         n.and_then(|n| n.text()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty() && t.len() <= 140)
     };
@@ -255,6 +309,7 @@ pub fn amount_minor(s: &str) -> Option<u64> {
     {
         return None;
     }
+    // "12.5" is 12 pounds and 50 pence, so the fraction is padded to two digits on the right.
     let f = format!("{frac:0<2}");
     whole.parse::<u64>().ok()?.checked_mul(100)?.checked_add(f.parse::<u64>().ok()?)
 }
@@ -262,11 +317,13 @@ pub fn amount_minor(s: &str) -> Option<u64> {
 /// The first whole, valid creditor reference (`RF…`) in free text (a payment's description or remittance line). A
 /// reference split by spaces is not trusted.
 pub fn reference_in_text(text: &str) -> Option<String> {
+    // Words are split on anything that is not a letter or a digit, so a reference broken by a space is not found.
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .map(str::to_ascii_uppercase)
         .find(|w| w.starts_with("RF") && reference_valid(w))
 }
 
+/// The direct child of a node with this local name.
 fn child<'a, 'i>(n: roxmltree::Node<'a, 'i>, local: &str) -> Option<roxmltree::Node<'a, 'i>> {
     n.children().find(|c| c.is_element() && c.tag_name().name() == local)
 }
@@ -277,12 +334,15 @@ fn child<'a, 'i>(n: roxmltree::Node<'a, 'i>, local: &str) -> Option<roxmltree::N
 pub fn credits_from_camt(xml: &str) -> Result<Vec<Credit>, BillingError> {
     let doc =
         roxmltree::Document::parse(xml).map_err(|e| BillingError::Malformed(format!("not an XML statement: {e}")))?;
+    // Elements are matched by their local name, which ignores the namespace and so the version of the standard.
     let name = |n: &roxmltree::Node, l: &str| n.is_element() && n.tag_name().name() == l;
     let mut out = Vec::new();
     for ntry in doc.descendants().filter(|n| name(n, "Ntry")) {
+        // Only credits (money in) are payments.
         if child(ntry, "CdtDbtInd").and_then(|n| n.text()) != Some("CRDT") {
             continue;
         }
+        // Only booked entries count; an entry with no status is taken as booked.
         if let Some(sts) = child(ntry, "Sts") {
             let code = child(sts, "Cd").and_then(|n| n.text()).or(sts.text()).unwrap_or("").trim();
             if !code.is_empty() && code != "BOOK" {
@@ -296,6 +356,7 @@ pub fn credits_from_camt(xml: &str) -> Result<Vec<Credit>, BillingError> {
         // One entry may batch several transactions; each carries its own reference and amount.
         let txs: Vec<_> = ntry.descendants().filter(|n| name(n, "TxDtls")).collect();
         let parts: Vec<roxmltree::Node> = if txs.is_empty() { vec![ntry] } else { txs };
+        // The index keeps the ledger id of each transaction in a batch distinct.
         for (i, part) in parts.into_iter().enumerate() {
             let amt = part
                 .descendants()
@@ -315,6 +376,7 @@ pub fn credits_from_camt(xml: &str) -> Result<Vec<Credit>, BillingError> {
             else {
                 continue;
             };
+            // A reference whose check digits fail is ignored, so a mistyped one never pays anything.
             if !reference_valid(&reference) {
                 continue;
             }
@@ -349,10 +411,12 @@ pub fn expected(client: &Value) -> Option<(u64, String)> {
     Some((client["amountMinor"].as_u64()?, client["currency"].as_str()?.to_string()))
 }
 
+/// Unit tests for references, IBANs, amounts and statements.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The ISO 11649 example reference is reproduced, check digits are verified with spaces tolerated, and empty or over-long bodies are refused.
     #[test]
     fn creditor_references() {
         // The ISO 11649 example.
@@ -365,6 +429,7 @@ mod tests {
         assert!(reference_valid(&r));
     }
 
+    /// Valid IBANs pass and a changed digit fails; the EPC payload has the fields in the order the standard sets, with the IBAN without spaces and the amount in euros and cents.
     #[test]
     fn ibans_and_epc() {
         assert!(iban_valid("DE89 3704 0044 0532 0130 00"));
@@ -378,6 +443,7 @@ mod tests {
         );
     }
 
+    /// Decimal amounts become minor units; more than two decimals and negative amounts are refused.
     #[test]
     fn amounts() {
         assert_eq!(amount_minor("12.5"), Some(1250));
@@ -387,6 +453,7 @@ mod tests {
         assert_eq!(amount_minor("-1"), None);
     }
 
+    /// Credits are read from both statement kinds and versions; debits and pending entries are ignored, a reference only in free text is accepted only whole, and a document that is not XML is refused.
     #[test]
     fn camt_054_and_053() {
         let camt054 = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -419,6 +486,7 @@ mod tests {
         assert!(credits_from_camt("not xml").is_err());
     }
 
+    /// The paying party's name, account and bank are read when the statement carries them, an other-kind account id is read too, and they end up in the payment's evidence.
     #[test]
     fn the_debtor_is_read_when_the_statement_names_it() {
         // camt.053.001.08: the debtor's name under `Dbtr/Pty`, its IBAN and its bank's BIC.

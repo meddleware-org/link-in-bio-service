@@ -18,38 +18,52 @@ use crate::{
     Refunded, Seller, hmac_sha256, same, send_json,
 };
 
+/// The provider id recorded in the ledger and used as the prefix of the method id.
 pub const ID: &str = "square";
+/// The webhook header that carries the signature, lower-cased as the router passes header names.
 pub const SIGNATURE_HEADER: &str = "x-square-hmacsha256-signature";
 /// The Square API version this adapter is written against.
 pub const VERSION: &str = "2025-10-16";
 
+/// How to reach Square and what the method costs.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// `https://connect.squareupsandbox.com` (sandbox) or `https://connect.squareup.com`.
     pub api_base: String,
+    /// The access token, sent as a bearer token on every API call.
     pub access_token: String,
+    /// The Square location the payments are made at.
     pub location_id: String,
+    /// The key the webhook signature is made with.
     pub signature_key: String,
     /// The notification URL exactly as registered in Square's dashboard (it is part of what Square signs).
     pub notification_url: String,
+    /// The method's fixed fee in pence, used to work out the minimum months.
     pub fixed_pence: u32,
+    /// The method's percentage fee in basis points.
     pub percent_bps: u32,
 }
 
+/// The adapter.
 pub struct Square {
+    /// The settings.
     config: Config,
+    /// The HTTP client for API calls.
     http: reqwest::Client,
 }
 
 impl Square {
+    /// An adapter from its settings and a client.
     pub fn new(config: Config, http: reqwest::Client) -> Self {
         Self { config, http }
     }
 
+    /// An API address for a path.
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.config.api_base.trim_end_matches('/'))
     }
 
+    /// A GET request with the access token and the API version.
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
         self.http.get(self.url(path)).bearer_auth(&self.config.access_token).header("Square-Version", VERSION)
     }
@@ -69,10 +83,12 @@ pub fn signature(key: &str, notification_url: &str, body: &[u8]) -> String {
 
 #[async_trait::async_trait]
 impl BillingProvider for Square {
+    /// The provider id.
     fn id(&self) -> &'static str {
         ID
     }
 
+    /// One method, a card or a wallet on Square's page, sold by the operator.
     fn methods(&self) -> Vec<Method> {
         vec![Method {
             id: format!("{ID}:card"),
@@ -84,6 +100,7 @@ impl BillingProvider for Square {
         }]
     }
 
+    /// Create a payment link in pounds with the checkout id as the idempotency key; the buyer pays on Square's page and the order id is the checkout's reference.
     async fn create_checkout(&self, req: &CheckoutRequest) -> Result<CheckoutStart, BillingError> {
         if req.method != format!("{ID}:card") {
             return Err(BillingError::NotOffered);
@@ -106,6 +123,7 @@ impl BillingProvider for Square {
                 .json(&body),
         )
         .await?;
+        // The link's address and its order id, both required.
         let link = &v["payment_link"];
         let (Some(url), Some(order)) = (link["url"].as_str(), link["order_id"].as_str()) else {
             return Err(BillingError::Malformed("no payment link url or order id".into()));
@@ -116,6 +134,7 @@ impl BillingProvider for Square {
         })
     }
 
+    /// Verify the signature over the notification address and the body, then read a payment (completed is paid, failed or cancelled is failed) or a completed refund. Other states are ignored.
     async fn verify_notification(
         &self,
         headers: &BTreeMap<String, String>,
@@ -123,24 +142,29 @@ impl BillingProvider for Square {
         _now: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         let got = headers.get(SIGNATURE_HEADER).ok_or(BillingError::Unauthentic)?;
+        // Square signs the address it was told to call plus the body, so the address in the settings must be exactly the one registered.
         let want = signature(&self.config.signature_key, &self.config.notification_url, body);
         if !same(got.trim().as_bytes(), want.as_bytes()) {
             return Err(BillingError::Unauthentic);
         }
         let v: Value = serde_json::from_slice(body).map_err(|e| BillingError::Malformed(e.to_string()))?;
+        // The event's id, for idempotency of the events that are not payments.
         let event = v["event_id"].as_str().unwrap_or("").to_string();
         match v["type"].as_str() {
+            // A payment, new or changed.
             Some("payment.updated") | Some("payment.created") => {
                 let p = &v["data"]["object"]["payment"];
                 let (Some(order), Some(status)) = (p["order_id"].as_str(), p["status"].as_str()) else {
                     return Err(BillingError::Malformed("no order id or status".into()));
                 };
+                // Only terminal states matter; a payment still pending reports nothing yet.
                 let outcome = match status {
                     "COMPLETED" => Outcome::Paid,
                     "FAILED" | "CANCELED" => Outcome::Failed,
                     _ => return Ok(Vec::new()),
                 };
                 Ok(vec![ProviderEvent {
+                    // A paid event uses the shared ledger key, so a payment seen by notification and by reconciliation extends the period once.
                     event_id: if outcome == Outcome::Paid {
                         self.paid_event_id(order)
                     } else {
@@ -156,8 +180,10 @@ impl BillingProvider for Square {
                     }),
                 }])
             }
+            // A refund, new or changed.
             Some("refund.updated") | Some("refund.created") => {
                 let r = &v["data"]["object"]["refund"];
+                // A refund counts only once it has completed.
                 if r["status"].as_str() != Some("COMPLETED") {
                     return Ok(Vec::new());
                 }
@@ -177,15 +203,19 @@ impl BillingProvider for Square {
                     evidence: json!({ "event": event, "refund": r["id"], "amount": r["amount_money"] }),
                 }])
             }
+            // Anything else is acknowledged and ignored.
             _ => Ok(Vec::new()),
         }
     }
 
+    /// Ask Square how an order stands.
     async fn checkout_outcome(&self, provider_ref: &str) -> Result<Outcome, BillingError> {
+        // An order id is alphanumeric with underscore and hyphen; anything else is not put in a request path.
         if provider_ref.is_empty() || !provider_ref.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         {
             return Err(BillingError::Malformed("not an order id".into()));
         }
+        // The order's state or its total.
         let v = send_json(self.get(&format!("/v2/orders/{provider_ref}"))).await?;
         Ok(match v["order"]["state"].as_str() {
             Some("COMPLETED") => Outcome::Paid,
@@ -194,6 +224,7 @@ impl BillingProvider for Square {
         })
     }
 
+    /// The total Square says the order is for, so the app can check the payment covers the checkout.
     async fn paid_facts(&self, provider_ref: &str) -> Result<Option<Paid>, BillingError> {
         if provider_ref.is_empty() || !provider_ref.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         {

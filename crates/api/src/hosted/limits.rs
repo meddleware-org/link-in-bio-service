@@ -37,22 +37,28 @@ fn shown(m: &Manifest) -> Manifest {
 
 /// Whether `new` keeps `old`'s order and only leaves things out.
 fn subsequence<T>(new: &[T], old: &[T], same: impl Fn(&T, &T) -> bool) -> bool {
+    // Walks the old list once, so the order must be kept.
     let mut rest = old.iter();
     new.iter().all(|n| rest.by_ref().any(|o| same(n, o)))
 }
 
 /// Whether `new` differs from the published `old` only by links removed or hidden (and contact entries removed).
 pub fn only_removes(old: &Manifest, new: &Manifest) -> bool {
+    // Everything but the items and contacts must be identical; the items must be a subsequence of the old ones, so nothing is added, changed or reordered.
+    // Only what a visitor sees is compared, so hiding a link counts as removing it.
     let (o, n) = (shown(old), shown(new));
+    // Everything but the items and the contacts, which are compared separately.
     let rest = |m: &Manifest| {
         let mut m = m.clone();
         m.items.clear();
         m.contact.clear();
         m
     };
+    // Any change outside the items and contacts is not a removal.
     if rest(&o) != rest(&n) {
         return false;
     }
+    // Links must be equal; groups must keep their id, title and open state, and may only lose links.
     let same_item = |a: &Item, b: &Item| match (a, b) {
         (Item::Link(x), Item::Link(y)) => x == y,
         (Item::Group(x), Item::Group(y)) => {
@@ -65,7 +71,9 @@ pub fn only_removes(old: &Manifest, new: &Manifest) -> bool {
 
 /// The shown links' URLs in `new` that `old` (the published page, if any) did not show.
 pub fn new_urls(old: Option<&Manifest>, new: &Manifest) -> BTreeSet<String> {
+    // A first publish has no published page, so every shown link counts as new.
     let before: BTreeSet<&str> = old.map(|o| o.visible_links().map(|l| l.url.as_str()).collect()).unwrap_or_default();
+    // Links shown now that the published page did not show.
     new.visible_links().map(|l| l.url.as_str()).filter(|u| !before.contains(u)).map(String::from).collect()
 }
 
@@ -77,17 +85,24 @@ pub fn hour(now: OffsetDateTime) -> String {
 
 /// When the current UTC hour or day ends.
 pub fn next_hour(now: OffsetDateTime) -> OffsetDateTime {
+    // The start of this hour, an hour on.
     let t = now.to_offset(UtcOffset::UTC);
     t.replace_time(Time::from_hms(t.hour(), 0, 0).unwrap_or(Time::MIDNIGHT)) + Duration::HOUR
 }
 
+/// When the current UTC day ends.
 pub fn next_day(now: OffsetDateTime) -> OffsetDateTime {
+    // The start of this day, a day on.
     let t = now.to_offset(UtcOffset::UTC);
+    // Midnight UTC, a day on.
     t.replace_time(Time::MIDNIGHT) + Duration::DAY
 }
 
+/// The seconds until a reset, and the time in words for the answer.
 fn wait(now: OffsetDateTime, until: OffsetDateTime) -> (u64, String) {
+    // At least a second, so `Retry-After` is never zero.
     let secs = (until - now).whole_seconds().max(1) as u64;
+    // Minutes below an hour, otherwise hours.
     let words = if secs < 3600 {
         format!("in {} minute(s)", secs.div_ceil(60))
     } else {
@@ -104,8 +119,11 @@ pub fn takes(
     new_links: usize,
     now: OffsetDateTime,
 ) -> Vec<(String, String, i64, i64)> {
+    // A limit of zero is no limit, and a publish with no new links takes nothing from the link budget.
+    // The list of budgets this publish takes from.
     let mut t = Vec::new();
     if limits.changes_per_hour > 0 {
+        // One change in this hour's budget.
         t.push((format!("changes:{account}"), hour(now), 1, limits.changes_per_hour));
     }
     if limits.new_links_per_day > 0 && new_links > 0 {
@@ -121,9 +139,11 @@ pub fn takes(
 
 /// The refusal for the take at `index` of [`takes`].
 pub fn refusal(take: &(String, String, i64, i64), used: i64, now: OffsetDateTime, upload: bool) -> ApiError {
+    // The message says which limit was reached, the setting that controls it, when it resets, and that removing links and unpublishing are always possible.
     let (name, _, by, cap) = take;
     if name.starts_with("changes:") {
         let (secs, when) = wait(now, next_hour(now));
+        // A picture upload is named as such, so the refusal reads right.
         let what = if upload { "This picture upload is refused: you" } else { "You" };
         ApiError::TooMany {
             message: format!(
@@ -135,6 +155,7 @@ pub fn refusal(take: &(String, String, i64, i64), used: i64, now: OffsetDateTime
         }
     } else {
         let (secs, when) = wait(now, next_day(now));
+        // How many new links are left today.
         let left = (cap - used).max(0);
         ApiError::TooMany {
             message: format!(
@@ -149,6 +170,8 @@ pub fn refusal(take: &(String, String, i64, i64), used: i64, now: OffsetDateTime
 
 /// Takes a publish (or, with `upload`, a picture upload) and its new links from the account's budgets, all or none.
 pub async fn take(app: &Shared, account: Uuid, new_links: usize, upload: bool, now: OffsetDateTime) -> ApiResult<()> {
+    // All budgets are taken in one step, so a refusal leaves every counter as it was; the refusal names the first budget that did not fit.
+    // No budgets (limits off) means nothing to take.
     let t = takes(&app.config.account_limits, account, new_links, now);
     if t.is_empty() {
         return Ok(());
@@ -162,21 +185,28 @@ pub async fn take(app: &Shared, account: Uuid, new_links: usize, upload: bool, n
     }
 }
 
+/// Unit tests for the account limits.
 #[cfg(test)]
 mod tests {
     use super::*;
     use time::macros::datetime;
 
+    /// A page with these links, parsed as an account's page is.
     fn page(links: &str) -> Manifest {
         let doc = format!(r#"{{"schema":1,"identity":{{"displayName":"Alice","handle":"alice"}},"items":[{links}]}}"#);
         link_in_bio_core::parse(doc.as_bytes(), super::super::account_page_options()).unwrap().manifest
     }
 
+    /// A link.
     const A: &str = r#"{"kind":"link","id":"a","title":"A","url":"https://a.example/"}"#;
+    /// Another link.
     const B: &str = r#"{"kind":"link","id":"b","title":"B","url":"https://b.example/"}"#;
+    /// A third link.
     const C: &str = r#"{"kind":"link","id":"c","title":"C","url":"https://c.example/"}"#;
+    /// The second link, hidden.
     const B_HIDDEN: &str = r#"{"kind":"link","id":"b","title":"B","url":"https://b.example/","hidden":true}"#;
 
+    /// Removing or hiding links is only removing; reordering, adding, changing and showing a hidden link again are not, and the same holds inside a group.
     #[test]
     fn removing_or_hiding_links_is_only_removing() {
         let old = page(&[A, B, C].join(","));
@@ -197,6 +227,7 @@ mod tests {
         assert!(!only_removes(&grouped(B), &grouped(&[A, B].join(","))));
     }
 
+    /// A link the published page hid counts as new when shown, and a first publish counts every link.
     #[test]
     fn new_links_are_those_the_published_page_did_not_show() {
         let old = page(&[A, B_HIDDEN].join(","));
@@ -206,6 +237,7 @@ mod tests {
         assert_eq!(new_urls(None, &new).len(), 3, "a first publish: every link is new");
     }
 
+    /// The hour and day keys and resets, what is taken for a publish, that zero means no limit, and the two refusals with their reset times.
     #[test]
     fn budgets_and_their_resets() {
         let now = datetime!(2026-11-18 13:37:10 UTC);
@@ -217,11 +249,14 @@ mod tests {
             changes_per_hour: 30,
             new_links_per_day: 120,
         };
+        // A fixed account id.
         let id = Uuid::nil();
+        // A publish with seven new links takes from both budgets.
         let t = takes(&limits, id, 7, now);
         assert_eq!(t.len(), 2);
         assert_eq!(t[1], (format!("new-links:{id}"), "2026-11-18".to_string(), 7, 120));
         assert_eq!(takes(&limits, id, 0, now).len(), 1, "no new link, nothing to take for them");
+        // Both limits switched off.
         let off = AccountLimits { changes_per_hour: 0, new_links_per_day: 0, ..limits };
         assert!(takes(&off, id, 7, now).is_empty(), "0 means no limit");
         match refusal(&t[0], 30, now, false) {

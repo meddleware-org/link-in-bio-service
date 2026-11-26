@@ -1,13 +1,20 @@
+# Link in Bio's link-screening crate: built-in checks, the operator's blocklist, ThreatFox, and Google Web Risk (lookup or update mode) behind
+# monthly caps that are counted in the database across every process. A link that is flagged is hidden until an operator reviews it.
+# The crate's identity.
 [package]
 name = "link-in-bio-safety"
 description = "Link in Bio: layered link screening (built-in checks, blocklist and ThreatFox, Google Web Risk Update API lists behind monthly caps)."
+# Version, edition, minimum Rust, licence and repository come from the workspace manifest.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Inherited: no crate here is published to crates.io.
 publish.workspace = true
 
+# Runtime dependencies are versioned once, in the workspace manifest.
+# The store holds the blocklist, the Web Risk lists and the call counters; `reqwest` talks to Web Risk and ThreatFox, with `rustls` as its one TLS stack.
 [dependencies]
 link-in-bio-store.workspace = true
 reqwest.workspace = true
@@ -15,13 +22,16 @@ rustls.workspace = true
 url.workspace = true
 time.workspace = true
 serde_json.workspace = true
+# Web Risk's lists are hash prefixes of normalised links, so the crate hashes with SHA-256 and handles the encodings with `base64`.
 sha2.workspace = true
 base64.workspace = true
 
+# Test-only: stand-in servers for Web Risk and ThreatFox, and `sqlx` for the tests that use a real database.
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 axum = { workspace = true, features = ["query", "json"] }
 sqlx.workspace = true
 
+# The workspace's lint set, including the documentation lints.
 [lints]
 workspace = true

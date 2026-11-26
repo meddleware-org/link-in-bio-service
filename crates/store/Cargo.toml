@@ -1,13 +1,19 @@
+# Link in Bio's store crate: every SQL statement the hosted service runs, its migrations, and the connection settings (PostgreSQL, verify-full
+# TLS only). Other crates reach the database only through this one, so the database roles stay the only way in.
+# The crate's identity.
 [package]
 name = "link-in-bio-store"
 description = "Link in Bio: every SQL statement of the hosted service, the migrations and the connection settings (PostgreSQL, verify-full TLS)."
+# Version, edition, minimum Rust, licence and repository come from the workspace manifest.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Inherited: no crate here is published to crates.io.
 publish.workspace = true
 
+# Runtime dependencies are versioned once, in the workspace manifest. `sqlx` is the only database driver, with the TLS stack and the migration runner the workspace manifest chooses.
 [dependencies]
 sqlx.workspace = true
 url.workspace = true
@@ -16,10 +22,13 @@ time.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Content hashes name stored pictures and the screened links.
 sha2.workspace = true
 
+# Test-only: an async runtime for the store's tests, which run against a real PostgreSQL.
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
+# The workspace's lint set, including the documentation lints.
 [lints]
 workspace = true

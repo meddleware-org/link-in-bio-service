@@ -17,6 +17,7 @@ pub fn secure(h: &mut HeaderMap, local: bool, hsts: bool) {
             h.insert(k, v);
         }
     };
+    // The policy, then the headers that stop sniffing, referrers, framing and cross-window access, and the powerful features no page needs.
     set(h, header::CONTENT_SECURITY_POLICY, page_csp());
     set(h, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     set(h, header::REFERRER_POLICY, "no-referrer");
@@ -27,6 +28,7 @@ pub fn secure(h: &mut HeaderMap, local: bool, hsts: bool) {
         HeaderName::from_static("permissions-policy"),
         "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=(), browsing-topics=()",
     );
+    // Strict transport security only when the edge serves HTTPS, and never on the loopback editor.
     if hsts && !local {
         set(h, header::STRICT_TRANSPORT_SECURITY, "max-age=31536000; includeSubDomains");
     }
@@ -34,6 +36,9 @@ pub fn secure(h: &mut HeaderMap, local: bool, hsts: bool) {
     h.remove(header::SET_COOKIE);
 }
 
+/// The cache header for a page: five minutes, shared.
 pub const CACHE_PAGE: &str = "public, max-age=300";
+/// The cache header for a content-hashed file: a year, and never revalidated.
 pub const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+/// The cache header for anything private or changing: not stored.
 pub const CACHE_NONE: &str = "no-store";

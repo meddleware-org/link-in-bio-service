@@ -9,37 +9,58 @@ use link_in_bio_store::Stats;
 /// This month's Web Risk calls against their caps, and the prefixes this process holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebRiskFigures {
+    /// Calls made this month.
     pub calls: i64,
+    /// The month's hard cap on calls.
     pub cap: i64,
+    /// Billed confirmations made this month.
     pub confirms: i64,
+    /// The month's cap on confirmations.
     pub confirm_cap: i64,
+    /// Prefixes this process holds in memory.
     pub prefixes: usize,
 }
 
+/// The counters one process keeps, read by the scrape.
 #[derive(Debug, Default)]
 pub struct Metrics {
+    /// Accounts created.
     pub signups: AtomicU64,
+    /// Successful sign-ins.
     pub signins: AtomicU64,
+    /// Refused sign-in attempts.
     pub signin_failures: AtomicU64,
+    /// Pages published.
     pub publishes: AtomicU64,
+    /// Reports received.
     pub reports: AtomicU64,
+    /// Checkouts started.
     pub checkouts: AtomicU64,
+    /// Payments applied to a paid period.
     pub payments: AtomicU64,
+    /// Payment notifications that did not cover their checkout.
     pub payment_mismatches: AtomicU64,
     /// Publishes and picture uploads refused by an account's limits (429).
     pub limited: AtomicU64,
+    /// Provider notifications refused.
     pub notification_failures: AtomicU64,
+    /// Links screened.
     pub screenings: AtomicU64,
+    /// Tenant page documents served.
     pub pages_served: AtomicU64,
+    /// Worker duties that failed.
     pub job_failures: AtomicU64,
 }
 
 impl Metrics {
+    /// Count one event.
     pub fn inc(c: &AtomicU64) {
         c.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The exposition text: this process's counters, then the database figures and the Web Risk figures when they are known.
     pub fn render(&self, stats: Option<&Stats>, web_risk: Option<WebRiskFigures>) -> String {
+        // Counters first (always present), then the gauges that need the database or Web Risk.
         let mut s = String::new();
         for (name, help, c) in [
             ("link_in_bio_signups_total", "Accounts created", &self.signups),

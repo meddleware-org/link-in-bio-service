@@ -1,17 +1,27 @@
+# Link in Bio's billing crate: the one port every payment provider implements, the router that decides which methods a buyer is offered, and
+# the adapters (manual, Chain Payments, Square, GoCardless, Paddle, bank transfer, Open Payments and the bank feeds). It holds no database access:
+# the app stores what it returns.
+# The crate's identity.
 [package]
 name = "link-in-bio-billing"
 description = "Link in Bio: the billing provider port, the router (switches, country evidence, minimum months) and the manual and Chain Payments adapters."
+# Version, edition, minimum Rust, licence and repository come from the workspace manifest.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Inherited: no crate here is published to crates.io.
 publish.workspace = true
 
+# Runtime dependencies are versioned once, in the workspace manifest, except the statement parser below.
 [dependencies]
+# The provider port is an async trait object, so adapters can be chosen at start-up.
 async-trait.workspace = true
+# The HTTP client for provider APIs, with `rustls` as its one TLS stack.
 reqwest.workspace = true
 rustls.workspace = true
+# Signatures and digests for the signing adapters (HTTP message signatures, HMAC), and `base64`/`hex` for their encodings.
 ring.workspace = true
 base64.workspace = true
 hex.workspace = true
@@ -20,14 +30,18 @@ uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Only the parts of the runtime the adapters use: channels, sockets for tests and timers.
 tokio = { workspace = true, features = ["sync", "net", "time"] }
 url.workspace = true
+# The bank statements (ISO 20022 camt) are XML; this parser is read-only and does not resolve external entities. It is pinned exactly, as the rest of the fleet is.
 roxmltree = "=0.21.2"
 
+# Test-only: a multi-threaded runtime and an HTTP server for the adapters' conformance tests, which run against local servers.
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 axum.workspace = true
 reqwest.workspace = true
 
+# The workspace's lint set, including the documentation lints.
 [lints]
 workspace = true

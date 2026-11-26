@@ -19,16 +19,27 @@
 //! - [`refunds`]: what an account holder may ask back and exactly how much (cancel within 14 days, unstarted months
 //!   later, an unapplied payment whole), net of the provider's fee share.
 
+/// The receiving banks' APIs as sources of credits.
 pub mod bank_feed;
+/// SEPA and Faster Payments bank transfers, matched by reference.
 pub mod bank_transfer;
+/// The Chain Payments adapter (SUI and native USDC).
 pub mod chain_payments;
+/// UK bank payments through Open Banking.
 pub mod gocardless;
+/// HTTP message signatures and digests.
 pub mod httpsig;
+/// Key files for the signing adapters.
 pub mod keys;
+/// The operator's manual grants.
 pub mod manual;
+/// Interledger Open Payments.
 pub mod open_payments;
+/// Paddle, the merchant of record for other countries.
 pub mod paddle;
+/// What an account holder may ask back, and how much.
 pub mod refunds;
+/// UK card payments through Square.
 pub mod square;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,8 +51,10 @@ use uuid::Uuid;
 
 /// Months one purchase may buy at most, and how far ahead an account may be paid.
 pub const MAX_MONTHS_PER_PURCHASE: u32 = 12;
+/// How far ahead of now an account may be paid, in months.
 pub const MAX_MONTHS_AHEAD: u32 = 24;
 
+/// Who sells to the buyer, which decides whose tax it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Seller {
@@ -55,7 +68,9 @@ pub enum Seller {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Fees {
+    /// The fixed part of the fee for one purchase, in pence.
     pub fixed_pence: u32,
+    /// The percentage part, in basis points (hundredths of a percent).
     pub percent_bps: u32,
 }
 
@@ -63,10 +78,13 @@ pub struct Fees {
 /// 3 % of one month's price. Paddle's 50¢ (≈ 40p) at £3 gives 6; Square's 25p gives 4; GoCardless's 20p gives 3; a
 /// method without a fixed fee gives 1.
 pub fn min_months(fixed_pence: u32, price_pence: u32) -> u32 {
+    // A free price has no meaningful minimum, so the most is required.
     if price_pence == 0 {
         return MAX_MONTHS_PER_PURCHASE;
     }
+    // The fixed fee with a 25 % buffer (125 / 100), kept in integers.
     let num = u64::from(fixed_pence) * 125;
+    // Three percent of one month's price (3 / 100), with the 100 cancelled against the numerator.
     let den = 3 * u64::from(price_pence);
     (num.div_ceil(den) as u32).max(1)
 }
@@ -77,22 +95,32 @@ pub fn min_months(fixed_pence: u32, price_pence: u32) -> u32 {
 pub struct Method {
     /// `<provider>:<method>`, e.g. `chain-payments:sui-testnet:SUI`.
     pub id: String,
+    /// The provider that offers the method.
     pub provider: String,
+    /// What the buyer sees.
     pub label: String,
+    /// Who sells under this method.
     pub seller: Seller,
+    /// What the method costs per purchase.
     pub fees: Fees,
     /// Can renew without the buyer (a mandate or a saved card). Never on by default.
     pub recurring: bool,
 }
 
+/// Everything an adapter needs to start a checkout.
 #[derive(Debug, Clone)]
 pub struct CheckoutRequest {
+    /// The service's own id for the checkout.
     pub checkout_id: Uuid,
+    /// The method the buyer chose.
     pub method: String,
     /// The opaque reference a provider may record (never the handle).
     pub billing_ref: String,
+    /// How many months are being bought.
     pub months: u32,
+    /// The price of those months, in pence.
     pub amount_pence: u64,
+    /// What the provider shows the buyer.
     pub description: String,
     /// Where the provider sends the buyer back to (the app's billing view for this checkout).
     pub return_url: String,
@@ -102,20 +130,28 @@ pub struct CheckoutRequest {
 /// and the provider's public origin, a redirect URL, …).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckoutStart {
+    /// The provider's reference for the checkout, which a notification names.
     pub provider_ref: String,
+    /// What the app's checkout page needs, as JSON.
     pub client: Value,
 }
 
+/// How a checkout ended, as far as a provider says.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
+    /// Paid in full.
     Paid,
     /// A real payment for a checkout that was already paid or closed (Chain Payments' `payment.unapplied`). It is
     /// credited as the months its quote was for; a refund is the buyer's request and the operator's manual act.
     Unapplied,
+    /// Paid, then given back.
     Refunded,
+    /// Did not complete.
     Failed,
+    /// Timed out before it was paid.
     Expired,
+    /// Still waiting for the buyer.
     Open,
 }
 
@@ -124,9 +160,19 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Paid {
     /// An amount in minor units of a currency (Square, GoCardless).
-    Amount { minor: u64, currency: String },
+    Amount {
+        /// The amount, in the currency's minor units.
+        minor: u64,
+        /// The currency code.
+        currency: String,
+    },
     /// A quantity of one catalog price (Paddle: the currency is the buyer's, so the quantity and price are what count).
-    Quantity { quantity: u32, price_id: String },
+    Quantity {
+        /// How many units of the price were bought (the months).
+        quantity: u32,
+        /// The catalog price they were bought at.
+        price_id: String,
+    },
 }
 
 /// How much of a purchase a refund gave back, in the provider's minor units of one currency.
@@ -145,6 +191,7 @@ pub struct ProviderEvent {
     pub event_id: String,
     /// The checkout it is about (`CheckoutStart::provider_ref`).
     pub provider_ref: String,
+    /// What happened.
     pub outcome: Outcome,
     /// For a payment: what the provider says was paid (required by the card and bank providers, see [`paid_covers`]).
     pub paid: Option<Paid>,
@@ -182,22 +229,30 @@ pub fn paid_covers(
 /// refund as the difference between this before and after it means the months taken back never exceed the purchase's,
 /// and partial refunds that add up to the whole take all of them.
 pub fn months_refunded(months: u32, paid_minor: u64, refunded_minor: u64) -> u32 {
+    // Nothing paid, or the whole amount refunded: every month is given back.
     if paid_minor == 0 || refunded_minor >= paid_minor {
         return months;
     }
+    // Pro rata, in wide integers so it cannot overflow, rounded down.
     (u128::from(months) * u128::from(refunded_minor) / u128::from(paid_minor)) as u32
 }
 
+/// Why a billing step failed. Provider messages are shortened and carry no credential.
 #[derive(Debug, thiserror::Error)]
 pub enum BillingError {
+    /// The method is not on offer to this buyer.
     #[error("this payment method is not available")]
     NotOffered,
+    /// The notification's signature or origin did not verify.
     #[error("the notification is not authentic")]
     Unauthentic,
+    /// The notification or the provider's answer could not be read.
     #[error("the notification could not be read: {0}")]
     Malformed(String),
+    /// The provider did not answer, or answered with a server error.
     #[error("the payment provider did not answer: {0}")]
     Unavailable(String),
+    /// The provider refused the request.
     #[error("the payment provider refused: {0}")]
     Refused(String),
 }
@@ -205,8 +260,11 @@ pub enum BillingError {
 /// A payment provider adapter. Implementations hold their own credentials and talk to exactly their provider.
 #[async_trait::async_trait]
 pub trait BillingProvider: Send + Sync {
+    /// The provider's id, as used in method ids and settings.
     fn id(&self) -> &'static str;
+    /// The methods this provider offers.
     fn methods(&self) -> Vec<Method>;
+    /// Start a checkout with the provider.
     async fn create_checkout(&self, req: &CheckoutRequest) -> Result<CheckoutStart, BillingError>;
     /// Verifies a notification's signature and reads it. `headers` are lower-case names.
     async fn verify_notification(
@@ -231,15 +289,19 @@ pub trait BillingProvider: Send + Sync {
 /// A shared adapter is an adapter (the app keeps a typed handle to one whose flow has steps beyond the port).
 #[async_trait::async_trait]
 impl<T: BillingProvider + ?Sized> BillingProvider for std::sync::Arc<T> {
+    /// The wrapped adapter's id.
     fn id(&self) -> &'static str {
         (**self).id()
     }
+    /// The wrapped adapter's methods.
     fn methods(&self) -> Vec<Method> {
         (**self).methods()
     }
+    /// Start a checkout with the wrapped adapter.
     async fn create_checkout(&self, req: &CheckoutRequest) -> Result<CheckoutStart, BillingError> {
         (**self).create_checkout(req).await
     }
+    /// Verify a notification with the wrapped adapter.
     async fn verify_notification(
         &self,
         headers: &BTreeMap<String, String>,
@@ -248,12 +310,15 @@ impl<T: BillingProvider + ?Sized> BillingProvider for std::sync::Arc<T> {
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         (**self).verify_notification(headers, body, now).await
     }
+    /// Ask the wrapped adapter how a checkout ended.
     async fn checkout_outcome(&self, provider_ref: &str) -> Result<Outcome, BillingError> {
         (**self).checkout_outcome(provider_ref).await
     }
+    /// The wrapped adapter's ledger key for a payment.
     fn paid_event_id(&self, provider_ref: &str) -> String {
         (**self).paid_event_id(provider_ref)
     }
+    /// What the wrapped adapter says was paid.
     async fn paid_facts(&self, provider_ref: &str) -> Result<Option<Paid>, BillingError> {
         (**self).paid_facts(provider_ref).await
     }
@@ -278,19 +343,26 @@ impl Evidence {
     }
 }
 
+/// One method a buyer may use now, with the fewest and most months they may buy with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Offer {
+    /// The method (its fields are flattened into the offer).
     #[serde(flatten)]
     pub method: Method,
+    /// The fewest months this method may buy, so its fixed fee stays small.
     pub min_months: u32,
+    /// The most months that fit before the account is as far ahead as allowed.
     pub max_months: u32,
 }
 
+/// What a buyer may use now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Offers {
+    /// The price of one month, in pence.
     pub price_pence: u32,
+    /// The methods on offer.
     pub offers: Vec<Offer>,
     /// Why nothing (or less) is offered, in plain words, when that is the case.
     pub notes: Vec<String>,
@@ -299,6 +371,7 @@ pub struct Offers {
 /// Which methods are switched on and where they may be offered.
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
+    /// The price of one month, in pence.
     pub price_pence: u32,
     /// Providers switched on (`BILLING_PROVIDERS`); `manual` is always on and never offered at checkout.
     pub enabled: BTreeSet<String>,
@@ -306,24 +379,31 @@ pub struct RouterConfig {
     pub countries: BTreeMap<String, BTreeSet<String>>,
 }
 
+/// Chooses which methods a buyer is offered, from the switches, the country evidence and the fees.
 pub struct Router {
+    /// The switches and the price.
     config: RouterConfig,
+    /// Every adapter built at start-up, whether or not switched on.
     providers: Vec<Box<dyn BillingProvider>>,
 }
 
 impl Router {
+    /// A router over these adapters.
     pub fn new(config: RouterConfig, providers: Vec<Box<dyn BillingProvider>>) -> Self {
         Self { config, providers }
     }
 
+    /// The price of one month, in pence.
     pub fn price_pence(&self) -> u32 {
         self.config.price_pence
     }
 
+    /// The adapter with this id, only if it is switched on.
     pub fn provider(&self, id: &str) -> Option<&dyn BillingProvider> {
         self.providers.iter().find(|p| p.id() == id && self.config.enabled.contains(id)).map(|p| p.as_ref())
     }
 
+    /// The countries a provider may sell to as the operator; UK only unless configured.
     fn countries_for(&self, provider: &str) -> BTreeSet<String> {
         self.config.countries.get(provider).cloned().unwrap_or_else(|| BTreeSet::from(["GB".to_string()]))
     }
@@ -331,10 +411,12 @@ impl Router {
     /// What a buyer may use now: `months_ahead` is how many whole months the account is already paid beyond now.
     pub fn offers(&self, evidence: &Evidence, months_ahead: u32) -> Offers {
         let mut notes = Vec::new();
+        // Months still available before the account is as far ahead as allowed, and at most one purchase's worth.
         let room = MAX_MONTHS_AHEAD.saturating_sub(months_ahead).min(MAX_MONTHS_PER_PURCHASE);
         if room == 0 {
             notes.push(format!("This account is already paid {MAX_MONTHS_AHEAD} months ahead."));
         }
+        // Whether the two pieces of country evidence agree.
         let agreed = evidence.agreed();
         if agreed.is_none() {
             notes.push(
@@ -349,6 +431,7 @@ impl Router {
                 continue;
             }
             for m in p.methods() {
+                // A merchant of record sells anywhere; the operator sells only to a country on the provider's list, and only when the evidence agrees.
                 let allowed = match m.seller {
                     Seller::MerchantOfRecord => true,
                     Seller::Operator => agreed.is_some_and(|c| self.countries_for(p.id()).contains(c)),
@@ -357,6 +440,7 @@ impl Router {
                     continue;
                 }
                 let min = min_months(m.fees.fixed_pence, self.config.price_pence);
+                // A method whose minimum purchase does not fit in the room left is not offered.
                 if room >= min {
                     offers.push(Offer { method: m, min_months: min, max_months: room });
                 }
@@ -379,9 +463,11 @@ impl Router {
 
 /// An HTTP client for provider APIs: no redirects followed, short timeouts.
 pub fn http_client() -> reqwest::Client {
+    // Installing twice is harmless; the first provider stays.
     let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .user_agent(concat!("link-in-bio/", env!("CARGO_PKG_VERSION")))
+        // Redirects are never followed, so a provider cannot send a request somewhere else.
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(3))
         .timeout(std::time::Duration::from_secs(15))
@@ -397,11 +483,20 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
 
 /// Constant-time comparison of a received signature with the expected one.
 pub fn same(a: &[u8], b: &[u8]) -> bool {
+    // Constant-time: every byte is compared, so the time does not say where they differ.
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Wrap any error as a provider-unavailable error (its text, never a request body).
 fn unavailable(e: impl std::fmt::Display) -> BillingError {
     BillingError::Unavailable(e.to_string())
+}
+
+/// Wrap a failed HTTP call as a provider-unavailable error. The client's own text ends with the address it called, and that
+/// address is configured by the operator (it can carry a private path or query) and would reach the logs and the bank-feed
+/// status, so it is dropped here: the message says what failed, not where.
+pub(crate) fn transport(e: reqwest::Error) -> BillingError {
+    unavailable(e.without_url())
 }
 
 /// The longest answer read from a provider, bank or wallet API (their JSON documents are a few kilobytes; a buyer's
@@ -413,12 +508,14 @@ pub const MAX_STATEMENT_BYTES: usize = 16 * 1024 * 1024;
 /// Reads a response body of at most `max` bytes: refused on the declared length before reading, and while reading
 /// (a chunked answer has none), so an upstream can never make this process buffer without bound.
 pub async fn read_limited(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>, BillingError> {
+    // The same error for both ways an answer can be too long.
     let too_long = || BillingError::Malformed(format!("the answer is longer than {max} bytes"));
     if resp.content_length().is_some_and(|n| n > max as u64) {
         return Err(too_long());
     }
     let mut out = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(unavailable)? {
+    // Read chunk by chunk and stop as soon as the limit would be passed.
+    while let Some(chunk) = resp.chunk().await.map_err(crate::transport)? {
         if out.len() + chunk.len() > max {
             return Err(too_long());
         }
@@ -434,7 +531,7 @@ pub async fn read_json_or_null(resp: reqwest::Response, max: usize) -> Result<Va
 
 /// Sends a request and reads a JSON answer; a non-success status is `Refused` with the provider's message.
 pub(crate) async fn send_json(r: reqwest::RequestBuilder) -> Result<Value, BillingError> {
-    let resp = r.send().await.map_err(unavailable)?;
+    let resp = r.send().await.map_err(crate::transport)?;
     let status = resp.status();
     let v: Value = read_json_or_null(resp, MAX_ANSWER_BYTES).await?;
     if status.is_success() {
@@ -449,6 +546,7 @@ pub(crate) async fn send_json(r: reqwest::RequestBuilder) -> Result<Value, Billi
 /// The human part of a provider's error answer (each names it differently).
 pub(crate) fn provider_message(v: &Value) -> String {
     for p in ["/errors/0/detail", "/errors/0/message", "/error/message", "/error/detail", "/message"] {
+        // Each provider puts its message somewhere different; the first one found is used, shortened.
         if let Some(m) = v.pointer(p).and_then(Value::as_str) {
             return m.chars().take(200).collect();
         }
@@ -462,6 +560,7 @@ pub fn months_ahead(paid_until: Option<OffsetDateTime>, now: OffsetDateTime) -> 
     if p <= now {
         return 0;
     }
+    // A month as 30.4375 days in milliseconds (a year of 365.25 days over twelve).
     let month_ms = 2_629_800_000i128;
     ((p - now).whole_milliseconds() / month_ms) as u32
 }
@@ -483,9 +582,27 @@ pub fn parse_rfc3339(s: &str) -> Option<OffsetDateTime> {
         .map(|t| t.to_offset(time::UtcOffset::UTC))
 }
 
+/// Unit tests for the router, the limits on what is read from providers and the arithmetic.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed call to a provider reports that the provider did not answer, and never repeats the address it called: the
+    /// address is configured (an operator's setting) and may carry a path or a query that is private to them.
+    #[tokio::test]
+    async fn a_transport_failure_never_repeats_the_address() {
+        // A stand-in secret in the path and the query, on a port nothing listens on, so the connection is refused.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let target = format!("http://127.0.0.1:{port}/stand-in-path-secret?key=stand-in-query-secret");
+        let err = http_client().get(&target).send().await.unwrap_err();
+        let shown = transport(err).to_string();
+        assert!(shown.contains("did not answer"), "{shown}");
+        for secret in ["stand-in-path-secret", "stand-in-query-secret", "127.0.0.1"] {
+            assert!(!shown.contains(secret), "the message repeats part of the address: {shown}");
+        }
+    }
 
     /// A one-request HTTP server that answers with `head` then `body` (written by hand, so the test chooses the framing).
     async fn answer_once(head: &'static str, body: Vec<u8>) -> String {
@@ -502,6 +619,7 @@ mod tests {
         url
     }
 
+    /// A chunked HTTP body of `parts` chunks of `size` bytes, to test an answer with no declared length.
     fn chunked(parts: usize, size: usize) -> Vec<u8> {
         let mut out = Vec::new();
         for _ in 0..parts {
@@ -513,6 +631,7 @@ mod tests {
         out
     }
 
+    /// An answer longer than the limit is refused from its declared length, or while reading when it has none; one within the limit is read whole.
     #[tokio::test]
     async fn answers_are_read_up_to_a_limit() {
         let http = http_client();
@@ -533,6 +652,7 @@ mod tests {
         assert_eq!(read_json_or_null(r, 4096).await.unwrap(), serde_json::json!({}));
     }
 
+    /// Times are written in UTC with milliseconds (truncated, not rounded), offsets are normalised, and a bare date does not parse.
     #[test]
     fn rfc3339_with_milliseconds() {
         use time::macros::datetime;
@@ -545,6 +665,7 @@ mod tests {
         assert_eq!(parse_rfc3339("2026-11-17"), None);
     }
 
+    /// Months given back are pro rata and rounded down, the whole amount takes them all, and partial refunds that add up to the whole take every month.
     #[test]
     fn refunds_give_back_months_pro_rata_rounded_down() {
         // A partial refund: a third of 12 months paid 3600 is 4; a little less is 3.
@@ -561,6 +682,7 @@ mod tests {
         assert_eq!(months_refunded(5, 0, 0), 5, "nothing was paid: a refund takes everything");
     }
 
+    /// Card and bank payments must cover the checkout in pounds, Paddle must match the months and the price, and the providers that verify the amount themselves need nothing.
     #[test]
     fn a_payment_counts_only_when_it_covers_the_checkout() {
         let gbp = |minor| Paid::Amount { minor, currency: "GBP".into() };
@@ -579,6 +701,7 @@ mod tests {
         }
     }
 
+    /// The minimum months equal the formula for each provider's fee, and are the smallest number that keeps the fee under the limit.
     #[test]
     fn minimum_months_follow_the_three_percent_rule() {
         assert_eq!(min_months(40, 300), 6, "Paddle 50¢");
@@ -592,13 +715,16 @@ mod tests {
         }
     }
 
+    /// A stand-in provider with an id, a seller and a fixed fee, for the routing tests.
     struct Fake(&'static str, Seller, u32);
 
     #[async_trait::async_trait]
     impl BillingProvider for Fake {
+        /// The stand-in's id.
         fn id(&self) -> &'static str {
             self.0
         }
+        /// One method, with the stand-in's seller and fixed fee.
         fn methods(&self) -> Vec<Method> {
             vec![Method {
                 id: format!("{}:x", self.0),
@@ -609,9 +735,11 @@ mod tests {
                 recurring: false,
             }]
         }
+        /// A stand-in never starts a checkout.
         async fn create_checkout(&self, _: &CheckoutRequest) -> Result<CheckoutStart, BillingError> {
             Err(BillingError::NotOffered)
         }
+        /// A stand-in never authenticates a notification.
         async fn verify_notification(
             &self,
             _: &BTreeMap<String, String>,
@@ -620,11 +748,13 @@ mod tests {
         ) -> Result<Vec<ProviderEvent>, BillingError> {
             Err(BillingError::Unauthentic)
         }
+        /// A stand-in's checkouts are always open.
         async fn checkout_outcome(&self, _: &str) -> Result<Outcome, BillingError> {
             Ok(Outcome::Open)
         }
     }
 
+    /// A router over three stand-ins (cheap operator-as-seller, card-like operator-as-seller and a merchant of record) with the given ones switched on.
     fn router(enabled: &[&str]) -> Router {
         Router::new(
             RouterConfig {
@@ -640,10 +770,12 @@ mod tests {
         )
     }
 
+    /// Country evidence from the declared and the request's country.
     fn ev(d: &str, r: &str) -> Evidence {
         Evidence { declared: Some(d.into()), request: Some(r.into()) }
     }
 
+    /// Operator-as-seller methods are offered only in the UK by default, a merchant of record anywhere, disagreeing evidence leaves only the merchant of record, and nothing is offered for a method that is switched off.
     #[test]
     fn routing_by_country_and_switches() {
         let r = router(&["crypto", "card", "mor"]);
@@ -659,6 +791,7 @@ mod tests {
         assert!(router(&[]).offers(&ev("GB", "GB"), 0).offers.is_empty(), "nothing on, nothing offered");
     }
 
+    /// The months a method may buy stay inside the room left ahead, below the method's minimum nothing is offered, and an unknown method is refused.
     #[test]
     fn months_are_bounded() {
         let r = router(&["crypto", "mor"]);
@@ -671,6 +804,7 @@ mod tests {
         assert!(r.check(&ev("GB", "GB"), 0, "nope", 1).is_none());
     }
 
+    /// No payment or a lapsed one is zero months ahead; a payment 95 days ahead is three whole months.
     #[test]
     fn whole_months_ahead() {
         let now = OffsetDateTime::now_utc();

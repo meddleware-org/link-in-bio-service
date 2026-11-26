@@ -26,11 +26,16 @@ use super::{App, HostedConfig, Shared};
 use link_in_bio_store::Store;
 use link_in_bio_store::config::{Access, DatabaseSettings};
 
+/// The app's origin in the tests.
 const APP: &str = "https://app.example.link";
+/// The console's origin in the tests.
 const ADMIN: &str = "https://admin.example.co.uk";
+/// The Access team domain the tests configure.
 const ISS: &str = "https://team.cloudflareaccess.com";
+/// The audience tag the tests configure.
 const AUD: &str = "aud-tag";
 
+/// A store on a fresh migrated database made for this test, or `None` (a logged skip) when no test database is configured; with `REQUIRE_TEST_DATABASE=1` a missing one is a failure.
 async fn store() -> Option<Store> {
     let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
         assert!(std::env::var("REQUIRE_TEST_DATABASE").as_deref() != Ok("1"), "TEST_DATABASE_URL is required");
@@ -49,6 +54,7 @@ async fn store() -> Option<Store> {
     Some(s)
 }
 
+/// A hosted configuration with the three required settings (and the current terms) plus any extra ones.
 fn config(extra: &[(&str, String)]) -> HostedConfig {
     let mut env: Vec<(String, String)> = vec![
         ("PAGES_DOMAIN".into(), "example.link".into()),
@@ -59,6 +65,7 @@ fn config(extra: &[(&str, String)]) -> HostedConfig {
     HostedConfig::from_env(move |k| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())).unwrap()
 }
 
+/// An application state over a store, with a short page-cache time and a fixed Access key set and operator, so the console can be called without a network.
 fn app(store: Store, c: HostedConfig) -> Shared {
     let mut a = App::new(store, c, Duration::from_millis(200)).unwrap();
     a.access = Some(Admins::new(AccessConfig {
@@ -71,6 +78,7 @@ fn app(store: Store, c: HostedConfig) -> Shared {
     Arc::new(a)
 }
 
+/// A valid operator token for the test key, signed now and good for ten minutes.
 fn operator_token() -> String {
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     super::jwt::testing::sign(
@@ -79,24 +87,32 @@ fn operator_token() -> String {
     )
 }
 
+/// An answer collected from a router: status, headers and body.
 struct Resp {
+    /// The status.
     status: StatusCode,
+    /// The headers.
     headers: axum::http::HeaderMap,
+    /// The body bytes.
     body: Vec<u8>,
 }
 
 impl Resp {
+    /// The body as JSON, or null if it is not JSON.
     fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
+    /// The body as text.
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+    /// The session cookie's name and value, if the answer sets one.
     fn cookie(&self) -> Option<String> {
         self.headers.get(header::SET_COOKIE)?.to_str().ok()?.split(';').next().map(String::from)
     }
 }
 
+/// Send a request through a router and collect the answer.
 async fn send(router: &Router, req: Request<Body>) -> Resp {
     let r = router.clone().oneshot(req).await.unwrap();
     let (p, b) = r.into_parts();
@@ -121,6 +137,7 @@ fn call(method: &str, path: &str, body: Option<Value>, cookie: Option<&str>) -> 
     }
 }
 
+/// A request to the console: the admin origin, the app header and a valid operator token.
 fn admin_call(method: &str, path: &str, body: Option<Value>) -> Request<Body> {
     let b = Request::builder()
         .method(method)
@@ -134,6 +151,7 @@ fn admin_call(method: &str, path: &str, body: Option<Value>) -> Request<Body> {
     }
 }
 
+/// A GET for a tenant page on a host.
 fn page_get(host: &str, path: &str) -> Request<Body> {
     Request::get(path).header(header::HOST, host).body(Body::empty()).unwrap()
 }
@@ -150,14 +168,17 @@ fn wallet_sign(seed: &[u8; 32], message: &[u8]) -> (String, String) {
     (address, STANDARD.encode(raw))
 }
 
+/// The Sui address of an ed25519 key, as the access gate derives it.
 fn access_gate_like_address(pk: &[u8]) -> String {
     access_gate_gateway_core::sig::derive_address(0, pk)
 }
 
+/// The digest a wallet signs for a personal message.
 fn link_in_bio_auth_digest(message: &[u8]) -> [u8; 32] {
     access_gate_gateway_core::sig::signing_digest(message)
 }
 
+/// Sign up with a software passkey through both steps and return the final answer.
 async fn signup_with_passkey(app_r: &Router, device: &mut SoftPasskey, handle: &str, invite: Option<&str>) -> Resp {
     let start = send(
         app_r,
@@ -187,11 +208,16 @@ async fn signup_with_passkey(app_r: &Router, device: &mut SoftPasskey, handle: &
     .await
 }
 
+/// Switches fail closed.
 #[tokio::test]
 async fn switches_fail_closed() {
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
+    // An application with every switch at its default.
     let a = app(s, config(&[]));
+    // The app's router.
     let r = super::app::router(a.clone());
+    // The public instance answer shows everything closed.
     let i = send(&r, call("GET", "/api/v1/instance", None, None)).await.json();
     assert_eq!((i["signup"].as_str(), i["thirdPartyPages"].as_bool()), (Some("closed"), Some(false)));
     assert_eq!(i["billingProviders"], json!(["manual"]));
@@ -210,6 +236,7 @@ async fn switches_fail_closed() {
     let unmarked = Request::post("/api/v1/logout").header(header::ORIGIN, APP).body(Body::empty()).unwrap();
     assert_eq!(send(&r, unmarked).await.status, StatusCode::FORBIDDEN);
     // The console refuses without an Access token, and without the role.
+    // The console's router.
     let admin = super::admin::router(a);
     let bare = Request::get("/api/v1/admin/overview").body(Body::empty()).unwrap();
     assert_eq!(send(&admin, bare).await.status, StatusCode::UNAUTHORIZED);
@@ -235,8 +262,11 @@ async fn switches_fail_closed() {
     );
 }
 
+/// Invite signup publish serve suspend report.
 #[tokio::test]
 async fn invite_signup_publish_serve_suspend_report() {
+    // The wallet sign-up and the Chain Payments checkout need a database of their own.
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let a = app(s.clone(), config(&[("SIGNUP_MODE", "invite".into())]));
     let app_r = super::app::router(a.clone());
@@ -425,8 +455,10 @@ async fn invite_signup_publish_serve_suspend_report() {
     );
 }
 
+/// Wallet signup recovery and chain payments checkout.
 #[tokio::test]
 async fn wallet_signup_recovery_and_chain_payments_checkout() {
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     // A stand-in for the Chain Payments merchant API that signs its webhooks with a known key.
     let kp = Ed25519KeyPair::from_seed_unchecked(&[5u8; 32]).unwrap();
@@ -606,8 +638,10 @@ async fn wallet_signup_recovery_and_chain_payments_checkout() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// Every route in the tables exists.
 #[tokio::test]
 async fn every_route_in_the_tables_exists() {
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let a = app(s, config(&[]));
     let app_r = super::app::router(a.clone());
@@ -633,8 +667,10 @@ async fn every_route_in_the_tables_exists() {
     // The OpenAPI documents are checked without a database: `openapi::tests::the_committed_documents_match`.
 }
 
+/// Bank transfer paid by an imported statement.
 #[tokio::test]
 async fn bank_transfer_paid_by_an_imported_statement() {
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let a = app(
         s.clone(),
@@ -720,11 +756,13 @@ async fn bank_transfer_paid_by_an_imported_statement() {
     assert_eq!(send(&app_r, hook("square")).await.status, StatusCode::NOT_FOUND, "square is not switched on here");
 }
 
+/// An operator account with a reserved handle is served.
 #[tokio::test]
 async fn an_operator_account_with_a_reserved_handle_is_served() {
     // The operator's own account may use a reserved handle (created by the operator's CLI). The app publishes its page,
     // and the page server must parse it by the same rules and serve it (2026-11-17: it re-checked the reserved list and
     // answered 404 for a page the app had published).
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let a = app(s.clone(), config(&[]));
     let app_r = super::app::router(a.clone());
@@ -782,11 +820,15 @@ async fn account_with_session(s: &Store, handle: &str) -> (uuid::Uuid, String) {
     (id, format!("{}={value}", link_in_bio_auth::session::COOKIE))
 }
 
+/// The Open Payments stand-in, shared with the billing conformance tests.
 #[path = "../../../billing/tests/support/open_payments.rs"]
 mod op_stand_in;
 
+/// Open payments checkout paid from a wallet.
 #[tokio::test]
 async fn open_payments_checkout_paid_from_a_wallet() {
+    // The bank feeds need a database of its own.
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let public = link_in_bio_billing::keys::ed25519_from_pem(&op_stand_in::test_key_pem())
         .unwrap()
@@ -920,11 +962,15 @@ async fn open_payments_checkout_paid_from_a_wallet() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// The bank stand-ins, shared with the billing conformance tests.
 #[path = "../../../billing/tests/support/bank_feeds.rs"]
 mod banks;
 
+/// Bank feeds pay bank transfer checkouts.
 #[tokio::test]
 async fn bank_feeds_pay_bank_transfer_checkouts() {
+    // The refund requests for late payments need a database of their own.
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let (wise, bunq, revolut) = (
         banks::WiseBank::start().await,
@@ -1022,8 +1068,11 @@ async fn bank_feeds_pay_bank_transfer_checkouts() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// Refund requests for unapplied payments.
 #[tokio::test]
 async fn refund_requests_for_unapplied_payments() {
+    // The card payments and refunds need a database of their own.
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let a = app(s.clone(), config(&[]));
     let app_r = super::app::router(a.clone());
@@ -1153,18 +1202,23 @@ fn square_hook(key: &str, body: &Value) -> Request<Body> {
         .unwrap()
 }
 
+/// A Square payment notification body for an order.
 fn square_payment(event: &str, order: &str, amount: u64) -> Value {
     json!({ "type": "payment.updated", "event_id": event, "data": { "object": { "payment": {
         "id": format!("P-{event}"), "order_id": order, "status": "COMPLETED", "amount_money": { "amount": amount, "currency": "GBP" } } } } })
 }
 
+/// A Square refund notification body for an order.
 fn square_refund(id: &str, order: &str, amount: u64) -> Value {
     json!({ "type": "refund.updated", "event_id": format!("E-{id}"), "data": { "object": { "refund": {
         "id": id, "order_id": order, "status": "COMPLETED", "amount_money": { "amount": amount, "currency": "GBP" } } } } })
 }
 
+/// Card payments apply only when they cover the checkout and refunds take months pro rata.
 #[tokio::test]
 async fn card_payments_apply_only_when_they_cover_the_checkout_and_refunds_take_months_pro_rata() {
+    // The account budgets need a database of their own.
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let dir = std::env::temp_dir().join(format!("lib-square-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1248,8 +1302,10 @@ async fn card_payments_apply_only_when_they_cover_the_checkout_and_refunds_take_
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// An account has change budgets but can always remove links.
 #[tokio::test]
 async fn an_account_has_change_budgets_but_can_always_remove_links() {
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let a =
         app(s.clone(), config(&[("CHANGES_PER_ACCOUNT_HOUR", "3".into()), ("NEW_LINKS_PER_ACCOUNT_DAY", "4".into())]));
@@ -1330,9 +1386,12 @@ async fn an_account_has_change_budgets_but_can_always_remove_links() {
     assert_eq!(o["accountLimits"], json!({ "preset": "standard", "changesPerHour": 3, "newLinksPerDay": 4 }));
 }
 
+/// Lookup mode never updates lists and rechecks only links on published pages.
 #[tokio::test]
 async fn lookup_mode_never_updates_lists_and_rechecks_only_links_on_published_pages() {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    // The refunds on request need a database of their own.
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     // A Web Risk stand-in counting lookups and list updates.
     let lookups = Arc::new(AtomicUsize::new(0));
@@ -1419,8 +1478,10 @@ async fn lookup_mode_never_updates_lists_and_rechecks_only_links_on_published_pa
     let _ = std::fs::remove_file(key);
 }
 
+/// Refunds on request net of fees matched or recorded exactly.
 #[tokio::test]
 async fn refunds_on_request_net_of_fees_matched_or_recorded_exactly() {
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let dir = std::env::temp_dir().join(format!("lib-square-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1581,8 +1642,10 @@ async fn refunds_on_request_net_of_fees_matched_or_recorded_exactly() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The console starts without any key and shows the switches.
 #[tokio::test]
 async fn the_console_starts_without_any_key_and_shows_the_switches() {
+    // Each test makes its own database; without a test server it is skipped.
     let Some(s) = store().await else { return };
     let env: Vec<(&str, &str)> = vec![
         ("PAGES_DOMAIN", "example.link"),

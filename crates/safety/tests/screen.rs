@@ -12,15 +12,18 @@ use serde_json::json;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
+/// A store on a fresh database made for this test, or `None` (a logged skip) when no test database is configured; with `REQUIRE_TEST_DATABASE=1` a missing one is a failure.
 async fn store() -> Option<Store> {
     let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
         assert!(std::env::var("REQUIRE_TEST_DATABASE").as_deref() != Ok("1"), "TEST_DATABASE_URL is required");
         eprintln!("SKIPPED: no TEST_DATABASE_URL");
         return None;
     };
+    // A connection to the server's maintenance database, to make the test's own.
     let admin = DatabaseSettings::parse(&url, false).unwrap().lazy_pool(2, Access::ReadWrite).unwrap();
     let name = format!("lib_safety_{}", uuid_like());
     sqlx_create(&admin, &name).await;
+    // The test's own database, migrated with the service's migrations.
     let pool = DatabaseSettings::parse(&url.replacen("/postgres?", &format!("/{name}?"), 1), false)
         .unwrap()
         .lazy_pool(4, Access::ReadWrite)
@@ -30,23 +33,28 @@ async fn store() -> Option<Store> {
     Some(s)
 }
 
+/// A name that is unique to this run, from the clock.
 fn uuid_like() -> String {
     format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())
 }
 
+/// Create a database with this name.
 async fn sqlx_create(pool: &sqlx::PgPool, name: &str) {
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(pool).await.unwrap();
 }
 
+/// The four-byte prefix of the hash of an expression, as Web Risk lists them.
 fn prefix(expression: &str) -> Vec<u8> {
     sha2_256(expression.as_bytes())[..4].to_vec()
 }
 
+/// The SHA-256 of some bytes.
 fn sha2_256(b: &[u8]) -> [u8; 32] {
     use sha2::Digest;
     sha2::Sha256::digest(b).into()
 }
 
+/// Base64 of some bytes.
 fn b64(b: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(b)
@@ -65,6 +73,7 @@ async fn web_risk() -> String {
                 {
                     return (axum::http::StatusCode::FORBIDDEN, axum::Json(json!({})));
                 }
+                // Only the MALWARE list has entries; the others are empty.
                 let mut prefixes: Vec<Vec<u8>> = if q.get("threatType").map(String::as_str) == Some("MALWARE") {
                     vec![prefix("phish.example/login"), prefix("down.example/"), prefix("collide.example/")]
                 } else {
@@ -72,6 +81,7 @@ async fn web_risk() -> String {
                 };
                 prefixes.sort();
                 let raw: Vec<u8> = prefixes.concat();
+                // Version `v1` gets a diff with a wrong checksum; anything else gets a reset.
                 let body = if q.get("versionToken").map(String::as_str) == Some("v1") {
                     json!({ "responseType": "DIFF", "newVersionToken": "v2", "additions": { "rawHashes": [] },
                             "removals": { "rawIndices": { "indices": [0] } }, "checksum": { "sha256": b64(&[0u8; 32]) } })
@@ -91,10 +101,12 @@ async fn web_risk() -> String {
             get(|Query(q): Query<HashMap<String, String>>| async move {
                 use base64::Engine;
                 let asked = base64::engine::general_purpose::URL_SAFE.decode(q.get("hashPrefix").cloned().unwrap_or_default()).unwrap_or_default();
+                // This prefix always fails, to test an outage.
                 if asked == prefix("down.example/") {
                     return (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({})));
                 }
                 let mut threats = Vec::new();
+                // Only this one is a real threat.
                 if asked == prefix("phish.example/login") {
                     threats.push(json!({ "threatTypes": ["SOCIAL_ENGINEERING"], "hash": b64(&sha2_256(b"phish.example/login")),
                                          "expireTime": "2099-01-01T00:00:00Z" }));
@@ -108,6 +120,7 @@ async fn web_risk() -> String {
     format!("http://{addr}/v1")
 }
 
+/// Layers lists caps and outage.
 #[tokio::test]
 async fn layers_lists_caps_and_outage() {
     let Some(s) = store().await else { return };
@@ -115,6 +128,7 @@ async fn layers_lists_caps_and_outage() {
     // Ten calls a month in all, two of them confirmations.
     let mut w = WebRiskUpdate::new("test-key".into(), 10, 2, 1024);
     w.api.base = web_risk().await;
+    // Update mode only.
     let screener = Screener { lookup: None, update: Some(w) };
     let w = screener.update.as_ref().unwrap();
 
@@ -223,6 +237,7 @@ async fn lookup_stand_in() -> (String, std::sync::Arc<[std::sync::atomic::Atomic
     (format!("http://{addr}/v1"), hits)
 }
 
+/// Lookup mode keeps a reserve for publishes and stops at the paid allowance.
 #[tokio::test]
 async fn lookup_mode_keeps_a_reserve_for_publishes_and_stops_at_the_paid_allowance() {
     use std::sync::atomic::Ordering;

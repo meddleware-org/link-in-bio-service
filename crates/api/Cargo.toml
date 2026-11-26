@@ -1,18 +1,26 @@
+# Link in Bio's HTTP crate: the static page router, the local editor's loopback backend, and the hosted service (tenant pages by host, the account API,
+# the operator console's API, provider notifications and the worker). It owns no SQL: every statement is in the store crate.
+# The crate's identity.
 [package]
 name = "link-in-bio-api"
 description = "Link in Bio: the HTTP routers (static page, local editor, hosted pages, app and admin APIs), the worker, security headers and the site model."
+# Version, edition, minimum Rust, licence and repository come from the workspace manifest.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Inherited: no crate here is published to crates.io.
 publish.workspace = true
 
+# Off by default, so a release build never contains the test signing key.
 [features]
 # Exposes the throwaway JWT signing key to other crates' tests.
 testing = []
 
+# Runtime dependencies are versioned once, in the workspace manifest. The six workspace crates come first, then the HTTP stack (`axum`, `tower`, `tower-http`), then the rest.
 [dependencies]
+# The page document, the renderer and the interop documents.
 link-in-bio-core.workspace = true
 link-in-bio-assets.workspace = true
 link-in-bio-store.workspace = true
@@ -22,6 +30,7 @@ link-in-bio-safety.workspace = true
 axum = { workspace = true, features = ["query"] }
 tower.workspace = true
 tower-http.workspace = true
+# Only the parts of the runtime the routers and the worker use.
 tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -32,10 +41,12 @@ time.workspace = true
 uuid.workspace = true
 hex.workspace = true
 base64.workspace = true
+# `ring` signs and verifies the operator's Access tokens (RS256), and `reqwest` with `rustls` makes the few outbound calls (key sets and providers).
 ring.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 
+# Test-only: a runtime for the async tests, a body reader for the router tests, and a software passkey that plays the part of a person's authenticator. Pinned exactly, like the rest.
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 http-body-util = "=0.1.5"
@@ -44,5 +55,6 @@ webauthn-authenticator-rs = { version = "=0.6.2", features = ["softpasskey"] }
 webauthn-rs.workspace = true
 access-gate-gateway-core.workspace = true
 
+# The workspace's lint set, including the documentation lints.
 [lints]
 workspace = true

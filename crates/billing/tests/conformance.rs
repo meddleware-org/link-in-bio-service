@@ -21,13 +21,17 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// The merchant API key the Chain Payments stand-in accepts.
 const KEY: &str = "cpk_test_000000000000000000000000000000";
 
+/// The Chain Payments stand-in's state: the sessions it has been asked to create.
 #[derive(Default)]
 struct Mock {
+    /// Session id to the request body that made it and its status.
     sessions: Mutex<BTreeMap<String, (Value, String)>>,
 }
 
+/// Create a session: needs the API key and a request with units and a subscription reference.
 async fn create(State(m): State<Arc<Mock>>, headers: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
     if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {KEY}")) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unknown API key"})));
@@ -40,6 +44,7 @@ async fn create(State(m): State<Arc<Mock>>, headers: HeaderMap, Json(body): Json
     (StatusCode::CREATED, Json(json!({"id": id})))
 }
 
+/// Read a session's status, or 404 for one it never made.
 async fn session(State(m): State<Arc<Mock>>, Path(id): Path<String>) -> (StatusCode, Json<Value>) {
     match m.sessions.lock().unwrap().get(&id) {
         Some((_, status)) => (StatusCode::OK, Json(json!({"id": id, "status": status}))),
@@ -47,6 +52,7 @@ async fn session(State(m): State<Arc<Mock>>, Path(id): Path<String>) -> (StatusC
     }
 }
 
+/// Serve the stand-in merchant API and its webhook key on a free local port.
 async fn serve(mock: Arc<Mock>, public_hex: String) -> String {
     let app = Router::new()
         .route("/v1/merchant/sessions", post(create))
@@ -62,18 +68,22 @@ async fn serve(mock: Arc<Mock>, public_hex: String) -> String {
     format!("http://{addr}")
 }
 
+/// A `Chain-Payments-Signature` header value for a body, as the real service makes it.
 fn sign(kp: &Ed25519KeyPair, t: i64, body: &[u8]) -> String {
     let mut msg = format!("{t}.").into_bytes();
     msg.extend_from_slice(body);
     format!("t={t},ed25519={}", STANDARD.encode(kp.sign(&msg)))
 }
 
+/// The headers of a notification: just the signature.
 fn headers(sig: &str) -> BTreeMap<String, String> {
     BTreeMap::from([(chain_payments::SIGNATURE_HEADER.to_string(), sig.to_string())])
 }
 
+/// Chain payments adapter conforms.
 #[tokio::test]
 async fn chain_payments_adapter_conforms() {
+    // The stand-in's webhook key, and another key that must not be accepted.
     let kp = Ed25519KeyPair::from_seed_unchecked(&[5u8; 32]).unwrap();
     let other = Ed25519KeyPair::from_seed_unchecked(&[6u8; 32]).unwrap();
     let mock = Arc::new(Mock::default());
@@ -86,6 +96,7 @@ async fn chain_payments_adapter_conforms() {
         methods: vec![("sui-testnet:SUI".into(), "SUI".into()), ("sui-testnet:USDC".into(), "USDC".into())],
         webhook_key: None,
     };
+    // The adapter under test, with its webhook key fetched from the stand-in on first use.
     let p = ChainPayments::new(config.clone(), ChainPayments::http_client()).unwrap();
 
     // Methods: its own, namespaced by the provider id.
@@ -102,9 +113,11 @@ async fn chain_payments_adapter_conforms() {
         description: "Link in Bio, 3 months".into(),
         return_url: "https://app.example.link/billing?checkout=x".into(),
     };
+    // The checkout reference is the session id.
     let start = p.create_checkout(&req).await.unwrap();
     assert_eq!(start.client["sessionId"], start.provider_ref);
     assert_eq!(start.client["baseUrl"], "https://chain-payments.example.dev");
+    // What the adapter sent the merchant API: the months as units, the amount, and only the chosen coin.
     let sent = mock.sessions.lock().unwrap()[&start.provider_ref].0.clone();
     assert_eq!((sent["units"].as_u64(), sent["amountPence"].as_u64()), (Some(3), Some(900)));
     assert_eq!(sent["methods"], json!(["sui-testnet:SUI"]));
@@ -112,6 +125,7 @@ async fn chain_payments_adapter_conforms() {
         p.create_checkout(&CheckoutRequest { method: "chain-payments:eth:ETH".into(), ..req.clone() }).await,
         Err(BillingError::NotOffered)
     ));
+    // An adapter with another API key, which the stand-in refuses.
     let wrong_key = ChainPayments::new(
         Config { api_key: "cpk_wrong_00000000000000000000000000000".into(), ..config },
         ChainPayments::http_client(),
@@ -128,6 +142,7 @@ async fn chain_payments_adapter_conforms() {
                  "digest": "7AkSLeZf", "payer": "0xabc", "paidUntilMs": 1}
     }))
     .unwrap();
+    // A genuine notification: signed now with the right key.
     let good = sign(&kp, now.unix_timestamp(), &body);
     let events = p.verify_notification(&headers(&good), &body, now).await.unwrap();
     assert_eq!(events.len(), 1);
@@ -138,6 +153,7 @@ async fn chain_payments_adapter_conforms() {
     // A second delivery of the same event reads the same id.
     assert_eq!(p.verify_notification(&headers(&good), &body, now).await.unwrap()[0].event_id, events[0].event_id);
 
+    // Whether a result is the not-authentic error.
     let unauthentic = |r: Result<_, BillingError>| matches!(r, Err(BillingError::Unauthentic));
     assert!(unauthentic(p.verify_notification(&BTreeMap::new(), &body, now).await), "unsigned");
     assert!(
@@ -147,6 +163,7 @@ async fn chain_payments_adapter_conforms() {
     let mut altered = body.clone();
     altered[10] ^= 1;
     assert!(unauthentic(p.verify_notification(&headers(&good), &altered, now).await), "altered");
+    // The right key, an hour old.
     let stale = sign(&kp, now.unix_timestamp() - 3600, &body);
     assert!(unauthentic(p.verify_notification(&headers(&stale), &body, now).await), "stale");
 
@@ -169,6 +186,7 @@ async fn chain_payments_adapter_conforms() {
     assert!(p.checkout_outcome("../etc").await.is_err());
 }
 
+/// A webhook key that is not 64 hex characters is refused at start.
 #[test]
 fn a_configured_key_must_be_well_formed() {
     let c = Config {
@@ -206,6 +224,7 @@ async fn stand_in(routes: Vec<(&'static str, Value)>) -> String {
     format!("http://{addr}")
 }
 
+/// A checkout request of the given method and months at the test price.
 fn request(method: &str, months: u32) -> CheckoutRequest {
     CheckoutRequest {
         checkout_id: Uuid::new_v4(),
@@ -218,12 +237,15 @@ fn request(method: &str, months: u32) -> CheckoutRequest {
     }
 }
 
+/// A one-entry header map.
 fn h(k: &str, v: &str) -> BTreeMap<String, String> {
     BTreeMap::from([(k.to_string(), v.to_string())])
 }
 
+/// Square adapter conforms.
 #[tokio::test]
 async fn square_adapter_conforms() {
+    // The stand-in answers the provider's paths with fixed JSON.
     let base = stand_in(vec![
         (
             "/v2/online-checkout/payment-links",
@@ -241,6 +263,7 @@ async fn square_adapter_conforms() {
         fixed_pence: 25,
         percent_bps: 140,
     };
+    // The Square adapter under test.
     let p = square::Square::new(c.clone(), link_in_bio_billing::http_client());
     assert_eq!(p.methods()[0].id, "square:card");
     assert!(matches!(p.create_checkout(&request("square:other", 4)).await, Err(BillingError::NotOffered)));
@@ -251,11 +274,13 @@ async fn square_adapter_conforms() {
     );
     let body = serde_json::to_vec(&json!({ "type": "payment.updated", "event_id": "E1", "data": { "object": { "payment": {
         "id": "P1", "order_id": "ORD1", "status": "COMPLETED", "amount_money": { "amount": 1200, "currency": "GBP" } } } } })).unwrap();
+    // A genuine notification is signed over its address and body.
     let sig = square::signature(&c.signature_key, &c.notification_url, &body);
     let now = OffsetDateTime::now_utc();
     let e = p.verify_notification(&h(square::SIGNATURE_HEADER, &sig), &body, now).await.unwrap();
     assert_eq!((e[0].outcome.clone(), e[0].event_id.clone()), (Outcome::Paid, p.paid_event_id("ORD1")));
     assert!(matches!(p.verify_notification(&BTreeMap::new(), &body, now).await, Err(BillingError::Unauthentic)));
+    // The same body signed for another address is not authentic.
     let other_url = square::signature(&c.signature_key, "https://elsewhere.example/hook", &body);
     assert!(matches!(
         p.verify_notification(&h(square::SIGNATURE_HEADER, &other_url), &body, now).await,
@@ -307,6 +332,7 @@ async fn square_adapter_conforms() {
     assert_eq!((first, both - first, both), (1, 3, 4));
 }
 
+/// Gocardless adapter conforms.
 #[tokio::test]
 async fn gocardless_adapter_conforms() {
     let base = stand_in(vec![
@@ -323,6 +349,7 @@ async fn gocardless_adapter_conforms() {
         fixed_pence: 20,
         percent_bps: 100,
     };
+    // The GoCardless adapter under test.
     let p = gocardless::GoCardless::new(c.clone(), link_in_bio_billing::http_client());
     let s = p.create_checkout(&request("gocardless:bank", 3)).await.unwrap();
     assert_eq!(s.provider_ref, "BRQ123");
@@ -361,6 +388,7 @@ async fn gocardless_adapter_conforms() {
     assert_eq!((e[0].outcome.clone(), e[0].refunded), (Outcome::Refunded, None));
 }
 
+/// Paddle adapter conforms.
 #[tokio::test]
 async fn paddle_adapter_conforms() {
     let base = stand_in(vec![
@@ -377,6 +405,7 @@ async fn paddle_adapter_conforms() {
         fixed_pence: 40,
         percent_bps: 500,
     };
+    // The Paddle adapter under test.
     let p = paddle::Paddle::new(c, link_in_bio_billing::http_client());
     assert_eq!(p.methods()[0].seller, link_in_bio_billing::Seller::MerchantOfRecord);
     let s = p.create_checkout(&request("paddle:checkout", 6)).await.unwrap();
@@ -438,8 +467,10 @@ async fn paddle_adapter_conforms() {
     assert_eq!((first, months_refunded(6, 2160, 2160) - first), (2, 4));
 }
 
+/// Bank transfer adapter conforms.
 #[tokio::test]
 async fn bank_transfer_adapter_conforms() {
+    // A SEPA bank transfer adapter.
     let sepa = bank_transfer::BankTransfer::new(bank_transfer::Config {
         payee: "Example Ltd".into(),
         scheme: bank_transfer::Scheme::Sepa {
@@ -458,6 +489,7 @@ async fn bank_transfer_adapter_conforms() {
         sepa.verify_notification(&BTreeMap::new(), b"{}", OffsetDateTime::now_utc()).await,
         Err(BillingError::Unauthentic)
     ));
+    // A statement with the credit that pays the checkout.
     let camt = format!(
         r#"<Document><BkToCstmrDbtCdtNtfctn><Ntfctn><Ntry><Amt Ccy="EUR">7.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>
         <NtryDtls><TxDtls><RmtInf><Strd><CdtrRefInf><Ref>{}</Ref></CdtrRefInf></Strd></RmtInf></TxDtls></NtryDtls></Ntry></Ntfctn></BkToCstmrDbtCdtNtfctn></Document>"#,
@@ -479,6 +511,7 @@ async fn bank_transfer_adapter_conforms() {
         .is_err(),
         "a bad IBAN is refused at start"
     );
+    // A Faster Payments adapter.
     let fp = bank_transfer::BankTransfer::new(bank_transfer::Config {
         payee: "Example Ltd".into(),
         scheme: bank_transfer::Scheme::FasterPayments {
@@ -493,12 +526,14 @@ async fn bank_transfer_adapter_conforms() {
 
 // ── Open Payments, against a stand-in account servicing entity that checks every signature ────────────────────────
 
+/// The Open Payments stand-in, shared with the hosted tests.
 #[path = "support/open_payments.rs"]
 mod op_stand_in;
 
 use link_in_bio_billing::open_payments::{self, OpenPayments};
 use ring::signature::Ed25519KeyPair as Ed;
 
+/// The adapter settings for the Open Payments tests, pointing at the stand-in.
 fn op_config(wallet: &str, key: &str) -> open_payments::Config {
     open_payments::Config {
         wallet_address: wallet.into(),
@@ -510,6 +545,7 @@ fn op_config(wallet: &str, key: &str) -> open_payments::Config {
     }
 }
 
+/// Open payments adapter conforms.
 #[tokio::test]
 async fn open_payments_adapter_conforms() {
     let public = link_in_bio_billing::keys::ed25519_from_pem(&op_stand_in::test_key_pem())
@@ -597,6 +633,7 @@ async fn open_payments_adapter_conforms() {
     ));
 }
 
+/// Open payments settings are checked.
 #[test]
 fn open_payments_settings_are_checked() {
     let ok = op_config("https://wallet.example/operator", &op_stand_in::test_key_pem());
@@ -611,6 +648,7 @@ fn open_payments_settings_are_checked() {
 
 // ── Bank feeds, each against a stand-in for its bank's API ──────────────────────────────────────────────────────
 
+/// The bank stand-ins, shared with the hosted tests.
 #[path = "support/bank_feeds.rs"]
 mod banks;
 
@@ -621,6 +659,7 @@ fn rf(body: &str) -> String {
     bank_transfer::creditor_reference(body).unwrap()
 }
 
+/// Wise feed conforms.
 #[tokio::test]
 async fn wise_feed_conforms() {
     let bank = banks::WiseBank::start().await;
@@ -683,6 +722,7 @@ async fn wise_feed_conforms() {
     assert!(wrong.fetch(&FeedState::default(), now).await.is_err());
 }
 
+/// Bunq feed conforms.
 #[tokio::test]
 async fn bunq_feed_conforms() {
     let bank = banks::BunqBank::start().await;
@@ -736,6 +776,7 @@ async fn bunq_feed_conforms() {
     ));
 }
 
+/// Bunq reads on while pages are full.
 #[tokio::test]
 async fn bunq_reads_on_while_pages_are_full() {
     let bank = banks::BunqBank::start().await;
@@ -760,6 +801,7 @@ async fn bunq_reads_on_while_pages_are_full() {
     assert_eq!(first.cursor.as_deref(), Some(r#"{"7":450}"#));
 }
 
+/// Revolut feed conforms.
 #[tokio::test]
 async fn revolut_feed_conforms() {
     let bank = banks::RevolutBank::start("unused").await;

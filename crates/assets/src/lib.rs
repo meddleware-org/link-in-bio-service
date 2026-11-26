@@ -20,16 +20,22 @@ pub const SIDE: u32 = 400;
 /// Largest stored picture.
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
+/// Why a picture was refused. The messages are shown to the person who uploaded it, so they say what to do.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AvatarError {
+    /// The upload is over the byte limit.
     #[error("The picture is too large: at most 5 MiB.")]
     TooLarge,
+    /// The file is not one of the accepted raster formats (an SVG, a PDF or anything else is refused here).
     #[error("This is not a picture this service reads (PNG, JPEG, WebP or GIF).")]
     Unsupported,
+    /// The file looked like a picture but could not be decoded.
     #[error("The picture could not be read.")]
     Corrupt,
+    /// The picture is over the pixel limits, which are enforced from the header before any pixel buffer exists.
     #[error("The picture is too large in pixels: at most 4096 on each side.")]
     TooManyPixels,
+    /// No quality setting got the result under the size limit.
     #[error("The picture could not be made small enough.")]
     CannotShrink,
 }
@@ -37,10 +43,15 @@ pub enum AvatarError {
 /// A normalised picture.
 #[derive(Debug, Clone)]
 pub struct Avatar {
+    /// The encoded picture.
     pub bytes: Vec<u8>,
+    /// Its media type.
     pub mime: &'static str,
+    /// Its file extension.
     pub ext: &'static str,
+    /// Its width in pixels (always [`SIDE`]).
     pub width: u32,
+    /// Its height in pixels (always [`SIDE`]).
     pub height: u32,
     /// Hex SHA-256 of `bytes` (the asset reference is `sha256:<this>`).
     pub sha256: String,
@@ -51,20 +62,25 @@ pub fn normalise_raster(input: &[u8]) -> Result<Avatar, AvatarError> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(AvatarError::TooLarge);
     }
+    // The format is read from the content, never from a name or a declared type.
     let format = image::guess_format(input).map_err(|_| AvatarError::Unsupported)?;
     if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif) {
         return Err(AvatarError::Unsupported);
     }
+    // The reader is told the format it found, so it cannot be steered to another decoder.
     let mut reader = ImageReader::with_format(Cursor::new(input), format);
+    // The pixel and memory limits are applied by the decoder before it allocates.
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_INPUT_SIDE);
     limits.max_image_height = Some(MAX_INPUT_SIDE);
     limits.max_alloc = Some(MAX_DECODE_BYTES);
     reader.limits(limits);
+    // A limit error is reported as too many pixels; everything else as a corrupt file, without the decoder's own message.
     let img = reader.decode().map_err(|e| match e {
         image::ImageError::Limits(_) => AvatarError::TooManyPixels,
         _ => AvatarError::Corrupt,
     })?;
+    // The result is cropped, resized and re-encoded from pixels, so the output holds nothing of the input but the picture.
     encode(square(img))
 }
 
@@ -73,9 +89,11 @@ pub fn normalise_operator_svg(input: &[u8]) -> Result<Avatar, AvatarError> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(AvatarError::TooLarge);
     }
+    // Default options: no external files or fonts are loaded.
     let opts = resvg::usvg::Options::default();
     let tree = resvg::usvg::Tree::from_data(input, &opts).map_err(|_| AvatarError::Corrupt)?;
     let size = tree.size();
+    // Scale the longer side to the output size and centre the other.
     let scale = SIDE as f32 / size.width().max(size.height());
     let mut pixmap = resvg::tiny_skia::Pixmap::new(SIDE, SIDE).ok_or(AvatarError::Corrupt)?;
     let dx = (SIDE as f32 - size.width() * scale) / 2.0;
@@ -94,24 +112,29 @@ pub fn normalise_operator_svg(input: &[u8]) -> Result<Avatar, AvatarError> {
 
 /// Centre-crops to a square and resizes to [`SIDE`].
 fn square(img: DynamicImage) -> DynamicImage {
+    // Crop the longer side equally from both ends.
     let (w, h) = img.dimensions();
     let side = w.min(h);
     let cropped = img.crop_imm((w - side) / 2, (h - side) / 2, side, side);
     cropped.resize_exact(SIDE, SIDE, FilterType::Lanczos3)
 }
 
+/// Whether any pixel is not fully opaque; only then is PNG kept, because JPEG would lose it.
 fn has_transparency(img: &DynamicImage) -> bool {
     img.color().has_alpha() && img.to_rgba8().pixels().any(|p| p.0[3] < 255)
 }
 
+/// Encode a square picture: PNG if it has transparency, otherwise the best JPEG quality that fits under the size limit. The hash is of the output bytes.
 fn encode(img: DynamicImage) -> Result<Avatar, AvatarError> {
     let (bytes, mime, ext) = if has_transparency(&img) {
         let mut out = Vec::new();
         img.to_rgba8().write_to(&mut Cursor::new(&mut out), ImageFormat::Png).map_err(|_| AvatarError::Corrupt)?;
         (out, "image/png", "png")
     } else {
+        // An opaque picture is encoded as JPEG, which is smaller for photographs.
         let rgb = DynamicImage::ImageRgb8(img.to_rgb8());
         let mut found = None;
+        // The highest quality that fits is used; the first one under the limit wins.
         for quality in [85u8, 75, 65, 55, 45] {
             let mut out = Vec::new();
             let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
@@ -126,14 +149,17 @@ fn encode(img: DynamicImage) -> Result<Avatar, AvatarError> {
     if bytes.len() > MAX_OUTPUT_BYTES {
         return Err(AvatarError::CannotShrink);
     }
+    // The hash names the stored picture.
     let sha256 = hex::encode(Sha256::digest(&bytes));
     Ok(Avatar { bytes, mime, ext, width: SIDE, height: SIDE, sha256 })
 }
 
+/// Unit tests for the picture pipeline.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A PNG of the given size filled with a gradient at the given opacity.
     fn png(w: u32, h: u32, alpha: u8) -> Vec<u8> {
         let img = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba([(x % 256) as u8, (y % 256) as u8, 90, alpha]));
         let mut out = Vec::new();
@@ -141,8 +167,10 @@ mod tests {
         out
     }
 
+    /// An opaque picture comes out as a 400 by 400 JPEG under the size limit, with no metadata segment.
     #[test]
     fn photographs_become_square_jpegs_without_metadata() {
+        // A wide, opaque picture.
         let a = normalise_raster(&png(1200, 800, 255)).unwrap();
         assert_eq!((a.width, a.height, a.mime), (400, 400, "image/jpeg"));
         assert!(a.bytes.len() <= MAX_OUTPUT_BYTES);
@@ -151,12 +179,14 @@ mod tests {
         assert!(!a.bytes.windows(4).any(|w| w == b"Exif"));
     }
 
+    /// A picture with transparency comes out as a PNG.
     #[test]
     fn transparency_is_kept_as_png() {
         let a = normalise_raster(&png(300, 300, 128)).unwrap();
         assert_eq!(a.mime, "image/png");
     }
 
+    /// An SVG and a PDF are refused as unsupported, a PNG signature with garbage after it is corrupt, and anything appended to a real PNG is gone after re-encoding.
     #[test]
     fn refuses_non_images_svg_and_polyglots() {
         assert_eq!(
@@ -178,6 +208,7 @@ mod tests {
     /// A PNG whose header claims `w` × `h` pixels of RGBA at `depth` bits (its image data is an empty zlib stream: only
     /// the header matters here).
     fn png_header(w: u32, h: u32, depth: u8) -> Vec<u8> {
+        /// The CRC-32 that PNG chunks carry.
         fn crc32(data: &[u8]) -> u32 {
             let mut c = 0xFFFF_FFFFu32;
             for b in data {
@@ -188,6 +219,7 @@ mod tests {
             }
             !c
         }
+        /// Append one PNG chunk: its length, its type and data, and the checksum of both.
         fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
             out.extend_from_slice(&(data.len() as u32).to_be_bytes());
             let mut body = kind.to_vec();
@@ -205,6 +237,7 @@ mod tests {
         out
     }
 
+    /// Pictures that are too wide, too tall or too deep to decode within the budget are refused from the header alone.
     #[test]
     fn pictures_too_large_to_decode_safely_are_refused_before_decoding() {
         // Over the side limit: refused from the header, before any pixel buffer exists.
@@ -220,6 +253,7 @@ mod tests {
         }
     }
 
+    /// The operator's SVG comes out as a 400 pixel PNG.
     #[test]
     fn operator_svg_is_rasterised() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill="#86321d"/></svg>"##;

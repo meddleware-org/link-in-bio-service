@@ -4,27 +4,40 @@
  * (crates/core/src/theme.rs) and lands in --lib-accent / --lib-on-accent.
  */
 
+/* The page's own variables. Each --lib-* value falls back to a design-token role, and the data-* attributes below override it. */
 :root {
+/* The accent is overridden per hue, button style and mode by the generated accent rules (crates/core/src/theme.rs). */
   --lib-accent: var(--accent);
+/* The text colour that passes the contrast table on the accent. */
   --lib-on-accent: var(--accent-contrast);
+/* Corner radius for links, buttons and boxes; the data-radius rules below change it. */
   --lib-radius: var(--radius);
+/* The space between links. */
   --lib-gap: var(--space-sm);
+/* A link's padding, block direction. */
   --lib-pad-block: var(--space-sm);
+/* A link's padding, inline direction. */
   --lib-pad-inline: var(--space-md);
+/* The type face; the data-font rules below may swap it for another system stack. */
   --lib-font: var(--mw-font-sans);
+/* The column's width; the cards layout widens it. */
   --lib-column: 34rem;
 
+/* Light until the visitor's choice or the system says otherwise; this makes native controls and scrollbars match the page. */
   color-scheme: light;
 }
 
+/* Colour mode: a dark page draws native controls dark; the system mode lets the browser pick either. */
 :root[data-theme="dark"] { color-scheme: dark; }
 :root[data-theme="system"] { color-scheme: light dark; }
 
+/* Corner radius choices (the manifest's `radius`), from the shared radius tokens. */
 :root[data-radius="xs"] { --lib-radius: var(--radius-xs); }
 :root[data-radius="sm"] { --lib-radius: var(--radius-sm); }
 :root[data-radius="md"] { --lib-radius: var(--radius); }
 :root[data-radius="lg"] { --lib-radius: var(--radius-lg); }
 
+/* Compact density (the manifest's `density`): tighter gaps and padding, from the spacing tokens. */
 :root[data-density="compact"] {
   --lib-gap: var(--space-xs);
   --lib-pad-block: var(--space-xs);
@@ -36,10 +49,12 @@
 :root[data-font="rounded"] { --lib-font: ui-rounded, "SF Pro Rounded", "Hiragino Maru Gothic ProN", "Arial Rounded MT", Calibri, system-ui, sans-serif; }
 :root[data-font="mono"] { --lib-font: var(--mw-font-mono); }
 
+/* Every box is measured border-box, so padding never widens a column. */
 *,
 *::before,
 *::after { box-sizing: border-box; }
 
+/* The page background, text colour, type face and line height; all colours are token roles, so both modes work. */
 html {
   background: var(--bg);
   color: var(--text);
@@ -48,6 +63,7 @@ html {
   line-height: 1.5;
 }
 
+/* The body is a full-height column so the footer sits at the bottom of a short page. */
 body {
   margin: 0;
   min-height: 100vh;
@@ -56,6 +72,7 @@ body {
   align-items: center;
 }
 
+/* The content column: as wide as the layout allows, centred by the body, and growing to push the footer down. */
 .page {
   width: 100%;
   max-width: var(--lib-column);
@@ -73,6 +90,7 @@ body {
   margin-block-end: var(--space-lg);
 }
 
+/* The profile picture: a fixed square, cropped to a circle, with a surface colour and border behind it while it loads. */
 .avatar {
   width: 7.5rem;
   height: 7.5rem;
@@ -82,6 +100,7 @@ body {
   border: 1px solid var(--border);
 }
 
+/* The display name; long names wrap rather than overflow. */
 .name {
   margin: var(--space-xs) 0 0;
   font-size: var(--font-size-xl, 1.75rem);
@@ -89,6 +108,7 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* Pronouns and the address line are quiet secondary text. */
 .pronouns,
 .address {
   margin: 0;
@@ -96,6 +116,7 @@ body {
   font-size: var(--font-size-sm, 0.875rem);
 }
 
+/* The short biography: a readable line length, with long unbroken words wrapped. */
 .bio {
   margin: var(--space-2xs) 0 0;
   max-width: 30rem;
@@ -103,6 +124,7 @@ body {
 }
 
 /* ── Links ─────────────────────────────────────────────────────────────── */
+/* The list of links: one column, with no list markers; the cards layout makes it a grid. */
 .links {
   list-style: none;
   margin: 0;
@@ -112,12 +134,15 @@ body {
   gap: var(--lib-gap);
 }
 
+/* A list item may shrink below its content's width, so a long link wraps instead of stretching the column. */
 .links > li { min-width: 0; }
 
+/* Cards layout: a wider column; links fill a responsive grid of columns at least 18rem wide, and a group spans the full row. */
 :root[data-layout="cards"] { --lib-column: 50rem; }
 :root[data-layout="cards"] .page > .links { grid-template-columns: repeat(auto-fill, minmax(min(100%, 18rem), 1fr)); }
 :root[data-layout="cards"] .page > .links > .group { grid-column: 1 / -1; }
 
+/* A link: a flex row of icon and text, at least 3rem tall so it is a comfortable touch target. */
 .link {
   display: flex;
   align-items: center;
@@ -131,29 +156,36 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* Filled buttons: the accent as background, with the text colour the contrast table chose for it. */
 :root[data-buttons="filled"] .link {
   background: var(--lib-accent);
   color: var(--lib-on-accent);
 }
 
+/* Outlined buttons: an accent border on a clear background. */
 :root[data-buttons="outline"] .link {
   border-color: var(--lib-accent);
   background: transparent;
 }
 
+/* Plain links: no box, an underlined accent-coloured line. */
 :root[data-buttons="plain"] .link {
   padding-inline: var(--space-2xs);
   text-decoration: underline;
   text-underline-offset: 0.2em;
 }
 
+/* In the cards layout, links that are not filled sit on the surface colour. */
 :root[data-layout="cards"]:not([data-buttons="filled"]) .link { background: var(--surface); }
 
+/* The title is underlined on hover and keyboard focus, so state is not shown by colour alone. */
 .link:hover .link-title,
 .link:focus-visible .link-title { text-decoration: underline; text-underline-offset: 0.2em; }
 
+/* An outlined link lifts to a tinted background on hover. */
 :root[data-buttons="outline"] .link:hover { background: var(--lift); }
 
+/* One visible focus ring for every interactive control, in the token's focus colour with an offset so it is never hidden by a border. */
 .link:focus-visible,
 .button:focus-visible,
 summary:focus-visible,
@@ -167,27 +199,34 @@ summary:focus-visible,
   outline-offset: 2px;
 }
 
+/* An icon from the sprite: a fixed size that never shrinks. */
 .icon {
   flex: 0 0 auto;
   width: 1.5rem;
   height: 1.5rem;
 }
 
+/* The link's text column: title above description, allowed to shrink so the text wraps. */
 .link-text {
   display: flex;
   flex-direction: column;
   min-width: 0;
 }
 
+/* The link's title. */
 .link-title { font-weight: 600; }
 
+/* The link's description: smaller, muted text. */
 .link-description {
   font-size: var(--font-size-sm, 0.875rem);
   color: var(--muted);
 }
 
+/* On a filled link the description keeps the button's own text colour, so contrast is never lowered. */
 :root[data-buttons="filled"] .link-description { color: inherit; }
 
+/* ── Groups (native <details>) ─────────────────────────────────────────── */
+/* A group is a native details element, so it opens and closes without a script: a bordered surface. */
 /* ── Groups (native <details>) ─────────────────────────────────────────── */
 .group details {
   border: 1px solid var(--control-border);
@@ -195,6 +234,7 @@ summary:focus-visible,
   background: var(--surface);
 }
 
+/* The summary row: the group's title and its chevron, a full-width tap target with the default marker removed. */
 .group summary {
   display: flex;
   align-items: center;
@@ -208,8 +248,10 @@ summary:focus-visible,
   list-style: none;
 }
 
+/* Safari draws its own disclosure triangle; the chevron replaces it. */
 .group summary::-webkit-details-marker { display: none; }
 
+/* The chevron: a fixed size, muted, and turned over when the group is open. */
 .group .chevron {
   flex: 0 0 auto;
   width: 1.25rem;
@@ -218,16 +260,22 @@ summary:focus-visible,
   transition: transform var(--duration-fast, 120ms) ease;
 }
 
+/* The open state is read from the details element's own `open` attribute. */
 .group details[open] > summary .chevron { transform: rotate(180deg); }
 
+/* A visitor who asks for reduced motion gets no turn animation. */
 @media (prefers-reduced-motion: reduce) {
   .group .chevron { transition: none; }
 }
 
+/* The links inside an open group sit inside the box, with the box's padding. */
 .group details > .links { padding: 0 var(--lib-pad-inline) var(--lib-pad-inline); }
 
+/* In the cards layout the links inside a group sit on the page colour, so they stand out from the group's surface. */
 :root[data-layout="cards"]:not([data-buttons="filled"]) .group .link { background: var(--bg); }
 
+/* ── Sections ──────────────────────────────────────────────────────────── */
+/* Contact, support and the call to action are boxes of the same kind: a surface with a border and space above. */
 /* ── Sections ──────────────────────────────────────────────────────────── */
 .contact,
 .support,
@@ -239,6 +287,7 @@ summary:focus-visible,
   background: var(--surface);
 }
 
+/* Their headings are small, because the page's one h1 is the name. */
 .contact h2,
 .support h2,
 .cta h2 {
@@ -246,20 +295,24 @@ summary:focus-visible,
   font-size: var(--font-size-md, 1.125rem);
 }
 
+/* A list with the markers and indentation removed (the list stays a list for assistive technology). */
 .plain-list {
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
+/* Links in these boxes use the text colour with an underline, not the accent, so they read as text. */
 .contact a,
 .support a,
 .address a { color: var(--text); text-underline-offset: 0.2em; }
 
+/* Space between one way of supporting and the next; the label is muted and the value sits close under it. */
 .support-method + .support-method { margin-block-start: var(--space-sm); }
 .support-label { margin: 0; color: var(--muted); }
 .support-value { margin: var(--space-2xs) 0; }
 
+/* An address (a wallet or account): monospace, wrapped anywhere, and selected whole with one click. It is plain text, so it works without a script. */
 .address-value {
   font-family: var(--mw-font-mono);
   font-size: var(--font-size-sm, 0.875rem);
@@ -267,6 +320,7 @@ summary:focus-visible,
   user-select: all;
 }
 
+/* The copy button and any link sit on a wrapping row. */
 .support-actions {
   display: flex;
   flex-wrap: wrap;
@@ -275,6 +329,7 @@ summary:focus-visible,
   margin: 0;
 }
 
+/* The copy button and the colour-mode buttons look alike: a bordered surface at least 2.75rem tall, inheriting the page's font. */
 .copy,
 .mode button {
   font: inherit;
@@ -287,8 +342,10 @@ summary:focus-visible,
   cursor: pointer;
 }
 
+/* The call to action's last paragraph has no extra space below it. */
 .cta p:last-child { margin-block-end: 0; }
 
+/* The call-to-action button (operator's page only): the accent, filled in the filled style. */
 .button {
   display: inline-flex;
   align-items: center;
@@ -304,14 +361,18 @@ summary:focus-visible,
   overflow-wrap: anywhere;
 }
 
+/* In the other button styles the call to action is outlined, to match the links. */
 :root:not([data-buttons="filled"]) .button {
   background: transparent;
   color: var(--lib-accent);
   border-color: var(--lib-accent);
 }
 
+/* The empty page's message. */
 .empty { text-align: center; color: var(--muted); }
 
+/* ── Footer ────────────────────────────────────────────────────────────── */
+/* The footer is a muted, centred column as wide as the page. */
 /* ── Footer ────────────────────────────────────────────────────────────── */
 .site-footer {
   width: 100%;
@@ -322,9 +383,11 @@ summary:focus-visible,
   font-size: var(--font-size-sm, 0.875rem);
 }
 
+/* Footer paragraphs and links are muted. */
 .site-footer p { margin: var(--space-2xs) 0; }
 .site-footer a { color: var(--muted); text-underline-offset: 0.2em; }
 
+/* The footer's list of links, centred and wrapping. */
 .footer-links {
   display: flex;
   flex-wrap: wrap;
@@ -335,6 +398,7 @@ summary:focus-visible,
   list-style: none;
 }
 
+/* The colour-mode control: a fieldset of buttons laid out on a wrapping row, with no border of its own. */
 .mode {
   display: inline-flex;
   flex-wrap: wrap;
@@ -345,9 +409,11 @@ summary:focus-visible,
   border: 0;
 }
 
+/* The control and the copy button start hidden in the markup and are shown by the script, so without a script they are not shown at all. */
 .mode[hidden],
 .copy[hidden] { display: none; }
 
+/* The legend sits inline beside the buttons, vertically centred on their height. */
 .mode legend {
   float: left;
   margin-inline-end: var(--space-xs);
@@ -355,6 +421,7 @@ summary:focus-visible,
   line-height: 2.75rem;
 }
 
+/* The pressed button is outlined in the text colour and bold, so the current mode is shown by more than colour. */
 .mode button[aria-pressed="true"] {
   border-color: var(--text);
   font-weight: 600;
@@ -402,6 +469,7 @@ summary:focus-visible,
   text-decoration: underline;
 }
 
+/* The symbol's glyph sits just below the text baseline, so it lines up with the text beside it. */
 .symbol-mark {
   display: inline;
   vertical-align: -0.15em;
@@ -425,6 +493,7 @@ summary:focus-visible,
 .spec code { font-family: var(--mw-font-mono); }
 .spec a { color: var(--text); }
 
+/* Forced-colours mode (such as Windows high contrast): boxes keep a border drawn in the user's own colours, even when the backgrounds are removed. */
 @media (forced-colors: active) {
   .link,
   .button,

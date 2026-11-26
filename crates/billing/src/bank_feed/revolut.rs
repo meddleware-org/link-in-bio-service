@@ -16,31 +16,40 @@ use super::{BankFeed, Credit, FeedBatch, FeedState, positive_minor, rfc3339, win
 use crate::keys::{RsaKey, jwt_rs256};
 use crate::{BillingError, bank_transfer};
 
+/// The feed's id, as stored with its cursor.
 pub const ID: &str = "revolut";
+/// Revolut Business's sandbox address, the default until a live address is configured.
 pub const SANDBOX: &str = "https://sandbox-b2b.revolut.com/api/1.0";
+/// The client-assertion type for a JWT bearer assertion (RFC 7523).
 pub const ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 /// Transactions per request (Revolut's maximum), and requests per poll.
 pub const COUNT: u32 = 1000;
+/// The most pages read in one poll.
 pub const MAX_PAGES: usize = 10;
 
+/// How to reach Revolut Business and authenticate.
 #[derive(Debug)]
 pub struct Config {
+    /// The API's base address.
     pub api_base: String,
+    /// The client id from the API settings.
     pub client_id: String,
     /// The host of the redirect URI registered with the certificate (the assertion's `iss`).
     pub issuer: String,
+    /// The private key that signs the assertion.
     pub key: RsaKey,
+    /// The refresh token from the one-time consent exchange.
     pub refresh_token: String,
 }
 
+/// The feed.
 pub struct Revolut {
+    /// The settings.
     config: Config,
+    /// The HTTP client.
     http: reqwest::Client,
+    /// The current access token and when it expires.
     access: Mutex<Option<(String, Instant)>>,
-}
-
-fn unavailable(e: impl std::fmt::Display) -> BillingError {
-    BillingError::Unavailable(e.to_string())
 }
 
 /// The client assertion: valid for five minutes.
@@ -56,6 +65,7 @@ pub fn client_assertion(
     )
 }
 
+/// A form-encoded body from name and value pairs, escaped.
 fn form(pairs: &[(&str, &str)]) -> String {
     let mut s = url::form_urlencoded::Serializer::new(String::new());
     for (k, v) in pairs {
@@ -64,6 +74,7 @@ fn form(pairs: &[(&str, &str)]) -> String {
     s.finish()
 }
 
+/// Post a token request and read the answer; a failure carries Revolut's own description, shortened.
 async fn token_request(http: &reqwest::Client, api_base: &str, body: String) -> Result<Value, BillingError> {
     let resp = http
         .post(format!("{}/auth/token", api_base.trim_end_matches('/')))
@@ -71,7 +82,7 @@ async fn token_request(http: &reqwest::Client, api_base: &str, body: String) -> 
         .body(body)
         .send()
         .await
-        .map_err(unavailable)?;
+        .map_err(crate::transport)?;
     let status = resp.status();
     let v: Value = crate::read_json_or_null(resp, crate::MAX_STATEMENT_BYTES).await?;
     if status.is_success() {
@@ -114,22 +125,28 @@ pub async fn exchange_code(
 /// description) holds a creditor reference. Also the earliest `created_at` seen (Revolut lists the newest first).
 pub fn credits_from_transactions(list: &Value) -> (Vec<Credit>, Option<OffsetDateTime>) {
     let mut out = Vec::new();
+    // The earliest creation time on the page, for the next page.
     let mut earliest: Option<OffsetDateTime> = None;
     for t in list.as_array().map(Vec::as_slice).unwrap_or_default() {
+        // Track the earliest time seen, so the next page continues from there.
         let created = t["created_at"].as_str().and_then(crate::parse_rfc3339);
         if let Some(c) = created {
             earliest = Some(earliest.map_or(c, |e| e.min(c)));
         }
+        // Only completed transactions count, and a currency exchange is not a payment.
         if t["state"].as_str() != Some("completed") || t["type"].as_str() == Some("exchange") {
             continue;
         }
+        // The transaction id, for the ledger entry.
         let id = t["id"].as_str().unwrap_or("");
+        // A transaction has legs; the incoming ones with a positive amount are the credits.
         for leg in t["legs"].as_array().map(Vec::as_slice).unwrap_or_default() {
             let (Some(minor), Some(currency)) = (positive_minor(&leg["amount"]), leg["currency"].as_str()) else {
                 continue;
             };
             let text =
                 format!("{} {}", t["reference"].as_str().unwrap_or(""), leg["description"].as_str().unwrap_or(""));
+            // Only a whole, valid creditor reference pays a checkout.
             let Some(reference) = bank_transfer::reference_in_text(&text) else { continue };
             out.push(Credit {
                 reference,
@@ -145,6 +162,7 @@ pub fn credits_from_transactions(list: &Value) -> (Vec<Credit>, Option<OffsetDat
 }
 
 impl Revolut {
+    /// A feed from its settings and a client.
     pub fn new(config: Config, http: reqwest::Client) -> Self {
         Self { config, http, access: Mutex::new(None) }
     }
@@ -152,6 +170,7 @@ impl Revolut {
     /// An access token, refreshed when it is about to expire. A new refresh token, if Revolut sends one, goes into
     /// `state`.
     async fn access_token(&self, state: &mut Value) -> Result<String, BillingError> {
+        // A token with more than a minute left is reused.
         if let Some((t, until)) = self.access.lock().await.clone()
             && until > Instant::now() + Duration::from_secs(60)
         {
@@ -173,8 +192,10 @@ impl Revolut {
             ]),
         )
         .await?;
+        // The answer must hold an access token; its lifetime defaults to ten minutes if the answer gives none.
         let token = v["access_token"].as_str().ok_or_else(|| BillingError::Malformed("no access token".into()))?;
         let ttl = Duration::from_secs(v["expires_in"].as_u64().unwrap_or(600));
+        // A replaced refresh token is kept in the feed's state, because the old one no longer works.
         if let Some(r) = v["refresh_token"].as_str().filter(|r| *r != refresh) {
             state["refreshToken"] = json!(r);
         }
@@ -185,16 +206,20 @@ impl Revolut {
 
 #[async_trait::async_trait]
 impl BankFeed for Revolut {
+    /// The feed's id.
     fn id(&self) -> &'static str {
         ID
     }
 
+    /// Read the transactions of the window, page by page, newest first, and collect the credits.
     async fn fetch(&self, from: &FeedState, now: OffsetDateTime) -> Result<FeedBatch, BillingError> {
+        // The feed's state is an object; anything else is replaced by an empty one.
         let mut state = if from.state.is_object() { from.state.clone() } else { json!({}) };
         let token = self.access_token(&mut state).await?;
         let start = window_start(from.cursor.as_deref(), now);
         let mut credits = Vec::new();
         let mut to: Option<OffsetDateTime> = None;
+        // At most ten pages a poll.
         for _ in 0..MAX_PAGES {
             let mut u = url::Url::parse(&format!("{}/transactions", self.config.api_base.trim_end_matches('/')))
                 .map_err(|_| BillingError::Malformed("REVOLUT_API_BASE".into()))?;
@@ -202,8 +227,9 @@ impl BankFeed for Revolut {
             if let Some(t) = to {
                 u.query_pairs_mut().append_pair("to", &rfc3339(t));
             }
-            let resp = self.http.get(u).bearer_auth(&token).send().await.map_err(unavailable)?;
+            let resp = self.http.get(u).bearer_auth(&token).send().await.map_err(crate::transport)?;
             let status = resp.status();
+            // A rejected token is forgotten, so the next call refreshes it.
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 *self.access.lock().await = None;
             }
@@ -227,6 +253,7 @@ impl BankFeed for Revolut {
                 _ => break,
             }
         }
+        // The next poll starts from now (less the overlap).
         let cursor = rfc3339(now);
         Ok(FeedBatch { credits, cursor: Some(cursor), state })
     }

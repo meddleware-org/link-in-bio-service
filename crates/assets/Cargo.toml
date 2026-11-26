@@ -1,13 +1,19 @@
+# Link in Bio's picture pipeline: every uploaded picture is decoded under strict limits and re-encoded from pixels, so nothing of the
+# uploaded file survives except the image. Depends on no other crate of the workspace.
+# The crate's identity.
 [package]
 name = "link-in-bio-assets"
 description = "Link in Bio: the avatar pipeline (decode with limits, re-encode, strip metadata). Raster input only for tenants; the operator's own SVG is rasterised with resvg."
+# Version, edition, minimum Rust, licence and repository come from the workspace manifest.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Inherited: no crate here is published to crates.io.
 publish.workspace = true
 
+# Runtime dependencies are versioned once, in the workspace manifest.
 [dependencies]
 image.workspace = true
 resvg.workspace = true
@@ -15,5 +21,6 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 
+# The workspace's lint set, including the documentation lints.
 [lints]
 workspace = true

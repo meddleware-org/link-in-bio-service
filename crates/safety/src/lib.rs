@@ -16,6 +16,7 @@
 //! A flagged link is hidden from the page until an operator reviews it; a link that could not be checked (Web Risk
 //! down, the allowance spent, the lists not loaded yet) is shown and checked again within the hour.
 
+/// Web Risk's Update API: its lists, their encodings, and the calls that keep them current.
 pub mod webrisk;
 
 use std::sync::{Arc, Mutex, RwLock};
@@ -26,8 +27,11 @@ use link_in_bio_store::Store;
 use serde_json::Value;
 use time::{Duration, OffsetDateTime, UtcOffset};
 
+/// How long a clean verdict holds before the link is checked again.
 pub const RESCAN_CLEAN: Duration = Duration::hours(24);
+/// How soon a link that could not be checked is tried again.
 pub const RESCAN_UNKNOWN: Duration = Duration::hours(1);
+/// How long a flagged verdict holds before the link is checked again.
 pub const RESCAN_FLAGGED: Duration = Duration::days(7);
 
 /// The longest ThreatFox answer read (seven days of indicators are a few megabytes).
@@ -36,10 +40,12 @@ const MAX_THREATFOX_BYTES: usize = 64 * 1024 * 1024;
 /// Reads a response body of at most `max` bytes (checked on the declared length, then while reading); `None` when it is
 /// longer or the connection broke off.
 pub(crate) async fn read_limited(mut resp: reqwest::Response, max: usize) -> Option<Vec<u8>> {
+    // Refused on the declared length, before reading anything.
     if resp.content_length().is_some_and(|n| n > max as u64) {
         return None;
     }
     let mut out = Vec::new();
+    // Read chunk by chunk and stop as soon as the limit would be passed; a broken connection gives nothing.
     while let Some(chunk) = resp.chunk().await.ok()? {
         if out.len() + chunk.len() > max {
             return None;
@@ -73,14 +79,30 @@ pub const SHORTENERS: &[&str] = &[
     "tr.im",
 ];
 
+/// The result of screening one link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    Clean { source: &'static str },
-    Flagged { source: String, detail: String },
-    Unknown { reason: String },
+    /// Nothing found; `source` says which layers looked.
+    Clean {
+        /// Which layers looked.
+        source: &'static str,
+    },
+    /// Something found: the layer that found it and what it found.
+    Flagged {
+        /// The layer that found it.
+        source: String,
+        /// What it found, in words.
+        detail: String,
+    },
+    /// The link could not be checked (a service was down or a cap was reached), with the reason; it is shown and tried again soon.
+    Unknown {
+        /// Why the link could not be checked.
+        reason: String,
+    },
 }
 
 impl Verdict {
+    /// The verdict's name as stored.
     pub fn as_str(&self) -> &'static str {
         match self {
             Verdict::Clean { .. } => "clean",
@@ -89,6 +111,7 @@ impl Verdict {
         }
     }
 
+    /// When the link should be checked again: soon for unknown, a week for flagged, a day for clean, and a day for a prefix match nobody could confirm.
     pub fn next_check(&self, now: OffsetDateTime) -> OffsetDateTime {
         now + match self {
             Verdict::Clean { .. } => RESCAN_CLEAN,
@@ -103,12 +126,14 @@ impl Verdict {
 /// The host of an `https:` link and its parent domains (`a.b.example.org` → itself, `b.example.org`, `example.org`),
 /// lower-case, never the bare top-level domain. `mailto:` links give the address's domain.
 pub fn hosts_of(link: &str) -> Vec<String> {
+    // A mail link's domain is the part after the last `@`, before any query.
     let host = if let Some(addr) = link.strip_prefix("mailto:") {
         addr.split('?').next().and_then(|a| a.rsplit_once('@')).map(|(_, d)| d.to_ascii_lowercase())
     } else {
         url::Url::parse(link).ok().and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()))
     };
     let Some(host) = host else { return Vec::new() };
+    // Every suffix of the host with at least two labels, never the bare top-level domain.
     let labels: Vec<&str> = host.split('.').collect();
     if labels.len() < 2 {
         return vec![host];
@@ -121,6 +146,7 @@ pub fn builtin(link: &str) -> Option<(String, String)> {
     if link.starts_with("mailto:") {
         return None;
     }
+    // Layer 1: a link that does not parse is left to the parser's own rules.
     let u = url::Url::parse(link).ok()?;
     match u.host() {
         Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => {
@@ -129,6 +155,7 @@ pub fn builtin(link: &str) -> Option<(String, String)> {
         None => return Some(("builtin".into(), "the link has no host".into())),
         _ => {}
     }
+    // Only the default https port.
     if u.port().is_some_and(|p| p != 443) {
         return Some(("builtin".into(), "the link uses an unusual port".into()));
     }
@@ -147,20 +174,28 @@ pub fn builtin(link: &str) -> Option<(String, String)> {
 /// URL) to `hashes.search`. Every call counts against `monthly_cap` (`computeDiff` and `hashes.search` together), and
 /// `hashes.search`, the only billed call, against `confirm_monthly_cap` as well.
 pub struct WebRiskUpdate {
+    /// The API client.
     pub api: webrisk::UpdateApi,
+    /// The most calls of any kind in a month.
     pub monthly_cap: i64,
+    /// The most billed confirmations in a month.
     pub confirm_monthly_cap: i64,
     /// `constraints.maxDatabaseEntries` per list (a power of two from 2^10 to 2^20).
     pub max_entries: u32,
+    /// The lists in memory, replaced as a whole when the database has newer ones.
     lists: RwLock<Arc<Loaded>>,
+    /// When the lists were last compared with the database.
     checked: Mutex<Option<std::time::Instant>>,
+    /// What confirmations said, kept until they expire, so the same link is not confirmed twice.
     cache: Mutex<webrisk::HashCache>,
 }
 
 /// The lists in memory and what they were loaded from (`threat:updated_at` per list).
 #[derive(Default)]
 struct Loaded {
+    /// What the lists were loaded from, as a string that changes when any list does.
     stamp: String,
+    /// Each threat type with its prefix lookup.
     lists: Vec<(String, webrisk::Lookup)>,
 }
 
@@ -168,6 +203,7 @@ struct Loaded {
 const RELOAD_EVERY: StdDuration = StdDuration::from_secs(60);
 
 impl WebRiskUpdate {
+    /// A screener in update mode with its caps.
     pub fn new(key: String, monthly_cap: i64, confirm_monthly_cap: i64, max_entries: u32) -> Self {
         Self {
             api: webrisk::UpdateApi::new(key),
@@ -180,6 +216,7 @@ impl WebRiskUpdate {
         }
     }
 
+    /// The lists in memory (empty if the lock is poisoned).
     fn loaded(&self) -> Arc<Loaded> {
         self.lists.read().map(|l| l.clone()).unwrap_or_default()
     }
@@ -192,29 +229,34 @@ impl WebRiskUpdate {
     /// Loads the lists again when the worker has changed them (compared at most once a minute, or now with `force`).
     pub async fn refresh(&self, store: &Store, force: bool) -> Result<(), link_in_bio_store::DbError> {
         {
+            // If the lock is unusable the check is skipped; the lists in memory stay as they are.
             let Ok(mut last) = self.checked.lock() else { return Ok(()) };
             if !force && last.is_some_and(|t| t.elapsed() < RELOAD_EVERY) {
                 return Ok(());
             }
             *last = Some(std::time::Instant::now());
         }
+        // Which lists the worker has stored, and when each was updated.
         let states = store.web_risk_lists().await?;
         let stamp: String = states
             .iter()
             .filter(|s| s.entries > 0)
             .map(|s| format!("{}:{}:{};", s.threat_type, s.updated_at.unix_timestamp_nanos(), s.entries))
             .collect();
+        // Nothing changed since the last load.
         if stamp == self.loaded().stamp {
             return Ok(());
         }
         let mut lists = Vec::new();
         for s in states.iter().filter(|s| s.entries > 0) {
+            // Lists that no longer decode are left out rather than half loaded.
             if let Some(l) = store.web_risk_list(&s.threat_type).await?
                 && let Some(prefixes) = webrisk::decode(&l.prefixes)
             {
                 lists.push((l.threat_type, webrisk::Lookup::new(&prefixes)));
             }
         }
+        // The new lists replace the old ones in one step, so a reader never sees a mix.
         if let Ok(mut w) = self.lists.write() {
             *w = Arc::new(Loaded { stamp, lists });
         }
@@ -224,6 +266,7 @@ impl WebRiskUpdate {
     /// One billed `hashes.search` call, if both monthly caps allow it.
     async fn confirm(&self, store: &Store, prefix: &[u8], now: OffsetDateTime) -> Result<webrisk::Found, Confirm> {
         let month = period(now);
+        // Both caps are taken in one step, so a confirmation is made only if both allow it.
         let takes = [
             ("webrisk".to_string(), month.clone(), 1, self.monthly_cap),
             ("webrisk-confirm".to_string(), month, 1, self.confirm_monthly_cap),
@@ -233,6 +276,7 @@ impl WebRiskUpdate {
             Ok(Some(_)) => return Err(Confirm::Budget),
             Err(_) => return Err(Confirm::Down("the Web Risk counter could not be read".into())),
         }
+        // Only the hash prefix leaves the service, never the link.
         let found = self.api.search_hashes(prefix, now).await.map_err(Confirm::Down)?;
         if let Ok(mut c) = self.cache.lock() {
             c.record(prefix, &found, now);
@@ -250,6 +294,7 @@ impl WebRiskUpdate {
             return Verdict::Unknown { reason: "the Web Risk lists are not loaded yet".into() };
         }
         // Each of the link's full hashes that starts with a local prefix, by prefix.
+        // Each full hash of the link that starts with a list prefix, grouped by the prefix.
         let mut by_prefix: Vec<(Vec<u8>, Vec<[u8; 32]>)> = Vec::new();
         for h in webrisk::full_hashes(link) {
             for (_, l) in &loaded.lists {
@@ -261,12 +306,14 @@ impl WebRiskUpdate {
                 }
             }
         }
+        // No local match means the link is clean, at no cost.
         if by_prefix.is_empty() {
             return Verdict::Clean { source: "webrisk" };
         }
         let mut threats: Vec<String> = Vec::new();
         let mut unconfirmed = false;
         for (prefix, hashes) in by_prefix {
+            // A recent confirmation answers without a call: unsafe types, or known safe.
             let cached: Option<Vec<String>> = self.cache.lock().ok().and_then(|c| {
                 let types: Vec<String> =
                     hashes.iter().filter_map(|h| c.unsafe_types(h, now)).flatten().cloned().collect();
@@ -300,6 +347,7 @@ impl WebRiskUpdate {
                 }
             }
         }
+        // Confirmed threats flag the link; an unconfirmed match is hidden until a person reviews it; otherwise it is clean.
         if !threats.is_empty() {
             Verdict::Flagged { source: "webrisk".into(), detail: threats.join(", ") }
         } else if unconfirmed {
@@ -315,9 +363,11 @@ impl WebRiskUpdate {
     }
 }
 
+/// Why a confirmation was not made.
 enum Confirm {
     /// A monthly cap is reached.
     Budget,
+    /// Web Risk or its counter could not be reached, with the reason.
     Down(String),
 }
 
@@ -337,10 +387,15 @@ pub fn period(now: OffsetDateTime) -> String {
 /// would price every `uris.search` of the month at $50 per 1 000.
 #[derive(Clone)]
 pub struct WebRiskLookup {
+    /// The API key.
     pub key: String,
+    /// The lookup address.
     pub endpoint: String,
+    /// The HTTP client: no redirects, short timeouts.
     pub http: reqwest::Client,
+    /// The free calls a month.
     pub free_monthly: i64,
+    /// The paid calls a month, on top of the free ones.
     pub paid_monthly: i64,
 }
 
@@ -351,8 +406,10 @@ const MAX_LOOKUP_BYTES: usize = 64 * 1024;
 pub const RECHECK_SHARE_PERCENT: i64 = 80;
 
 impl WebRiskLookup {
+    /// The address of Web Risk's lookup call.
     pub const ENDPOINT: &'static str = "https://webrisk.googleapis.com/v1/uris:search";
 
+    /// A lookup screener with its allowances.
     pub fn new(key: String, free_monthly: i64, paid_monthly: i64) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder()
@@ -401,7 +458,9 @@ impl WebRiskLookup {
 
     /// Layer 3 for one link: `None` when a recheck must wait (the recheck share of the month is spent).
     async fn check(&self, store: &Store, link: &str, now: OffsetDateTime, recheck: bool) -> Option<Verdict> {
+        // Rechecks stop at 80 % of the allowance; a link being published may use all of it.
         let cap = if recheck { self.recheck_stop() } else { self.allowance() };
+        // A call is counted before it is made, in the database, so every process shares one count.
         match store.take_from_counter("webrisk", &period(now), 1, cap).await {
             Ok(true) => {}
             Ok(false) if recheck => return None,
@@ -422,7 +481,9 @@ pub const RESCAN_CLEAN_LOOKUP: Duration = Duration::days(7);
 /// The layers, with at most one Web Risk mode (both `None`: the built-in checks and the lists only).
 #[derive(Default)]
 pub struct Screener {
+    /// Lookup mode, if on.
     pub lookup: Option<WebRiskLookup>,
+    /// Update mode, if on.
     pub update: Option<WebRiskUpdate>,
 }
 
@@ -451,6 +512,7 @@ impl Screener {
         }
     }
 
+    /// The layers in order: the built-in checks, the blocklist, then Web Risk in whichever mode is on. `None` only when a recheck must wait.
     async fn layers(&self, store: &Store, link: &str, now: OffsetDateTime, recheck: bool) -> Option<Verdict> {
         if let Some((source, detail)) = builtin(link) {
             return Some(Verdict::Flagged { source, detail });
@@ -477,6 +539,7 @@ impl Screener {
             .unwrap_or_else(|| Verdict::Unknown { reason: "Web Risk is not available".into() })
     }
 
+    /// Store a verdict with its source, detail and the time of the next check.
     async fn record(
         &self,
         store: &Store,
@@ -528,6 +591,7 @@ pub async fn update_list(
     now: OffsetDateTime,
     retry: Duration,
 ) -> Result<UpdateOutcome, link_in_bio_store::DbError> {
+    // The list as stored, with its version and when it may next be asked for.
     let current = store.web_risk_list(threat).await?;
     if current.as_ref().and_then(|c| c.next_diff_at).is_some_and(|t| t > now) {
         return Ok(UpdateOutcome::NotDue);
@@ -543,8 +607,10 @@ pub async fn update_list(
             return Ok(UpdateOutcome::Failed(e));
         }
     };
+    // Web Risk says when to ask again; without a usable time, thirty minutes.
     let next = diff.recommended_next.filter(|t| *t > now).unwrap_or(now + DEFAULT_NEXT_DIFF);
     let held = current.as_ref().and_then(|c| webrisk::decode(&c.prefixes)).unwrap_or_default();
+    // The diff is applied and stored only if its checksum matches.
     match webrisk::apply(&held, &diff) {
         Ok(list) => {
             store
@@ -571,11 +637,16 @@ pub async fn update_list(
 /// When to ask again if Web Risk recommends no time.
 pub const DEFAULT_NEXT_DIFF: Duration = Duration::minutes(30);
 
+/// What one list update did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateOutcome {
+    /// Web Risk has not said it is time yet.
     NotDue,
+    /// The month's call cap is reached.
     CapReached,
+    /// The list was updated; its size.
     Updated(usize),
+    /// The update failed, with the reason; the list is as it was.
     Failed(String),
 }
 
@@ -587,6 +658,7 @@ pub fn parse_threatfox(v: &Value) -> Vec<(String, String, String)> {
         .filter_map(|r| {
             let ioc = r["ioc"].as_str()?.trim();
             let threat = r["threat_type"].as_str().unwrap_or("").to_string();
+            // Domains and URLs appear in links; the other indicator kinds do not.
             match r["ioc_type"].as_str()? {
                 "domain" => Some((ioc.trim_end_matches('.').to_ascii_lowercase(), "host".to_string(), threat)),
                 "url" => url::Url::parse(ioc).ok().map(|u| (u.to_string(), "url".to_string(), threat)),
@@ -622,11 +694,13 @@ pub async fn fetch_threatfox(
     Ok(parse_threatfox(&v))
 }
 
+/// Unit tests for the screening helpers.
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A link's host and its parent domains, lower-cased, for the address of a mail link too, and nothing for text that is not a link.
     #[test]
     fn hosts_and_parents() {
         assert_eq!(hosts_of("https://a.b.example.org/x"), vec!["a.b.example.org", "b.example.org", "example.org"]);
@@ -634,6 +708,7 @@ mod tests {
         assert!(hosts_of("not a url").is_empty());
     }
 
+    /// IP addresses, other ports and shorteners (also with `www.`) are flagged; ordinary links and mail links are not.
     #[test]
     fn builtin_checks() {
         assert!(builtin("https://192.0.2.1/").is_some());
@@ -645,6 +720,7 @@ mod tests {
         assert!(builtin("mailto:me@example.org").is_none());
     }
 
+    /// The next-check times, and the month a call is counted in (UTC).
     #[test]
     fn verdict_schedule() {
         let now = OffsetDateTime::now_utc();
@@ -654,6 +730,7 @@ mod tests {
         assert_eq!(period(time::macros::datetime!(2026-04-01 00:30 +01:00)), "2026-03", "counted in UTC");
     }
 
+    /// Domains and URLs are read (a domain lower-cased without its trailing dot); other indicator types are skipped.
     #[test]
     fn threatfox_rows() {
         let v = json!({"query_status": "ok", "data": [

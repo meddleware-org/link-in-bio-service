@@ -24,39 +24,50 @@ use super::{BankFeed, Credit, FeedBatch, FeedState, positive_minor};
 use crate::keys::{self, RsaKey};
 use crate::{BillingError, bank_transfer};
 
+/// The feed's id, as stored with its cursor.
 pub const ID: &str = "bunq";
+/// bunq's sandbox address, the default until a live address is configured.
 pub const SANDBOX: &str = "https://public-api.sandbox.bunq.com/v1";
 /// Payments per page, bunq's maximum.
 pub const PAGE: usize = 200;
 /// Pages read per account per poll.
 pub const MAX_PAGES: usize = 10;
 
+/// How to reach bunq and authenticate.
 #[derive(Debug)]
 pub struct Config {
+    /// The API's base address.
     pub api_base: String,
+    /// The API key, which registers the device and opens sessions.
     pub api_key: String,
+    /// The client's RSA key: its public half is sent at installation and its private half signs every request body.
     pub key: RsaKey,
     /// The IPs the device may call from (empty: bunq binds it to the address it is registered from).
     pub permitted_ips: Vec<String>,
+    /// The device's description, shown in bunq.
     pub description: String,
 }
 
+/// An open session: its token and the user it is for.
 #[derive(Clone)]
 struct Session {
+    /// The session token.
     token: String,
+    /// The bunq user id.
     user_id: u64,
 }
 
+/// The feed.
 pub struct Bunq {
+    /// The settings.
     config: Config,
+    /// The HTTP client.
     http: reqwest::Client,
+    /// The current session, kept in memory and dropped when bunq answers 401.
     session: Mutex<Option<Session>>,
 }
 
-fn unavailable(e: impl std::fmt::Display) -> BillingError {
-    BillingError::Unavailable(e.to_string())
-}
-
+/// A malformed-input error from a fixed message.
 fn bad(m: &str) -> BillingError {
     BillingError::Malformed(m.into())
 }
@@ -76,15 +87,19 @@ fn user_id(v: &Value) -> Option<u64> {
 /// The credits in a page of bunq payments: incoming (positive) amounts whose description holds a reference.
 pub fn credits_from_payments(account: u64, page: &Value) -> (Vec<Credit>, Option<u64>) {
     let mut out = Vec::new();
+    // The highest payment id seen, which becomes the account's cursor.
     let mut newest = None;
     for p in page["Response"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|o| o.get("Payment"))
     {
+        // A payment without an id is skipped.
         let Some(id) = p["id"].as_u64() else { continue };
+        // The newest payment id on the page becomes the next cursor.
         newest = newest.max(Some(id));
         let (Some(minor), Some(currency)) = (positive_minor(&p["amount"]["value"]), p["amount"]["currency"].as_str())
         else {
             continue;
         };
+        // The reference is read from the description the payer typed.
         let Some(reference) = bank_transfer::reference_in_text(p["description"].as_str().unwrap_or("")) else {
             continue;
         };
@@ -112,6 +127,7 @@ pub fn credits_from_payments(account: u64, page: &Value) -> (Vec<Credit>, Option
 }
 
 impl Bunq {
+    /// A feed from its settings and a client.
     pub fn new(config: Config, http: reqwest::Client) -> Self {
         Self { config, http, session: Mutex::new(None) }
     }
@@ -125,6 +141,7 @@ impl Bunq {
         body: Option<&Value>,
         server_key: Option<&str>,
     ) -> Result<Value, BillingError> {
+        // The request headers bunq requires are fixed, apart from a fresh request id.
         let url = format!("{}{path}", self.config.api_base.trim_end_matches('/'));
         let mut r = self
             .http
@@ -139,13 +156,16 @@ impl Bunq {
         }
         if let Some(b) = body {
             let bytes = b.to_string().into_bytes();
+            // Every body is signed with the client's key.
             let sig = STANDARD.encode(self.config.key.sign_sha256(&bytes)?);
             r = r.header("content-type", "application/json").header("x-bunq-client-signature", sig).body(bytes);
         }
-        let resp = r.send().await.map_err(unavailable)?;
+        // The status, the server's signature and the body are read before anything is believed.
+        let resp = r.send().await.map_err(crate::transport)?;
         let status = resp.status();
         let sig = resp.headers().get("x-bunq-server-signature").and_then(|v| v.to_str().ok()).map(String::from);
         let bytes = crate::read_limited(resp, crate::MAX_STATEMENT_BYTES).await?;
+        // An expired session is forgotten, so the next poll opens a new one.
         if status == reqwest::StatusCode::UNAUTHORIZED {
             *self.session.lock().await = None;
         }
@@ -159,6 +179,7 @@ impl Bunq {
                 BillingError::Refused(format!("bunq answered HTTP {}: {m}", status.as_u16()))
             });
         }
+        // Every answer after the installation must carry bunq's signature, checked against the server key from the installation; an answer without a valid one is not authentic.
         if let Some(k) = server_key {
             let valid =
                 sig.and_then(|s| STANDARD.decode(s).ok()).is_some_and(|s| keys::rsa_sha256_valid(k, &bytes, &s));
@@ -166,11 +187,13 @@ impl Bunq {
                 return Err(BillingError::Unauthentic);
             }
         }
+        // Only now is the body parsed.
         serde_json::from_slice(&bytes).map_err(|_| bad("bunq's answer is not JSON"))
     }
 
     /// Steps 1 and 2, once: the installation token and server key, kept in the state.
     async fn installation(&self, state: &mut Value) -> Result<(String, String), BillingError> {
+        // Already installed and registered: nothing to do.
         if let (Some(t), Some(k)) = (state["installationToken"].as_str(), state["serverPublicKey"].as_str())
             && state["device"].as_bool() == Some(true)
         {
@@ -198,6 +221,7 @@ impl Bunq {
                 (t.to_string(), k.to_string())
             }
         };
+        // The device is registered with the API key, optionally limited to some addresses.
         let mut device = json!({ "description": self.config.description, "secret": self.config.api_key });
         if !self.config.permitted_ips.is_empty() {
             device["permitted_ips"] = json!(self.config.permitted_ips);
@@ -209,6 +233,7 @@ impl Bunq {
 
     /// Step 3: a session (reused until bunq answers 401).
     async fn session(&self, installation: &str, server_key: &str) -> Result<Session, BillingError> {
+        // A session is reused until bunq refuses it.
         if let Some(s) = self.session.lock().await.clone() {
             return Ok(s);
         }
@@ -231,14 +256,17 @@ impl Bunq {
 
 #[async_trait::async_trait]
 impl BankFeed for Bunq {
+    /// The feed's id.
     fn id(&self) -> &'static str {
         ID
     }
 
+    /// Open the context, list the active monetary accounts and read each one's new payments after its own cursor, which is kept as a JSON map of account to the newest payment id.
     async fn fetch(&self, from: &FeedState, _now: OffsetDateTime) -> Result<FeedBatch, BillingError> {
         let mut state = if from.state.is_object() { from.state.clone() } else { json!({}) };
         let (installation, server_key) = self.installation(&mut state).await?;
         let session = self.session(&installation, &server_key).await?;
+        // One cursor per monetary account, as a JSON map.
         let mut cursors: BTreeMap<String, u64> =
             from.cursor.as_deref().and_then(|c| serde_json::from_str(c).ok()).unwrap_or_default();
         let accounts = self
@@ -255,11 +283,13 @@ impl BankFeed for Bunq {
             // Each entry is `{"MonetaryAccountBank": {…}}`, `{"MonetaryAccountSavings": {…}}`, …
             let Some(acc) = a.as_object().and_then(|o| o.values().next()) else { continue };
             let Some(id) = acc["id"].as_u64() else { continue };
+            // Closed accounts are skipped.
             if acc["status"].as_str().is_some_and(|s| s != "ACTIVE") {
                 continue;
             }
             for _ in 0..MAX_PAGES {
                 let newer = cursors.get(&id.to_string()).copied();
+                // After the first poll only payments newer than the cursor are asked for.
                 let q = match newer {
                     Some(n) => format!("?count={PAGE}&newer_id={n}"),
                     None => format!("?count={PAGE}"),

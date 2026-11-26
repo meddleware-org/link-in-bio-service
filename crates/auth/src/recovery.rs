@@ -3,17 +3,22 @@
 
 use sha2::{Digest, Sha256};
 
+/// How many codes are issued at a time.
 pub const COUNT: usize = 10;
+/// Crockford base32: digits and lower-case letters without `i`, `l`, `o` and `u`.
 const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
 /// New codes: what to show the person, and what to store.
 pub fn generate() -> (Vec<String>, Vec<Vec<u8>>) {
     let codes: Vec<String> = (0..COUNT).map(|_| encode(&crate::random_bytes::<10>())).collect();
+    // Only the hashes are stored; the codes are shown once.
     let hashes = codes.iter().map(|c| hash(c)).collect();
     (codes, hashes)
 }
 
+/// Write 80 bits as 16 base32 characters in four groups of four, joined by hyphens.
 fn encode(bytes: &[u8; 10]) -> String {
+    // The ten bytes are gathered into one number, then read back five bits at a time.
     let mut bits: u128 = 0;
     for b in bytes {
         bits = (bits << 8) | u128::from(*b);
@@ -43,10 +48,12 @@ pub fn hash(code: &str) -> Vec<u8> {
     Sha256::digest(code.as_bytes()).to_vec()
 }
 
+/// Unit tests for recovery codes.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A code survives being typed in upper case with spaces, hashes to the stored value, and look-alike letters fold; short input and letters outside the alphabet are refused.
     #[test]
     fn codes_round_trip_through_typing() {
         let (codes, hashes) = generate();

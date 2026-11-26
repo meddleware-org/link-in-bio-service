@@ -14,10 +14,14 @@ use crate::render::PageContext;
 /// The extension relation type for "this is the same person" (the microformats rel-me definition), used until "me"
 /// is in the IANA link-relations registry.
 pub const REL_ME: &str = "http://microformats.org/wiki/rel-me";
+/// The media type of an RFC 9264 link set in JSON.
 pub const LINKSET_TYPE: &str = "application/linkset+json";
+/// The media type of an ActivityPub object.
 pub const ACTIVITY_TYPE: &str = "application/activity+json";
 
+/// One link as a link-set target: its address, its title with the page's language, and its description when it has one.
 fn target(l: &Link, lang: &str) -> Value {
+    // The title uses the `title*` form, which carries a language, as RFC 9264 allows for human-readable text.
     let mut t = json!({ "href": l.url, "title*": [{ "value": l.title, "language": lang }] });
     if let Some(d) = &l.description {
         t["description"] = json!([d]);
@@ -31,26 +35,32 @@ fn target(l: &Link, lang: &str) -> Value {
 /// order; a group's own context (anchor `…#g-<id>`) lists that group's links as `item`. Identity links are repeated
 /// under [`REL_ME`]. The avatar is the `icon`; the ActivityPub actor, when served, is `describedby`.
 pub fn linkset(m: &Manifest, cx: &PageContext, profile_uri: &str) -> Value {
+    // Every title is tagged with the page's own language.
     let lang = m.meta.lang.as_str();
     let mut items = Vec::new();
     let mut contexts = Vec::new();
     for item in &m.items {
         match item {
+            // A visible top-level link is one target of the page's own context.
             Item::Link(l) if !l.hidden => items.push(target(l, lang)),
             Item::Group(g) => {
                 let links: Vec<Value> = g.items.iter().filter(|l| !l.hidden).map(|l| target(l, lang)).collect();
+                // A group whose links are all hidden is left out altogether.
                 if links.is_empty() {
                     continue;
                 }
+                // A group is a fragment of the page, so it can be both a target of the page and the anchor of its own context.
                 let anchor = format!("{}#g-{}", cx.canonical, g.id);
                 items.push(
                     json!({ "href": anchor, "title*": [{ "value": g.title, "language": lang }], "type": "text/html" }),
                 );
                 contexts.push(json!({ "anchor": anchor, "item": links }));
             }
+            // A hidden top-level link appears nowhere.
             Item::Link(_) => {}
         }
     }
+    // The person's own profiles, repeated under the `rel="me"` relation so a verifier can follow them.
     let me: Vec<Value> = m.visible_links().filter(|l| l.identity).map(|l| json!({ "href": l.url })).collect();
     let mut main = json!({ "anchor": cx.canonical, "item": items });
     if !me.is_empty() {
@@ -63,6 +73,7 @@ pub fn linkset(m: &Manifest, cx: &PageContext, profile_uri: &str) -> Value {
         main["describedby"] = json!([{ "href": actor, "type": ACTIVITY_TYPE }]);
     }
     main["profile"] = json!([{ "href": profile_uri }]);
+    // The page's own context first, then one context for each group.
     let mut linkset = vec![main];
     linkset.extend(contexts);
     json!({ "linkset": linkset })
@@ -76,6 +87,7 @@ pub fn linkset_header(linkset_url: &str, profile_uri: &str) -> String {
 /// schema.org ProfilePage JSON-LD.
 pub fn json_ld(m: &Manifest, cx: &PageContext) -> Value {
     let id = &m.identity;
+    // The thing the page is about: a person or an organisation, with the handle as its alternate name and identifier.
     let mut entity = json!({
         "@type": match id.kind { Kind::Person => "Person", Kind::Organization => "Organization" },
         "name": id.display_name,
@@ -89,6 +101,7 @@ pub fn json_ld(m: &Manifest, cx: &PageContext) -> Value {
     if let Some(a) = &cx.avatar {
         entity["image"] = json!(a.url);
     }
+    // `sameAs` lists the person's own profiles, which is what `rel="me"` says in the page.
     let same: Vec<&str> = m.visible_links().filter(|l| l.identity).map(|l| l.url.as_str()).collect();
     if !same.is_empty() {
         entity["sameAs"] = json!(same);
@@ -104,6 +117,7 @@ pub fn json_ld_for_html(m: &Manifest, cx: &PageContext) -> String {
 
 /// A WebFinger (RFC 7033) JRD for `acct:<handle>@<domain>`.
 pub fn webfinger(m: &Manifest, cx: &PageContext, domain: &str) -> Value {
+    // The profile page is always listed; the actor and the avatar only when the page has them.
     let mut links = vec![json!({
         "rel": "http://webfinger.net/rel/profile-page", "type": "text/html", "href": cx.canonical
     })];
@@ -113,6 +127,7 @@ pub fn webfinger(m: &Manifest, cx: &PageContext, domain: &str) -> Value {
     if let Some(a) = &cx.avatar {
         links.push(json!({ "rel": "http://webfinger.net/rel/avatar", "type": a.mime, "href": a.url }));
     }
+    // The page and the actor are both names for the same subject.
     let mut aliases = vec![json!(cx.canonical)];
     if let Some(actor) = &cx.actor_url {
         aliases.push(json!(actor));
@@ -126,13 +141,16 @@ const ACTOR_FIELDS: usize = 4;
 /// A read-only ActivityPub actor: the profile, its links as `PropertyValue` fields (with `rel="me"` on the person's
 /// own profiles so Mastodon can verify them), an empty outbox, follow requests held for approval and never approved.
 pub fn actor(m: &Manifest, cx: &PageContext, public_key_pem: Option<&str>) -> Value {
+    // Without an actor address the page has no actor.
     let Some(actor_url) = &cx.actor_url else { return Value::Null };
     let id = &m.identity;
     let fields: Vec<Value> = m
         .visible_links()
+        // Only web addresses become fields; an email link is not shown on a fediverse profile.
         .filter(|l| l.url.starts_with("https://"))
         .take(ACTOR_FIELDS)
         .map(|l| {
+            // The person's own profiles carry `me`, which is how Mastodon verifies a link; every link also carries `nofollow noopener noreferrer`.
             let rel = if l.identity { "me nofollow noopener noreferrer" } else { "nofollow noopener noreferrer" };
             let shown = crate::render::display_url(&l.url);
             json!({
@@ -156,7 +174,9 @@ pub fn actor(m: &Manifest, cx: &PageContext, public_key_pem: Option<&str>) -> Va
         "url": cx.canonical,
         "inbox": format!("{actor_url}/inbox"),
         "outbox": format!("{actor_url}/outbox"),
+        // Follow requests are never approved: the actor is read-only.
         "manuallyApprovesFollowers": true,
+        // The page's indexing choice also decides whether the actor is discoverable.
         "discoverable": m.meta.indexable,
         "attachment": fields,
     });
@@ -166,6 +186,7 @@ pub fn actor(m: &Manifest, cx: &PageContext, public_key_pem: Option<&str>) -> Va
     if let Some(av) = &cx.avatar {
         a["icon"] = json!({ "type": "Image", "mediaType": av.mime, "url": av.url });
     }
+    // The key is included only when the service has one for the actor.
     if let Some(pem) = public_key_pem {
         a["publicKey"] = json!({ "id": format!("{actor_url}#main-key"), "owner": actor_url, "publicKeyPem": pem });
     }
@@ -190,6 +211,7 @@ pub fn nostr_json(handle: &str, pubkey: &str) -> Value {
 
 /// RFC 9116 security.txt. `expires` is an RFC 3339 timestamp.
 pub fn security_txt(contact: &str, canonical: &str, expires: &str, policy: Option<&str>) -> String {
+    // The four fields every file needs: how to report, when the file expires, the language, and where the file is canonically served.
     let mut s = format!("Contact: {contact}\nExpires: {expires}\nPreferred-Languages: en\nCanonical: {canonical}\n");
     if let Some(p) = policy {
         s.push_str(&format!("Policy: {p}\n"));
@@ -197,19 +219,23 @@ pub fn security_txt(contact: &str, canonical: &str, expires: &str, policy: Optio
     s
 }
 
+/// Escape text for use inside an HTML element, for the HTML that ActivityPub fields carry.
 fn html_text(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// Escape text for use inside a double-quoted HTML attribute.
 fn html_attr(s: &str) -> String {
     html_text(s).replace('"', "&quot;")
 }
 
+/// Unit tests for the interop documents.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::{ParseOptions, parse};
 
+    /// A page with a profile link, a group, and a hidden link, and a bio that needs escaping.
     fn manifest() -> Manifest {
         parse(
             br#"{"schema":1,"identity":{"displayName":"Ada","handle":"ada","bio":"a < b"},
@@ -222,17 +248,20 @@ mod tests {
         .manifest
     }
 
+    /// The render test context, with an actor address added.
     fn cx() -> PageContext {
         let mut c = crate::render::tests::cx();
         c.actor_url = Some("https://ada.example.org/actor".into());
         c
     }
 
+    /// The link set keeps page order, leaves out hidden links, gives a group its own context and repeats the person's profiles under `rel="me"`.
     #[test]
     fn linkset_keeps_order_groups_and_identity() {
         let ls = linkset(&manifest(), &cx(), "https://example.org/spec/profile-links/v1");
         let main = &ls["linkset"][0];
         assert_eq!(main["anchor"], "https://example.org/");
+        // Two targets: the visible link and the group; the hidden link is not listed.
         assert_eq!(main["item"].as_array().unwrap().len(), 2, "hidden links are left out");
         assert_eq!(main["item"][1]["href"], "https://example.org/#g-tools");
         assert_eq!(main[REL_ME][0]["href"], "https://github.com/ada");
@@ -240,6 +269,7 @@ mod tests {
         assert_eq!(ls["linkset"][1]["item"][0]["href"], "https://docs.example.org/");
     }
 
+    /// Text that tries to close the script element is escaped, and reads back unchanged.
     #[test]
     fn json_ld_cannot_break_out_of_its_script_element() {
         let mut m = manifest();
@@ -250,6 +280,7 @@ mod tests {
         assert_eq!(back["mainEntity"]["name"], "</script><script>alert(1)</script>");
     }
 
+    /// The actor carries the handle, an escaped summary and `rel="me"` on the person's profile; the WebFinger answer names the account and links the actor.
     #[test]
     fn actor_and_webfinger() {
         let a = actor(&manifest(), &cx(), None);

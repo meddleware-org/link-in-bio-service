@@ -6,36 +6,51 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+/// Everything an API handler can fail with. Each kind has a status, a stable code and plain words; internal causes are logged, not returned.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
+    /// The request is not understood.
     #[error("{0}")]
     BadRequest(String),
+    /// Not signed in.
     #[error("sign in first")]
     Unauthorized,
+    /// Signed in but not allowed, with the reason.
     #[error("{0}")]
     Forbidden(&'static str),
+    /// There is nothing at this address that the caller may see.
     #[error("not found")]
     NotFound,
     /// No route has this path and method (the routers' fallback).
     #[error("no such route")]
     NoRoute,
+    /// The request clashes with the current state.
     #[error("{0}")]
     Conflict(String),
+    /// The request is understood but its content is refused.
     #[error("{0}")]
     Unprocessable(String),
     /// Validation problems with the page document, by path.
     #[error("the page document has problems")]
     Issues(Vec<link_in_bio_core::Issue>),
+    /// A dependency is down.
     #[error("{0}")]
     Unavailable(&'static str),
     /// A per-account limit is reached: which one and when it resets, in plain words, and the seconds until then.
     #[error("{message}")]
-    TooMany { message: String, retry_after: u64 },
+    TooMany {
+        /// Which limit was reached and when it resets, in plain words.
+        message: String,
+        /// The seconds until the limit resets (the `Retry-After` header).
+        retry_after: u64,
+    },
+    /// Something unexpected; the cause is logged, not returned.
     #[error("something went wrong; try again")]
     Internal,
 }
 
 impl ApiError {
+    /// The status and the stable code for each kind of error.
     fn status_code(&self) -> (StatusCode, &'static str) {
         match self {
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
@@ -54,7 +69,9 @@ impl ApiError {
 }
 
 impl IntoResponse for ApiError {
+    /// The JSON answer: the plain-words error, the machine code, any issues or the retry time, never cached.
     fn into_response(self) -> Response {
+        // A rate limit also sets `Retry-After`.
         let (status, code) = self.status_code();
         let mut body = json!({ "error": self.to_string(), "code": code });
         if let ApiError::Issues(issues) = &self {
@@ -73,10 +90,12 @@ impl IntoResponse for ApiError {
 }
 
 impl From<link_in_bio_store::DbError> for ApiError {
+    /// A database error is logged and answered as "unavailable", never with its text.
     fn from(e: link_in_bio_store::DbError) -> Self {
         tracing::error!(error = %e, "database");
         ApiError::Unavailable("the database is unavailable; try again shortly")
     }
 }
 
+/// A result that fails with an API error.
 pub type ApiResult<T> = Result<T, ApiError>;

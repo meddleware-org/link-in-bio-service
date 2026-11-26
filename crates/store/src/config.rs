@@ -10,19 +10,25 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{ConnectOptions, Executor};
 use url::Url;
 
+/// Why the database settings were refused. No variant carries the URL or the password: a rejected value is named by its part, never repeated.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
+    /// A required variable is not set; its name follows.
     #[error("{0} is not set")]
     Missing(&'static str),
+    /// The value is not a `postgres://` URL.
     #[error("DATABASE_URL is not a valid postgres:// URL")]
     NotAUrl,
+    /// The URL lacks a part (host, user, password or database name).
     #[error("DATABASE_URL has no {0}")]
     Incomplete(&'static str),
     #[error(
         "DATABASE_URL must use sslmode=verify-full with sslrootcert=<the tier's CA> (set ALLOW_INSECURE_DATABASE=1 \
          only for a local test server)"
     )]
+    /// The URL does not ask for `sslmode=verify-full` with the tier's CA, and the insecure switch is off.
     NotVerifyFull,
+    /// The URL carries a query parameter other than `sslmode`, `sslrootcert` and `application_name`; only the parameter's name is kept.
     #[error("DATABASE_URL parameter {0} is not allowed (only sslmode, sslrootcert and application_name)")]
     UnknownParameter(String),
 }
@@ -40,11 +46,14 @@ pub enum Access {
 /// Parsed connection settings for one role.
 #[derive(Clone)]
 pub struct DatabaseSettings {
+    /// The URL, kept private: it holds the password.
     url: Url,
+    /// Whether the connection verifies the server certificate and host name.
     tls: bool,
 }
 
 impl fmt::Debug for DatabaseSettings {
+    /// Print the settings without the password.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DatabaseSettings")
             .field("host", &self.url.host_str().unwrap_or_default())
@@ -60,7 +69,9 @@ impl fmt::Debug for DatabaseSettings {
 impl DatabaseSettings {
     /// Parse a URL. Without `allow_insecure` only `sslmode=verify-full` with `sslrootcert` is accepted.
     pub fn parse(raw: &str, allow_insecure: bool) -> Result<Self, ConfigError> {
+        // The parser's own error is not used: it can quote the input.
         let url = Url::parse(raw).map_err(|_| ConfigError::NotAUrl)?;
+        // Only PostgreSQL URLs.
         if !matches!(url.scheme(), "postgres" | "postgresql") {
             return Err(ConfigError::NotAUrl);
         }
@@ -70,12 +81,14 @@ impl DatabaseSettings {
         if url.username().is_empty() {
             return Err(ConfigError::Incomplete("user"));
         }
+        // A password is required: the service never connects without one.
         if url.password().is_none_or(str::is_empty) {
             return Err(ConfigError::Incomplete("password"));
         }
         if url.path().trim_start_matches('/').is_empty() {
             return Err(ConfigError::Incomplete("database name"));
         }
+        // The two TLS settings, read from the query.
         let mut sslmode = None;
         let mut root = None;
         for (k, v) in url.query_pairs() {
@@ -83,10 +96,13 @@ impl DatabaseSettings {
                 "sslmode" => sslmode = Some(v.into_owned()),
                 "sslrootcert" => root = Some(v.into_owned()),
                 "application_name" => {}
+                // Any other parameter could change how the connection behaves, so it is refused by name.
                 other => return Err(ConfigError::UnknownParameter(other.to_owned())),
             }
         }
+        // Verify-full means the certificate chain and the host name are both checked against the tier's CA.
         let verify_full = sslmode.as_deref() == Some("verify-full") && root.as_deref().is_some_and(|r| !r.is_empty());
+        // A weaker setting is accepted only behind the explicit local-test switch.
         if !verify_full && !allow_insecure {
             return Err(ConfigError::NotVerifyFull);
         }
@@ -95,19 +111,24 @@ impl DatabaseSettings {
 
     /// From the process environment (`get` is `std::env::var(..).ok()` in production, a map in tests).
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        // The variable must be set and not empty.
         let url = get("DATABASE_URL").filter(|v| !v.is_empty()).ok_or(ConfigError::Missing("DATABASE_URL"))?;
+        // Exactly `1`; anything else leaves the switch off.
         let insecure = get("ALLOW_INSECURE_DATABASE").is_some_and(|v| v == "1");
         Self::parse(&url, insecure)
     }
 
+    /// The database user.
     pub fn user(&self) -> &str {
         self.url.username()
     }
 
+    /// The database name.
     pub fn database(&self) -> &str {
         self.url.path().trim_start_matches('/')
     }
 
+    /// Whether the connection verifies the server certificate.
     pub fn tls_enabled(&self) -> bool {
         self.tls
     }
@@ -121,6 +142,7 @@ impl DatabaseSettings {
     pub fn with_credentials(&self, user: &str, password: &str, database: &str) -> DatabaseSettings {
         let mut url = self.url.clone();
         // Setting these on a URL that already has a host cannot fail.
+        // Setting these on a URL that has a host cannot fail.
         let _ = url.set_username(user);
         let _ = url.set_password(Some(password));
         url.set_path(&format!("/{database}"));
@@ -133,18 +155,21 @@ impl DatabaseSettings {
         if self.tls {
             o = o.ssl_mode(PgSslMode::VerifyFull);
         }
+        // Statement logging is off because queries can carry people's text.
         Ok(o.application_name("link-in-bio").disable_statement_logging())
     }
 
     /// A pool of at most `size` connections; nothing connects until the first use, so a process starts (and
     /// answers its health check) while the database is unreachable.
     pub fn lazy_pool(&self, size: u32, access: Access) -> Result<PgPool, ConfigError> {
+        // A small pool with a short acquire timeout, so a request fails fast when the database is unreachable.
         let options = PgPoolOptions::new()
             .max_connections(size.max(1))
             .acquire_timeout(Duration::from_secs(5))
             .idle_timeout(Duration::from_secs(300));
         let options = match access {
             Access::ReadWrite => options,
+            // Every connection of a read-only pool also sets the session read-only.
             Access::ReadOnly => options.after_connect(|conn, _meta| {
                 Box::pin(async move {
                     conn.execute("SET default_transaction_read_only = on").await?;
@@ -152,17 +177,21 @@ impl DatabaseSettings {
                 })
             }),
         };
+        // Lazy: nothing connects until first use.
         Ok(options.connect_lazy_with(self.connect_options()?))
     }
 }
 
+/// Unit tests for the connection settings.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A valid URL, with a stand-in password.
     const GOOD: &str =
         "postgres://lib_app:s3cret@db.example:5432/link_in_bio?sslmode=verify-full&sslrootcert=/etc/ca.crt";
 
+    /// A URL with verify-full and a root certificate is accepted, with TLS on.
     #[test]
     fn verify_full_with_a_root_is_accepted() {
         let s = DatabaseSettings::parse(GOOD, false).expect("valid");
@@ -170,6 +199,7 @@ mod tests {
         assert_eq!((s.user(), s.database()), ("lib_app", "link_in_bio"));
     }
 
+    /// No setting weaker than verify-full is accepted, except plaintext behind the explicit local-test switch.
     #[test]
     fn every_weaker_tls_setting_is_refused() {
         for url in [
@@ -187,6 +217,7 @@ mod tests {
         assert!(!s.tls_enabled());
     }
 
+    /// Other schemes, text that is not a URL, a missing user, password or database, and an unknown parameter are each refused with their own error.
     #[test]
     fn incomplete_or_foreign_urls_are_refused() {
         let cases = [
@@ -205,6 +236,7 @@ mod tests {
         }
     }
 
+    /// The password is in neither the `Debug` output nor an error message.
     #[test]
     fn the_password_never_appears_in_debug_or_errors() {
         let s = DatabaseSettings::parse(GOOD, false).expect("valid");
@@ -214,6 +246,7 @@ mod tests {
         assert!(!e.to_string().contains("s3cret"));
     }
 
+    /// The URL is required, and only the exact value `1` turns the insecure switch on.
     #[test]
     fn from_env_needs_the_url_and_reads_the_insecure_switch() {
         let none = |_: &str| None;
@@ -232,6 +265,7 @@ mod tests {
         assert_eq!(DatabaseSettings::from_env(not_one).unwrap_err(), ConfigError::NotVerifyFull);
     }
 
+    /// Other credentials and another database keep the server and the TLS settings.
     #[test]
     fn credentials_can_be_swapped_keeping_tls() {
         let s = DatabaseSettings::parse(GOOD, false).expect("valid");

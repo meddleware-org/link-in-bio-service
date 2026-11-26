@@ -4,8 +4,11 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+/// The colour ramps and the semantic roles, as the design-tokens package publishes them.
 pub const TOKENS_JSON: &str = include_str!("../tokens/tokens.json");
+/// The tokens' stylesheet: custom properties for light and dark.
 pub const TOKENS_CSS: &str = include_str!("../tokens/tokens.css");
+/// The seasonal palettes' stylesheet.
 pub const SEASONS_CSS: &str = include_str!("../tokens/seasons.css");
 
 /// sRGB colour.
@@ -13,23 +16,28 @@ pub const SEASONS_CSS: &str = include_str!("../tokens/seasons.css");
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
+    /// Parse `#rgb` or `#rrggbb`; anything else is `None`.
     pub fn parse(hex: &str) -> Option<Self> {
         let h = hex.trim().strip_prefix('#')?;
+        // A three-digit colour is expanded by doubling each digit.
         let h = match h.len() {
             3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
             6 => h.to_string(),
             _ => return None,
         };
+        // The six digits are one number; its bytes are the three channels.
         let v = u32::from_str_radix(&h, 16).ok()?;
         Some(Self((v >> 16) as u8, (v >> 8) as u8, v as u8))
     }
 
+    /// The colour as lower-case `#rrggbb`.
     pub fn hex(self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.0, self.1, self.2)
     }
 
     /// WCAG 2.x relative luminance.
     pub fn luminance(self) -> f64 {
+        /// One channel, linearised as WCAG defines it.
         fn ch(c: u8) -> f64 {
             let s = f64::from(c) / 255.0;
             if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
@@ -40,6 +48,7 @@ impl Rgb {
     /// WCAG 2.x contrast ratio (1–21).
     pub fn contrast(self, other: Rgb) -> f64 {
         let (a, b) = (self.luminance(), other.luminance());
+        // The ratio is lighter over darker, each with 0.05 added, as WCAG defines it.
         let (hi, lo) = if a > b { (a, b) } else { (b, a) };
         (hi + 0.05) / (lo + 0.05)
     }
@@ -48,12 +57,16 @@ impl Rgb {
 /// Colour mode a value belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Mode {
+    /// The light colour mode.
     Light,
+    /// The dark colour mode.
     Dark,
 }
 
 impl Mode {
+    /// Both modes.
     pub const ALL: [Mode; 2] = [Mode::Light, Mode::Dark];
+    /// The mode's name, as used in the token files.
     pub fn as_str(self) -> &'static str {
         match self {
             Mode::Light => "light",
@@ -77,18 +90,23 @@ pub struct Tokens {
 }
 
 impl Tokens {
+    /// The vendored tokens, parsed on first use; a parse failure is a build-time mistake in the vendored files, so it panics.
     pub fn get() -> &'static Tokens {
+        /// The one parsed copy.
         static T: OnceLock<Tokens> = OnceLock::new();
         T.get_or_init(|| Tokens::parse(TOKENS_JSON, SEASONS_CSS).expect("vendored design tokens parse"))
     }
 
+    /// The colour of a semantic role (`bg`, `surface`, `text`, …) in a mode. Panics for an unknown role, which is a programming error: the roles are fixed by the token files.
     pub fn role(&self, mode: Mode, role: &str) -> Rgb {
         self.semantic[&mode][role]
     }
 
+    /// Read the ramps (primary, brand and secondary hues, then the neutral ramp), the semantic roles of both modes and the season accents.
     pub fn parse(json: &str, seasons_css: &str) -> Result<Tokens, String> {
         let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         let mut ramps = BTreeMap::new();
+        // The hue groups of the token file; each holds named ramps.
         for group in ["primary", "brand", "secondary"] {
             let obj = v[group].as_object().ok_or(format!("tokens.json: {group}"))?;
             for (name, shades) in obj {
@@ -103,16 +121,19 @@ impl Tokens {
                 ramps.insert(name.clone(), map);
             }
         }
+        // The neutral ramp is a group of its own.
         ramps.insert("neutral".into(), shade_map(&v["neutral"])?);
         let mut semantic = BTreeMap::new();
         for mode in Mode::ALL {
             semantic.insert(mode, shade_map(&v["semantic"][mode.as_str()])?);
         }
+        // Season accents are read from the seasons stylesheet, resolving their `var(--mw-…)` references against the ramps.
         let season_accents = parse_seasons(seasons_css, &ramps)?;
         Ok(Tokens { ramps, semantic, season_accents })
     }
 }
 
+/// Read an object of `shade -> hex colour` into colours.
 fn shade_map(v: &serde_json::Value) -> Result<BTreeMap<String, Rgb>, String> {
     let obj = v.as_object().ok_or("tokens.json: expected an object")?;
     obj.iter()
@@ -137,8 +158,10 @@ fn resolve(value: &str, ramps: &BTreeMap<String, BTreeMap<String, Rgb>>) -> Opti
 fn parse_seasons(css: &str, ramps: &BTreeMap<String, BTreeMap<String, Rgb>>) -> Result<SeasonAccents, String> {
     let mut out: BTreeMap<String, BTreeMap<Mode, (Rgb, Rgb)>> = BTreeMap::new();
     for (selector, body) in css_rules(css) {
+        // The first selector of a rule says which season and mode it is for.
         let first = selector.split(',').next().unwrap_or("").trim();
         let Some(season) = first.split("data-season=\"").nth(1).and_then(|s| s.split('"').next()) else { continue };
+        // Rules without the dark attribute are the light mode's.
         let mode = if first.contains("data-theme=\"dark\"") { Mode::Dark } else { Mode::Light };
         let decl = |name: &str| {
             body.split(';').find_map(|d| {
@@ -158,6 +181,7 @@ fn parse_seasons(css: &str, ramps: &BTreeMap<String, BTreeMap<String, Rgb>>) -> 
 
 /// Splits CSS into `(selector, body)` pairs, ignoring comments and at-rules' nesting (the token files are flat).
 pub fn css_rules(css: &str) -> Vec<(String, String)> {
+    // Comments are removed first so a brace inside one cannot confuse the split.
     let css = strip_comments(css);
     let mut out = Vec::new();
     let mut rest = css.as_str();
@@ -171,6 +195,7 @@ pub fn css_rules(css: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Remove `/* … */` comments; an unterminated comment drops the rest of the text.
 pub fn strip_comments(css: &str) -> String {
     let mut out = String::with_capacity(css.len());
     let mut rest = css;
@@ -185,10 +210,12 @@ pub fn strip_comments(css: &str) -> String {
     out
 }
 
+/// Unit tests for the colour maths and the vendored tokens.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Black on white is 21:1, and mid grey on white matches the published WCAG figure.
     #[test]
     fn contrast_matches_wcag_reference_values() {
         let white = Rgb(255, 255, 255);
@@ -197,6 +224,7 @@ mod tests {
         assert!((Rgb::parse("#777").unwrap().contrast(white) - 4.478).abs() < 0.01);
     }
 
+    /// The vendored files parse, the light background is the expected colour, and every season has a light and a dark accent.
     #[test]
     fn vendored_tokens_parse() {
         let t = Tokens::get();

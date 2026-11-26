@@ -16,33 +16,45 @@ use crate::{
     Refunded, Seller, hmac_sha256, same, send_json,
 };
 
+/// The provider id recorded in the ledger and used as the prefix of the method id.
 pub const ID: &str = "paddle";
+/// The webhook header that carries the signature, lower-cased as the router passes header names.
 pub const SIGNATURE_HEADER: &str = "paddle-signature";
 /// Notifications older (or newer) than this are refused.
 pub const MAX_AGE_SECS: i64 = 300;
 
+/// How to reach Paddle and what the method costs.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// `https://sandbox-api.paddle.com` or `https://api.paddle.com`.
     pub api_base: String,
+    /// The API key, sent as a bearer token on every API call.
     pub api_key: String,
+    /// The secret the webhook signature is made with.
     pub webhook_secret: String,
     /// The catalog price of one month (`pri_…`).
     pub price_id: String,
+    /// The method's fixed fee in pence, used to work out the minimum months.
     pub fixed_pence: u32,
+    /// The method's percentage fee in basis points.
     pub percent_bps: u32,
 }
 
+/// The adapter.
 pub struct Paddle {
+    /// The settings.
     config: Config,
+    /// The HTTP client for API calls.
     http: reqwest::Client,
 }
 
 impl Paddle {
+    /// An adapter from its settings and a client.
     pub fn new(config: Config, http: reqwest::Client) -> Self {
         Self { config, http }
     }
 
+    /// A request to the API with the API key.
     fn req(&self, m: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.http
             .request(m, format!("{}{path}", self.config.api_base.trim_end_matches('/')))
@@ -54,6 +66,7 @@ impl Paddle {
 /// transaction with any other set of items is not one this service created, so it says nothing (`None`).
 pub fn bought(transaction: &Value) -> Option<Paid> {
     let items = transaction["items"].as_array()?;
+    // A transaction this service created has exactly one item.
     let [item] = items.as_slice() else { return None };
     let price_id = item["price"]["id"].as_str().or_else(|| item["price_id"].as_str())?;
     Some(Paid::Quantity { quantity: u32::try_from(item["quantity"].as_u64()?).ok()?, price_id: price_id.to_string() })
@@ -73,10 +86,12 @@ pub fn h1(secret: &str, ts: &str, body: &[u8]) -> String {
 
 #[async_trait::async_trait]
 impl BillingProvider for Paddle {
+    /// The provider id.
     fn id(&self) -> &'static str {
         ID
     }
 
+    /// One method, Paddle's hosted checkout, where Paddle is the seller and handles the tax.
     fn methods(&self) -> Vec<Method> {
         vec![Method {
             id: format!("{ID}:checkout"),
@@ -88,6 +103,7 @@ impl BillingProvider for Paddle {
         }]
     }
 
+    /// Create a transaction for the catalog price with the months as the quantity; the buyer pays on Paddle's hosted checkout.
     async fn create_checkout(&self, req: &CheckoutRequest) -> Result<CheckoutStart, BillingError> {
         if req.method != format!("{ID}:checkout") {
             return Err(BillingError::NotOffered);
@@ -97,6 +113,7 @@ impl BillingProvider for Paddle {
             "custom_data": { "checkout": req.checkout_id.to_string(), "ref": req.billing_ref },
         })))
         .await?;
+        // Paddle puts the object under `data`.
         let d = &v["data"];
         let (Some(id), Some(url)) = (d["id"].as_str(), d["checkout"]["url"].as_str()) else {
             return Err(BillingError::Malformed(
@@ -107,6 +124,7 @@ impl BillingProvider for Paddle {
         Ok(CheckoutStart { provider_ref: id.into(), client: json!({ "kind": "redirect", "provider": ID, "url": url }) })
     }
 
+    /// Verify the signature and its age, then read a completed transaction (paid, with what was bought), a cancelled one, or an approved refund (measured against what the transaction was paid in the buyer's currency).
     async fn verify_notification(
         &self,
         headers: &BTreeMap<String, String>,
@@ -114,6 +132,7 @@ impl BillingProvider for Paddle {
         now: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
         let header = headers.get(SIGNATURE_HEADER).ok_or(BillingError::Unauthentic)?;
+        // The timestamp, and every `h1` signature in the header (Paddle sends two while a secret is being rotated).
         let mut ts = None;
         let mut sigs = Vec::new();
         for part in header.split(';') {
@@ -125,16 +144,20 @@ impl BillingProvider for Paddle {
         }
         let ts = ts.ok_or(BillingError::Unauthentic)?;
         let t: i64 = ts.parse().map_err(|_| BillingError::Unauthentic)?;
+        // A signature too old or too far in the future is refused, which stops a recorded webhook being replayed later.
         if (now.unix_timestamp() - t).abs() > MAX_AGE_SECS {
             return Err(BillingError::Unauthentic);
         }
         let want = h1(&self.config.webhook_secret, &ts, body);
+        // Any one signature matching is enough, compared in constant time.
         if !sigs.iter().any(|s| same(s.as_bytes(), want.as_bytes())) {
             return Err(BillingError::Unauthentic);
         }
         let v: Value = serde_json::from_slice(body).map_err(|e| BillingError::Malformed(e.to_string()))?;
+        // The event's id.
         let event = v["event_id"].as_str().unwrap_or("").to_string();
         let d = &v["data"];
+        // Only completed and cancelled transactions and approved refunds are acted on.
         match v["event_type"].as_str() {
             Some("transaction.completed") | Some("transaction.paid") => {
                 let id = d["id"].as_str().ok_or_else(|| BillingError::Malformed("no transaction id".into()))?;
@@ -169,6 +192,7 @@ impl BillingProvider for Paddle {
                 let refunded =
                     minor(&d["totals"]["total"]).ok_or_else(|| BillingError::Malformed("no refund total".into()))?;
                 // The refund is in the buyer's currency: measured against what the transaction was paid in it.
+                // The original transaction is read to know what was paid in the refund's currency.
                 let paid = self.transaction(id).await?;
                 let of = minor(&paid["details"]["totals"]["grand_total"])
                     .ok_or_else(|| BillingError::Malformed("the transaction has no total".into()))?;
@@ -185,6 +209,7 @@ impl BillingProvider for Paddle {
         }
     }
 
+    /// Ask Paddle how a transaction stands.
     async fn checkout_outcome(&self, provider_ref: &str) -> Result<Outcome, BillingError> {
         let v = self.transaction(provider_ref).await?;
         Ok(match v["status"].as_str() {
@@ -194,6 +219,7 @@ impl BillingProvider for Paddle {
         })
     }
 
+    /// The quantity and price Paddle says the transaction bought, so the app can check it equals the checkout.
     async fn paid_facts(&self, provider_ref: &str) -> Result<Option<Paid>, BillingError> {
         Ok(bought(&self.transaction(provider_ref).await?))
     }
@@ -202,6 +228,7 @@ impl BillingProvider for Paddle {
 impl Paddle {
     /// A transaction as Paddle reports it now (`GET /transactions/{id}`, its `data`).
     async fn transaction(&self, id: &str) -> Result<Value, BillingError> {
+        // A transaction id starts with `txn_` and is alphanumeric; anything else is not put in a request path.
         if !id.starts_with("txn_") || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
             return Err(BillingError::Malformed("not a transaction id".into()));
         }

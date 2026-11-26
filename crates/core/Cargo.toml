@@ -1,26 +1,39 @@
+# Link in Bio's core crate: the page document (the manifest) and the parser that is the trust boundary, the theme and contrast
+# model, the page renderer and the interoperable documents. Pure: no I/O, no async runtime and no clock, so every rule in it can be
+# tested without a database or a network, and the other crates depend on it rather than the reverse.
+# Fields that are not inherited.
 [package]
 name = "link-in-bio-core"
 description = "Link in Bio: the manifest and its parser (the trust boundary), the theme and contrast model, the page renderer and the interoperable documents. Pure: no I/O."
+# Version, edition, minimum Rust, licence and repository come from the workspace manifest, so every crate in the workspace is released together.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Inherited: no crate here is published to crates.io.
 publish.workspace = true
 
+# Runtime dependencies are versioned once, in the workspace manifest.
+# The documents are JSON (`serde`, `serde_json`); links and handles are parsed with `url`; text is normalised and counted with the two Unicode crates.
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 url.workspace = true
 unicode-segmentation.workspace = true
 unicode-normalization.workspace = true
+# `maud` builds the HTML with automatic escaping, so a typed string can never become markup.
 maud.workspace = true
+# The hash and its hex form give the embedded files their content-addressed names.
 sha2.workspace = true
 hex.workspace = true
+# Renders the Profile Links specification (Markdown) to the HTML page served at the profile address.
 pulldown-cmark.workspace = true
 
+# Test-only: property tests of the parser and the renderer.
 [dev-dependencies]
 proptest.workspace = true
 
+# The workspace's lint set, including the documentation lints.
 [lints]
 workspace = true

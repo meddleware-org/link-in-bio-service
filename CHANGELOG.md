@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Documentation pass (workspace documentation standard, D144).** Every file has a header and line-level comments, and every item,
+  struct field and enum variant has a doc comment; `missing_docs` and `clippy::missing_docs_in_private_items` are `deny` in the workspace
+  lints. `CONTRIBUTING.md` is new. Applied migrations are untouched (their checksums include comments). Doc fixes found on the way: a
+  misplaced doc in `chain_payments.rs`, a stale `ceil_div` doc in `refunds.rs`, and swapped `find` / `debtor_of` docs in `bank_transfer.rs`.
+- **The page's stylesheet and script are shipped without comments.** The sources are now commented line by line, so `assets.rs` removes the
+  comments when it embeds `page.css` and `enhance.js`. A visitor downloads only the code; the hashed asset paths change with the content, as
+  they do with any release.
+- **Provider errors no longer repeat the address that was called.** A failed call to a payment provider, bank feed or wallet server used to put
+  the full request address (path and query included) into the error text, which reaches the logs and a bank feed's stored last error;
+  the text now says what failed, not where (audit F37).
+- The CLI's `--help` now describes each argument (the `check`, `render`, `worker`, `account` and `bank-feed` subcommands had undocumented ones).
 - CI: `HOME=/root` is set on the browser-test command only, not the whole job, so the runner no longer warns that it cannot read
   `/root/.docker/config.json`.
 

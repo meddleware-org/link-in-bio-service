@@ -24,26 +24,35 @@ use crate::time::rfc3339_full as ts;
 /// Codes one request may issue.
 pub const MAX_CODES_PER_REQUEST: usize = 100;
 
+/// The audit actor for an operator: `operator:<their Access subject>`.
 fn actor(op: &Operator) -> String {
     format!("operator:{}", op.subject)
 }
 
+/// An account as the console lists it.
 fn account_row(a: &Account) -> Value {
     json!({
         "id": a.id, "handle": a.handle, "status": a.status, "suspensionKind": a.suspension_kind,
         "suspensionReason": a.suspension_reason, "suspendedUntil": a.suspended_until.map(ts), "free": a.free,
+        // The operator's flags and tags.
         "operator": a.operator, "mayShareInvites": a.may_share_invites, "invitedBy": a.invited_by, "tags": a.tags,
         "country": a.country_declared, "paidUntil": a.paid_until.map(ts), "createdAt": ts(a.created_at),
     })
 }
 
+/// The operator who is signed in.
 async fn me(Extension(op): Extension<Operator>) -> Json<Value> {
     Json(json!({ "subject": op.subject, "name": op.display_name }))
 }
 
+/// Counts, queues, the switches and Web Risk's budget for the console's front page.
 async fn overview(State(app): State<Shared>) -> ApiResult<Json<Value>> {
+    // The Web Risk figures come from the configuration and the counters, because the console holds no key.
+    // The counts come from one query.
     let s = app.store.stats(now()).await?;
+    // The switches and Web Risk budgets are read from the configuration.
     let c = &app.config;
+    // The lists exist in update mode only.
     // The lists exist in update mode only.
     let lists: Vec<Value> = if c.web_risk_mode == super::config::WebRiskMode::Update {
         app.store
@@ -67,6 +76,7 @@ async fn overview(State(app): State<Shared>) -> ApiResult<Json<Value>> {
         "appealsOpen": s.appeals_open,
         "links": { "flagged": s.links_flagged, "unknown": s.links_unknown },
         "storageBytes": s.storage_bytes,
+        // Checkouts not yet paid or expired.
         "checkoutsOpen": s.checkouts_open,
         // Where each bank feed left off (never its stored state, which holds the feed's own credentials).
         "bankFeeds": app.store.bank_feeds().await?.into_iter().map(|f| json!({
@@ -102,20 +112,27 @@ async fn overview(State(app): State<Shared>) -> ApiResult<Json<Value>> {
     })))
 }
 
+/// The query of the account list.
 #[derive(Deserialize)]
 struct ListQuery {
+    /// A handle prefix; none lists everyone.
     q: Option<String>,
+    /// How many to skip, for paging.
     #[serde(default)]
     offset: i64,
 }
 
+/// Accounts by handle prefix, 100 at a time.
 async fn accounts(State(app): State<Shared>, Query(q): Query<ListQuery>) -> ApiResult<Json<Value>> {
+    // A hundred at a time, with a non-negative offset.
     let rows = app.store.accounts(q.q.as_deref().unwrap_or(""), 100, q.offset.max(0)).await?;
     Ok(Json(json!({ "accounts": rows.iter().map(account_row).collect::<Vec<_>>() })))
 }
 
+/// One account with its page, the accounts it invited, its invites, billing, domains and audit trail.
 async fn account(State(app): State<Shared>, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     let a = app.store.account(id).await?.ok_or(ApiError::NotFound)?;
+    // The page row, for its published document and version.
     let page = app.store.page(id).await?;
     Ok(Json(json!({
         "account": account_row(&a),
@@ -135,22 +152,29 @@ async fn account(State(app): State<Shared>, Path(id): Path<Uuid>) -> ApiResult<J
     })))
 }
 
+/// The body of a change to an account's operator flags.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Flags {
+    /// Whether it is one of the operator's own accounts.
     operator: bool,
+    /// Whether it is free.
     free: bool,
+    /// Whether its invite codes may still be redeemed.
     may_share_invites: bool,
+    /// Free-form tags (at most 16, each at most 32 characters, lower-cased).
     #[serde(default)]
     tags: Vec<String>,
 }
 
+/// Set an account's operator flags and tags (audited), and forget its cached page.
 async fn flags(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Path(id): Path<Uuid>,
     Json(f): Json<Flags>,
 ) -> ApiResult<StatusCode> {
+    // Tags are trimmed, lower-cased, at most 32 characters each and at most 16.
     let tags: Vec<String> = f
         .tags
         .iter()
@@ -158,6 +182,7 @@ async fn flags(
         .filter(|t| !t.is_empty() && t.len() <= 32)
         .take(16)
         .collect();
+    // No account with this id.
     if !app.store.set_flags(id, f.operator, f.free, f.may_share_invites, &tags).await? {
         return Err(ApiError::NotFound);
     }
@@ -173,17 +198,20 @@ async fn flags(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Forget the account's cached page in this process, so a change shows at once.
 async fn forget_account(app: &Shared, id: Uuid) {
     if let Ok(Some(a)) = app.store.account(id).await {
         app.pages.forget(&format!("{}.{}", a.handle, app.config.pages_domain)).await;
     }
 }
 
+/// The body of a suspension.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Suspend {
     /// `policy` (410) or `legal` (451).
     kind: String,
+    /// The reason, recorded with the suspension.
     reason: String,
     /// Days, for a temporary suspension; none for an indefinite one.
     days: Option<i64>,
@@ -193,23 +221,30 @@ struct Suspend {
     statement: String,
 }
 
+/// Suspend an account (policy: 410, legal: 451), with a statement of reasons, audited; the account's page and sessions stop at once.
 async fn suspend(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Path(id): Path<Uuid>,
     Json(b): Json<Suspend>,
 ) -> ApiResult<StatusCode> {
+    // A suspension needs a reason and a statement of reasons, and may be tied to the report it acts on, which is then recorded as actioned.
+    // Only the two kinds of suspension exist.
     if !["policy", "legal"].contains(&b.kind.as_str()) {
         return Err(ApiError::Unprocessable("kind is policy or legal".into()));
     }
+    // The account holder is owed a statement of reasons.
     if b.reason.trim().is_empty() || b.statement.trim().is_empty() {
         return Err(ApiError::Unprocessable("A reason and a statement of reasons are required.".into()));
     }
     let n = now();
+    // A suspension of 1 to 365 days ends by itself; anything else is indefinite.
     let until = b.days.filter(|d| (1..=365).contains(d)).map(|d| n + Duration::days(d));
+    // No account with this id, or it is deleted.
     if !app.store.suspend(id, &b.kind, b.reason.trim(), until).await? {
         return Err(ApiError::NotFound);
     }
+    // The report the suspension acts on is decided in the same step.
     if let Some(r) = b.report {
         app.store
             .decide_report(r, "actioned", &actor(&op), &format!("suspended ({})", b.kind), Some(b.statement.trim()), n)
@@ -227,11 +262,13 @@ async fn suspend(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Lift a suspension by hand (audited).
 async fn unsuspend(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
+    // The account was not suspended.
     if !app.store.unsuspend(id).await? {
         return Err(ApiError::NotFound);
     }
@@ -240,10 +277,13 @@ async fn unsuspend(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The body of an operator grant.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Grant {
+    /// The months to give; negative takes months back.
     months: i32,
+    /// Why; recorded in the evidence.
     reason: String,
 }
 
@@ -254,10 +294,13 @@ async fn grant(
     Path(id): Path<Uuid>,
     Json(b): Json<Grant>,
 ) -> ApiResult<Json<Value>> {
+    // One to 24 months either way, with a reason.
     if b.months == 0 || b.months.abs() > 24 || b.reason.trim().is_empty() {
         return Err(ApiError::Unprocessable("1 to 24 months (negative to take back), with a reason".into()));
     }
+    // The account must exist.
     app.store.account(id).await?.ok_or(ApiError::NotFound)?;
+    // Each grant has its own event id, so two grants are never mistaken for one.
     let event = format!("grant:{}", Uuid::new_v4());
     let until = app
         .store
@@ -266,6 +309,7 @@ async fn grant(
                 account_id: id,
                 provider: link_in_bio_billing::manual::ID,
                 provider_event: &event,
+                // A negative grant is recorded as a refund of months.
                 kind: if b.months > 0 { "grant" } else { "refund" },
                 months: b.months,
                 amount_pence: 0,
@@ -291,23 +335,29 @@ async fn grant(
 
 // ── invites ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
+/// The body of an invite issue.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Issue {
+    /// How many codes.
     count: usize,
     /// The account the codes are given to (to pass on), or none for codes the operator hands out.
     held_by: Option<Uuid>,
+    /// The operator's note on the codes.
     note: Option<String>,
+    /// Days until the codes expire (thirty by default).
     #[serde(default = "thirty")]
     expires_in_days: i64,
 }
 
+/// The default life of an invite: thirty days.
 fn thirty() -> i64 {
     30
 }
 
 /// New codes: shown once, stored only as hashes.
 fn new_codes(n: usize) -> (Vec<String>, Vec<Vec<u8>>) {
+    // Recovery-code generation is reused, ten at a time, until there are enough; the codes are shown once and stored as hashes.
     let mut codes = Vec::with_capacity(n);
     let mut hashes = Vec::with_capacity(n);
     while codes.len() < n {
@@ -322,21 +372,26 @@ fn new_codes(n: usize) -> (Vec<String>, Vec<Vec<u8>>) {
     (codes, hashes)
 }
 
+/// Issue invite codes: to the operator (shown once, in the answer) or to an account to pass on (the holder reads them in the app, so the answer shows none).
 async fn issue(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Json(b): Json<Issue>,
 ) -> ApiResult<Json<Value>> {
+    // A bounded number of codes, valid for a bounded time.
     if b.count == 0 || b.count > MAX_CODES_PER_REQUEST || !(1..=365).contains(&b.expires_in_days) {
         return Err(ApiError::Unprocessable(format!("1 to {MAX_CODES_PER_REQUEST} codes, valid 1 to 365 days")));
     }
+    // A holder must be an active account.
     if let Some(h) = b.held_by {
         app.store.account(h).await?.filter(|a| a.status == "active").ok_or(ApiError::NotFound)?;
     }
+    // The codes and their hashes, generated together.
     let (codes, hashes) = new_codes(b.count);
     let expires = now() + Duration::days(b.expires_in_days);
     let note =
         b.note.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| s.chars().take(200).collect::<String>());
+    // Each hash with its code; the store keeps the code readable only for a holder.
     let pairs: Vec<(Vec<u8>, String)> = hashes.into_iter().zip(codes.iter().cloned()).collect();
     app.store.create_invites(&pairs, b.held_by, None, note.as_deref(), &actor(&op), expires).await?;
     app.store
@@ -348,11 +403,14 @@ async fn issue(
         )
         .await?;
     // Codes given to an account are shown to its holder in the app; codes for the operator are shown here, once.
+    // Codes for an account are not shown to the operator.
     let shown = if b.held_by.is_some() { Vec::new() } else { codes };
     Ok(Json(json!({ "codes": shown, "issued": b.count, "expiresAt": ts(expires) })))
 }
 
+/// The invites issued, newest first (never the codes).
 async fn invites(State(app): State<Shared>) -> ApiResult<Json<Value>> {
+    // The latest 500 invites, which never include the codes.
     let rows = app.store.invites(None, 500).await?;
     Ok(Json(json!({ "invites": rows.into_iter().map(|i| json!({
         "id": i.id, "heldBy": i.held_by, "selection": i.selection_id, "note": i.note, "createdBy": i.created_by,
@@ -361,11 +419,13 @@ async fn invites(State(app): State<Shared>) -> ApiResult<Json<Value>> {
     })).collect::<Vec<_>>() })))
 }
 
+/// Revoke an invite that is neither used nor revoked.
 async fn revoke(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
+    // Used or already revoked.
     if !app.store.revoke_invite(id, now()).await? {
         return Err(ApiError::Conflict("That invite is redeemed or already revoked.".into()));
     }
@@ -373,47 +433,61 @@ async fn revoke(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The body of a new saved selection.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NewSelection {
+    /// Its unique name.
     name: String,
+    /// What accounts must match.
     criteria: Criteria,
 }
 
+/// The saved selections.
 async fn selections(State(app): State<Shared>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "selections": app.store.selections().await?.into_iter().map(|s| json!({
         "id": s.id, "name": s.name, "criteria": s.criteria, "createdBy": s.created_by, "createdAt": ts(s.created_at),
     })).collect::<Vec<_>>() })))
 }
 
+/// Save a selection under a unique name.
 async fn selection_create(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Json(b): Json<NewSelection>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let name = b.name.trim();
+    // A name of one to 80 characters.
     if name.is_empty() || name.chars().count() > 80 {
         return Err(ApiError::Unprocessable("A name of 1 to 80 characters".into()));
     }
+    // A duplicate name is a database conflict.
     let id = app.store.create_selection(name, &b.criteria, &actor(&op)).await?;
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
 }
 
+/// Delete a selection.
 async fn selection_delete(State(app): State<Shared>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
     if app.store.delete_selection(id).await? { Ok(StatusCode::NO_CONTENT) } else { Err(ApiError::NotFound) }
 }
 
+/// The accounts a selection matches now.
 async fn selection_matches(State(app): State<Shared>, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
+    // The saved criteria, read back into their type.
     let s = app.store.selection(id).await?.ok_or(ApiError::NotFound)?;
+    // A stored criteria that cannot be read back is an internal error.
     let c: Criteria = serde_json::from_value(s.criteria).map_err(|_| ApiError::Internal)?;
     let rows = app.store.match_selection(&c, now()).await?;
     Ok(Json(json!({ "accounts": rows.iter().map(account_row).collect::<Vec<_>>() })))
 }
 
+/// The body of "issue codes to a selection".
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct IssueToSelection {
+    /// How many codes each matching account gets.
     per_account: usize,
+    /// Days until the codes expire (thirty by default).
     #[serde(default = "thirty")]
     expires_in_days: i64,
 }
@@ -425,8 +499,10 @@ async fn selection_issue(
     Path(id): Path<Uuid>,
     Json(b): Json<IssueToSelection>,
 ) -> ApiResult<Json<Value>> {
+    // Only accounts the operator allows to share invites get codes, and the total is capped, so one click cannot issue an unbounded number.
     let s = app.store.selection(id).await?.ok_or(ApiError::NotFound)?;
     let c: Criteria = serde_json::from_value(s.criteria).map_err(|_| ApiError::Internal)?;
+    // Only accounts that may share invites.
     let accounts: Vec<Account> =
         app.store.match_selection(&c, now()).await?.into_iter().filter(|a| a.may_share_invites).collect();
     if b.per_account == 0
@@ -436,6 +512,7 @@ async fn selection_issue(
         return Err(ApiError::Unprocessable("Too many codes in one go, or an invalid expiry.".into()));
     }
     let expires = now() + Duration::days(b.expires_in_days);
+    // The number of codes issued in all.
     let mut issued = 0;
     for a in &accounts {
         let (codes, hashes) = new_codes(b.per_account);
@@ -457,13 +534,17 @@ async fn selection_issue(
 
 // ── reports, appeals ─────────────────────────────────────────────────────────────────────────────────────────────
 
+/// A query that filters by status.
 #[derive(Deserialize)]
 struct StatusQuery {
+    /// The status wanted; `open` when absent.
     status: Option<String>,
 }
 
+/// Reports by status (open by default), oldest first, with the reporter's contact (the console is the only place it is shown).
 async fn reports(State(app): State<Shared>, Query(q): Query<StatusQuery>) -> ApiResult<Json<Value>> {
     let st = q.status.unwrap_or_else(|| "open".into());
+    // At most 200, oldest first.
     let rows = app.store.reports(&st, 200).await?;
     Ok(Json(json!({ "reports": rows.into_iter().map(|r| json!({
         "id": r.id, "page": r.handle, "account": r.account_id, "url": r.url, "reason": r.reason, "details": r.details,
@@ -472,32 +553,39 @@ async fn reports(State(app): State<Shared>, Query(q): Query<StatusQuery>) -> Api
     })).collect::<Vec<_>>() })))
 }
 
+/// The body of a decision on a report.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Decide {
     /// `actioned` or `dismissed`.
     status: String,
+    /// A short note of the decision.
     decision: String,
+    /// The statement of reasons sent to the account holder when content is restricted.
     statement: Option<String>,
     /// Hide the reported link (`url` of the report) on every page.
     #[serde(default)]
     hide_link: bool,
 }
 
+/// Decide an open report, optionally hiding its link everywhere, with a statement of reasons; a report decided before is a conflict.
 async fn decide(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Path(id): Path<Uuid>,
     Json(b): Json<Decide>,
 ) -> ApiResult<StatusCode> {
+    // Two outcomes, and a decision in words.
     if !["actioned", "dismissed"].contains(&b.status.as_str()) || b.decision.trim().is_empty() {
         return Err(ApiError::Unprocessable("status is actioned or dismissed, with a decision".into()));
     }
+    // The report, to read its link and its page.
     let r = app.store.report(id).await?.ok_or(ApiError::NotFound)?;
     let n = now();
     if b.hide_link
         && let Some(u) = &r.url
     {
+        // Hiding the link is an operator verdict that no automatic source overrides.
         app.store.override_screen(u, Some("flagged"), &actor(&op), n).await?;
     }
     if !app
@@ -505,6 +593,7 @@ async fn decide(
         .decide_report(id, &b.status, &actor(&op), b.decision.trim(), b.statement.as_deref().map(str::trim), n)
         .await?
     {
+        // Decided once only.
         return Err(ApiError::Conflict("That report is already decided.".into()));
     }
     app.store
@@ -515,10 +604,12 @@ async fn decide(
             &json!({ "status": b.status, "decision": b.decision, "hideLink": b.hide_link }),
         )
         .await?;
+    // The page is rebuilt without the link.
     app.pages.forget(&format!("{}.{}", r.handle, app.config.pages_domain)).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Appeals by status (open by default).
 async fn appeals(State(app): State<Shared>, Query(q): Query<StatusQuery>) -> ApiResult<Json<Value>> {
     let st = q.status.unwrap_or_else(|| "open".into());
     Ok(Json(json!({ "appeals": app.store.appeals(&st, 200).await?.into_iter().map(|x| json!({
@@ -527,23 +618,27 @@ async fn appeals(State(app): State<Shared>, Query(q): Query<StatusQuery>) -> Api
     })).collect::<Vec<_>>() })))
 }
 
+/// The body of a decision on an appeal.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DecideAppeal {
     /// `upheld` (the decision is reversed) or `rejected`.
     status: String,
+    /// The reasons given to the account holder.
     statement: String,
     /// When upheld: lift the account's suspension too.
     #[serde(default)]
     reinstate: bool,
 }
 
+/// Decide an open appeal; an upheld one can also lift the account's suspension.
 async fn decide_appeal(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Path(id): Path<Uuid>,
     Json(b): Json<DecideAppeal>,
 ) -> ApiResult<StatusCode> {
+    // Two outcomes, and reasons for the holder.
     if !["upheld", "rejected"].contains(&b.status.as_str()) || b.statement.trim().is_empty() {
         return Err(ApiError::Unprocessable("status is upheld or rejected, with a statement".into()));
     }
@@ -552,6 +647,7 @@ async fn decide_appeal(
         .decide_appeal(id, &b.status, &actor(&op), b.statement.trim(), now())
         .await?
         .ok_or(ApiError::NotFound)?;
+    // An upheld appeal may lift the suspension.
     if b.status == "upheld" && b.reinstate {
         app.store.unsuspend(account).await?;
         forget_account(&app, account).await;
@@ -564,25 +660,32 @@ async fn decide_appeal(
 
 // ── screening ────────────────────────────────────────────────────────────────────────────────────────────────────
 
+/// The operator's blocklist.
 async fn blocklist(State(app): State<Shared>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "entries": app.store.blocklist().await?.into_iter().map(|b| json!({
         "pattern": b.pattern, "kind": b.kind, "reason": b.reason, "addedBy": b.added_by, "addedAt": ts(b.added_at),
     })).collect::<Vec<_>>() })))
 }
 
+/// The body of a blocklist entry.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Block {
+    /// The host or URL to block.
     pattern: String,
+    /// `host` or `url`.
     kind: String,
+    /// Why.
     reason: String,
 }
 
+/// Add a host or URL to the blocklist (audited).
 async fn block_add(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Json(b): Json<Block>,
 ) -> ApiResult<StatusCode> {
+    // A host is lower-cased without a trailing dot; a URL must pass the same checks as a link on a page, so the pattern is the normalised form.
     let pattern = match b.kind.as_str() {
         "host" => b.pattern.trim().trim_end_matches('.').to_ascii_lowercase(),
         "url" => {
@@ -590,8 +693,10 @@ async fn block_add(
                 .map_err(|e| ApiError::Unprocessable(e.message()))?
                 .0
         }
+        // Only the two kinds exist.
         _ => return Err(ApiError::Unprocessable("kind is host or url".into())),
     };
+    // A pattern of a sane length, and a reason.
     if pattern.is_empty() || pattern.len() > 253 || b.reason.trim().is_empty() {
         return Err(ApiError::Unprocessable("A pattern and a reason are required.".into()));
     }
@@ -600,16 +705,20 @@ async fn block_add(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The query of a blocklist removal.
 #[derive(Deserialize)]
 struct PatternQuery {
+    /// The pattern to unblock.
     pattern: String,
 }
 
+/// Remove a blocklist entry (audited).
 async fn block_remove(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Query(q): Query<PatternQuery>,
 ) -> ApiResult<StatusCode> {
+    // No such entry.
     if !app.store.remove_block(&q.pattern).await? {
         return Err(ApiError::NotFound);
     }
@@ -617,19 +726,23 @@ async fn block_remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The body of an operator verdict on a link.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LinkVerdict {
+    /// The link.
     url: String,
     /// `clean`, `flagged`, or null to return the link to automatic screening.
     verdict: Option<String>,
 }
 
+/// An operator's verdict on a link: clean, flagged, or null to return it to automatic screening.
 async fn link_verdict(
     State(app): State<Shared>,
     Extension(op): Extension<Operator>,
     Json(b): Json<LinkVerdict>,
 ) -> ApiResult<StatusCode> {
+    // Only clean, flagged or null.
     if b.verdict.as_deref().is_some_and(|v| !["clean", "flagged"].contains(&v)) {
         return Err(ApiError::Unprocessable("verdict is clean, flagged or null".into()));
     }
@@ -638,11 +751,14 @@ async fn link_verdict(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The query of the audit log.
 #[derive(Deserialize)]
 struct AuditQuery {
+    /// Only entries about this subject; none lists all.
     subject: Option<String>,
 }
 
+/// The audit log, newest first, for one subject or for all.
 async fn audit(State(app): State<Shared>, Query(q): Query<AuditQuery>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "entries": app.store.audit_log(q.subject.as_deref(), 200).await?.into_iter().map(|e| json!({
         "id": e.id, "at": ts(e.at), "actor": e.actor, "action": e.action, "subject": e.subject, "details": e.details,
@@ -651,8 +767,11 @@ async fn audit(State(app): State<Shared>, Query(q): Query<AuditQuery>) -> ApiRes
 
 // ── refunds ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
+/// A refund request as the console shows it, with exactly what to send per purchase.
 fn refund_row(r: &link_in_bio_store::RefundRequest, lines: &[link_in_bio_store::RefundLine]) -> Value {
+    // The late payment's evidence, for a request made before schema 6.
     let e = r.evidence.clone().unwrap_or_default();
+    // Only this request's lines.
     let lines: Vec<Value> = lines.iter().filter(|l| l.request_id == r.id).map(super::refunds::line_json).collect();
     json!({
         "id": r.id, "account": r.account_id, "handle": r.handle, "kind": r.kind, "event": r.event_id,
@@ -679,6 +798,7 @@ fn refund_row(r: &link_in_bio_store::RefundRequest, lines: &[link_in_bio_store::
 /// The refund requests (`?status=open`, the default, or `refunded`, `withdrawn`, `declined`), oldest first.
 async fn refund_requests(State(app): State<Shared>, Query(q): Query<StatusQuery>) -> ApiResult<Json<Value>> {
     let st = q.status.unwrap_or_else(|| "open".into());
+    // Only the four statuses exist.
     if !["open", "refunded", "withdrawn", "declined"].contains(&st.as_str()) {
         return Err(ApiError::BadRequest("status is open, refunded, withdrawn or declined".into()));
     }
@@ -687,6 +807,7 @@ async fn refund_requests(State(app): State<Shared>, Query(q): Query<StatusQuery>
     Ok(Json(json!({ "requests": rows.iter().map(|r| refund_row(r, &lines)).collect::<Vec<_>>() })))
 }
 
+/// The body that records a refund the operator sent by hand.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Refunded {
@@ -695,6 +816,7 @@ struct Refunded {
     /// Which purchase's line was refunded, when the request has more than one open line.
     #[serde(default)]
     purchase: Option<Uuid>,
+    /// An optional note, at most 1000 characters.
     #[serde(default)]
     note: String,
 }
@@ -707,18 +829,23 @@ async fn refunded(
     Path(id): Path<Uuid>,
     Json(b): Json<Refunded>,
 ) -> ApiResult<Json<Value>> {
+    // A request made before schema 6 has no lines and is recorded as one payment; a newer one is recorded line by line, and when it has several open lines the operator must name the purchase.
+    // The reference is short visible text, so it can be stored and shown safely.
     let reference = b.reference.trim();
     if reference.is_empty() || reference.len() > 200 || !reference.bytes().all(|c| c.is_ascii_graphic()) {
         return Err(ApiError::Unprocessable(
             "The refund's transaction reference is 1 to 200 visible characters.".into(),
         ));
     }
+    // The operator's note, optional and bounded.
     let note = b.note.trim();
     if note.chars().count() > 1000 {
         return Err(ApiError::Unprocessable("The note is at most 1000 characters.".into()));
     }
+    // The request as it was, for the conflict message.
     let existing = app.store.refund_request(id).await?.ok_or(ApiError::NotFound)?;
     let lines = app.store.refund_lines(&[id]).await?;
+    // No lines: a request made before schema 6, for one payment.
     if lines.is_empty() {
         let Some(done) = app.store.record_refund(id, reference, &actor(&op), note, now()).await? else {
             return Err(ApiError::Conflict(format!("This request is already {}.", existing.status)));
@@ -734,6 +861,7 @@ async fn refunded(
             .await?;
         forget_account(&app, done.account_id).await;
     } else {
+        // The lines still waiting for a refund.
         let open: Vec<&link_in_bio_store::RefundLine> = lines.iter().filter(|l| l.status == "open").collect();
         let line = match (b.purchase, open.as_slice()) {
             (Some(p), _) => open.iter().find(|l| l.purchase_id == p).copied().ok_or(ApiError::NotFound)?,
@@ -769,6 +897,7 @@ async fn refunded(
     Ok(Json(json!({ "request": refund_row(&after, &lines), "paidUntil": paid_until.map(ts) })))
 }
 
+/// The body that declines a refund request.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Declined {
@@ -783,6 +912,8 @@ async fn declined(
     Path(id): Path<Uuid>,
     Json(b): Json<Declined>,
 ) -> ApiResult<Json<Value>> {
+    // A reason of 1 to 1000 characters is required, because the account holder is shown it.
+    // The reason for declining, shown to the holder.
     let reason = b.reason.trim();
     if reason.is_empty() || reason.chars().count() > 1000 {
         return Err(ApiError::Unprocessable("Say why, in 1 to 1000 characters.".into()));
@@ -811,13 +942,17 @@ async fn bank_statement(
     Extension(op): Extension<Operator>,
     body: axum::body::Bytes,
 ) -> ApiResult<Json<Value>> {
+    // The statement is read as UTF-8 and parsed by the same code the bank feeds use; the result says what paid, what was short and what was unknown.
+    // Bank transfer must be switched on.
     if app.config.bank_transfer.is_none() {
         return Err(ApiError::Unavailable("bank transfer is not switched on"));
     }
     let xml =
         std::str::from_utf8(&body).map_err(|_| ApiError::Unprocessable("the statement is not UTF-8 text".into()))?;
+    // The same parser the bank feeds use.
     let credits = link_in_bio_billing::bank_transfer::credits_from_camt(xml)
         .map_err(|e| ApiError::Unprocessable(e.to_string()))?;
+    // Paying, short and unknown credits are separated.
     let super::internal::Matched { paid, short, unknown } = super::internal::match_credits(&app, &credits).await?;
     app.store
         .audit(
@@ -830,8 +965,10 @@ async fn bank_statement(
     Ok(Json(json!({ "credits": credits.len(), "paid": paid, "short": short, "unknown": unknown })))
 }
 
+/// The console's router: every route behind the operator gate, the probe, a JSON 404 for everything else, answers that are never cached, a small body limit (a larger one for a statement) and a bound on concurrency.
 pub fn router(app: Shared) -> Router {
     let router = Router::new()
+        // The operator's own details and the overview.
         .route("/api/v1/admin/me", get(me))
         .route("/api/v1/admin/overview", get(overview))
         .route("/api/v1/admin/accounts", get(accounts))
@@ -840,19 +977,23 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v1/admin/accounts/{id}/suspend", post(suspend))
         .route("/api/v1/admin/accounts/{id}/unsuspend", post(unsuspend))
         .route("/api/v1/admin/accounts/{id}/grant", post(grant))
+        // Invites and selections.
         .route("/api/v1/admin/invites", get(invites).post(issue))
         .route("/api/v1/admin/invites/{id}", delete(revoke))
         .route("/api/v1/admin/selections", get(selections).post(selection_create))
         .route("/api/v1/admin/selections/{id}", delete(selection_delete))
         .route("/api/v1/admin/selections/{id}/matches", get(selection_matches))
         .route("/api/v1/admin/selections/{id}/issue", post(selection_issue))
+        // Moderation.
         .route("/api/v1/admin/reports", get(reports))
         .route("/api/v1/admin/reports/{id}/decide", post(decide))
         .route("/api/v1/admin/appeals", get(appeals))
         .route("/api/v1/admin/appeals/{id}/decide", post(decide_appeal))
+        // Screening.
         .route("/api/v1/admin/blocklist", get(blocklist).post(block_add).delete(block_remove))
         .route("/api/v1/admin/links", put(link_verdict))
         .route("/api/v1/admin/audit", get(audit))
+        // Refunds and bank statements.
         .route("/api/v1/admin/refund-requests", get(refund_requests))
         .route("/api/v1/admin/refund-requests/{id}/refunded", post(refunded))
         .route("/api/v1/admin/refund-requests/{id}/declined", post(declined))
@@ -860,9 +1001,13 @@ pub fn router(app: Shared) -> Router {
             "/api/v1/admin/bank-statements",
             post(bank_statement).layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
         )
+        // Every route above is behind the operator gate; the probe and the fallback below are not.
         .layer(middleware::from_fn_with_state(app.clone(), require_admin))
+        // The probe is outside the gate.
         .route("/healthz", get(|| async { "ok\n" }))
+        // A JSON 404 for any other path.
         .fallback(|| async { ApiError::NoRoute.into_response() })
+        // Every answer, including errors, gets the no-store headers.
         .layer(middleware::from_fn(no_store))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .with_state(app);
@@ -873,8 +1018,11 @@ pub fn router(app: Shared) -> Router {
 /// Console answers hold personal data (reports' contacts, the audit log): never stored by a cache, never sniffed, never
 /// sent on as a referrer.
 async fn no_store(req: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    // The three headers are set on every answer after the handler has run.
     use axum::http::{HeaderValue, header};
+    // The answer is changed after the handler has run.
     let mut r = next.run(req).await;
+    // The headers are set on the answer.
     let h = r.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));

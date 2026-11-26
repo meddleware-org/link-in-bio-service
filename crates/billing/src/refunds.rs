@@ -51,12 +51,15 @@ pub struct Received {
 pub struct Entry {
     /// The billing event.
     pub id: Uuid,
+    /// The provider the purchase was made with.
     pub provider: String,
     /// `purchase` or `grant`.
     pub kind: String,
+    /// The months the entry added to the paid period.
     pub months: u32,
     /// The months it still gives (its months less what refunds took back from it).
     pub held: u32,
+    /// When the entry was made.
     pub at: OffsetDateTime,
     /// When its first month began, or begins (each purchase starts where the paid period ended).
     pub start: OffsetDateTime,
@@ -66,24 +69,31 @@ pub struct Entry {
     pub amount_pence: u64,
     /// What was received; `None` when the ledger does not say (such a purchase cannot be refunded on request).
     pub received: Option<Received>,
+    /// The method's fees as they were when the checkout was made.
     pub fees: Fees,
     /// What sending a refund of this purchase costs the operator, in pence, once per line
     /// (`BANK_TRANSFER_REFUND_FEE_PENCE`, `OPEN_PAYMENTS_REFUND_FEE_PENCE`).
     pub refund_charge_pence: u64,
     /// Where a refund goes (provider payment, payer address, the debtor's account), for the operator.
     pub destination: Value,
+    /// The checkout the purchase came from, if any.
     pub checkout: Option<Uuid>,
 }
 
+/// The three kinds of refund on request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
+    /// The purchase is cancelled in full within the window, less the days used.
     Cancel,
+    /// Whole months that have not begun are given back.
     Unstarted,
+    /// A late payment is given back whole.
     Unapplied,
 }
 
 impl Kind {
+    /// The kind's name, as stored and shown.
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Cancel => "cancel",
@@ -97,45 +107,59 @@ impl Kind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Line {
+    /// The purchase this line refunds.
     pub purchase: Uuid,
+    /// The provider the purchase was made with.
     pub provider: String,
+    /// The purchase's checkout, if it had one.
     pub checkout: Option<Uuid>,
     /// The months taken back when this line is refunded (exactly these, never pro rata).
     pub months: u32,
     /// What to send, in `unit`'s smallest denomination.
     pub amount_minor: u64,
+    /// The unit of the amounts: a currency code or a coin type.
     pub unit: String,
+    /// The unit's decimals, when known.
     pub scale: Option<u32>,
     /// The deductions, in the same unit: the fee share, the outgoing charge and the days used.
     pub fee_minor: u64,
+    /// The cost of sending the refund, in the same unit.
     pub charge_minor: u64,
+    /// The value of the days already used, in the same unit.
     pub used_minor: u64,
+    /// The days begun since the purchase's first month started.
     pub days_used: u32,
     /// The refund's value in pence, for the ledger.
     pub amount_pence: i64,
+    /// Where and how the operator sends the refund, as JSON.
     pub destination: Value,
 }
 
 /// What an account holder may ask for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
+    /// Which kind of refund this is.
     pub kind: Kind,
+    /// What each purchase gives back.
     pub lines: Vec<Line>,
+    /// The months it takes back in all.
     pub months: u32,
     /// Cancel and unapplied: until when it may be asked. Unstarted: when the first month on it begins (after that
     /// the request no longer matches what is unstarted).
     pub until: Option<OffsetDateTime>,
 }
 
+/// Why a refund cannot be made, in plain words for the account holder.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct Refusal(pub String);
 
+/// A refusal with a reason.
 fn refuse<T>(why: impl Into<String>) -> Result<T, Refusal> {
     Err(Refusal(why.into()))
 }
 
-/// `ceil(a × b / c)` and `floor(a × b / c)` without overflow.
+/// `ceil(n / d)` in integers. Callers pass the numerator already multiplied out in 128 bits, so it cannot overflow.
 fn ceil_div(n: u128, d: u128) -> u128 {
     n.div_ceil(d)
 }
@@ -147,7 +171,9 @@ fn parts(p: u64, m: u32, k: u32, d: u32, amount_pence: u64, fees: Fees) -> Resul
         return refuse("There are no months to give back.");
     }
     let (p, m, k, d) = (u128::from(p), u128::from(m), u128::from(k), u128::from(d));
+    // What those months were worth when paid, rounded down.
     let gross = p * k / m;
+    // A day used costs a thirtieth of a month's price, rounded up.
     let used = ceil_div(p * d, u128::from(DAYS_PER_MONTH) * m);
     // The fee as a share of what was paid: (10000 × fixed + bps × amount) ÷ (10000 × amount), the amount in pence. In
     // the unit paid, so a purchase paid in euros or a coin is charged the same share without an exchange rate.
@@ -160,14 +186,17 @@ fn parts(p: u64, m: u32, k: u32, d: u32, amount_pence: u64, fees: Fees) -> Resul
         let f = 10_000 * u128::from(fees.fixed_pence) + u128::from(fees.percent_bps) * a;
         ceil_div(p * f * k, 10_000 * a * m)
     };
+    // The results fit a 64-bit amount; a larger one is capped rather than wrapped.
     let cap = |v: u128| u64::try_from(v).unwrap_or(u64::MAX);
     Ok((cap(gross), cap(fee), cap(used)))
 }
 
+/// One purchase's refund line: the gross share for `k` months, less the days used, the fee share and the cost of sending, all in the unit received; refused if nothing would be left.
 fn line(e: &Entry, k: u32, d: u32, with_fee: bool) -> Result<Line, Refusal> {
     let Some(r) = &e.received else {
         return refuse("What this purchase received is not on record; ask the operator.");
     };
+    // A late payment is given back whole, so it carries no fee share.
     let fees = if with_fee { e.fees } else { Fees { fixed_pence: 0, percent_bps: 0 } };
     let (gross, fee, used) = parts(r.minor, e.months, k, d, e.amount_pence, fees)?;
     // The outgoing charge, in pence, as a share of what was paid in its unit (rounded up), once for the line.
@@ -178,6 +207,7 @@ fn line(e: &Entry, k: u32, d: u32, with_fee: bool) -> Result<Line, Refusal> {
         }
         (c, a) => u64::try_from(ceil_div(u128::from(r.minor) * u128::from(c), u128::from(a))).unwrap_or(u64::MAX),
     };
+    // The refund is the gross less every deduction, never below zero.
     let net = gross.saturating_sub(fee).saturating_sub(used).saturating_sub(charge);
     if net == 0 {
         return refuse(
@@ -185,6 +215,7 @@ fn line(e: &Entry, k: u32, d: u32, with_fee: bool) -> Result<Line, Refusal> {
              to refund.",
         );
     }
+    // The refund's value in pence for the ledger, from the ratio of the refund to what was received.
     let pence =
         if r.minor == 0 { 0 } else { (u128::from(e.amount_pence) * u128::from(net) / u128::from(r.minor)) as i64 };
     Ok(Line {
@@ -209,6 +240,7 @@ fn days_begun(start: OffsetDateTime, now: OffsetDateTime) -> u32 {
     if start >= now {
         return 0;
     }
+    // A day begun counts as used, so the count rounds up.
     let ms = (now - start).whole_milliseconds();
     let day = Duration::DAY.whole_milliseconds();
     u32::try_from((ms + day - 1) / day).unwrap_or(u32::MAX)
@@ -217,9 +249,11 @@ fn days_begun(start: OffsetDateTime, now: OffsetDateTime) -> u32 {
 /// Cancelling one purchase within [`CANCEL_WINDOW`]: every month it still holds back, less the days used and its fee
 /// share.
 pub fn cancel(e: &Entry, now: OffsetDateTime) -> Result<Offer, Refusal> {
+    // A grant from the operator is not something that was bought.
     if e.kind != "purchase" {
         return refuse("Only a purchase can be cancelled.");
     }
+    // The window is 14 days from the purchase, and its last instant is excluded.
     if e.at + CANCEL_WINDOW <= now {
         return refuse(
             "A purchase can be cancelled within 14 days; after that, months that have not started can be refunded.",
@@ -228,6 +262,7 @@ pub fn cancel(e: &Entry, now: OffsetDateTime) -> Result<Offer, Refusal> {
     if e.held == 0 {
         return refuse("This purchase has already been refunded.");
     }
+    // Days are counted from when its first month began, which may be later than the purchase.
     let d = days_begun(e.start, now);
     let l = line(e, e.held, d, true)?;
     Ok(Offer { kind: Kind::Cancel, months: l.months, lines: vec![l], until: Some(e.at + CANCEL_WINDOW) })
@@ -241,6 +276,7 @@ pub fn unapplied(e: &Entry, now: OffsetDateTime) -> Result<Offer, Refusal> {
     if e.at + UNAPPLIED_WINDOW <= now {
         return refuse("A refund of a late payment can be asked for within 30 days of it.");
     }
+    // A late payment comes back whole or not at all.
     if e.held < e.months {
         return refuse("Part of this payment has already been refunded.");
     }
@@ -262,9 +298,11 @@ pub fn unstarted_months(paid_until: Option<OffsetDateTime>, now: OffsetDateTime)
 /// The unstarted months of the paid period that purchases gave, newest first: `(entry, months)`. Months a grant gave
 /// are unstarted too but not refundable; they still take their place at the end of the period.
 fn unstarted_shares(history: &[Entry], paid_until: Option<OffsetDateTime>, now: OffsetDateTime) -> Vec<(&Entry, u32)> {
+    // How many whole months are still to start.
     let mut left = unstarted_months(paid_until, now);
     let mut out = Vec::new();
     let mut newest_first: Vec<&Entry> = history.iter().filter(|e| e.held > 0).collect();
+    // Months are stacked, so the newest purchase's months are the last of the period.
     newest_first.sort_by_key(|e| std::cmp::Reverse(e.at));
     for e in newest_first {
         if left == 0 {
@@ -272,6 +310,7 @@ fn unstarted_shares(history: &[Entry], paid_until: Option<OffsetDateTime>, now: 
         }
         let c = e.held.min(left);
         left -= c;
+        // Months a grant gave are unstarted too, but they are not refundable.
         if e.kind == "purchase" {
             out.push((e, c));
         }
@@ -296,6 +335,7 @@ pub fn unstarted(
     if available == 0 {
         return refuse("No paid month has yet to start: the month in progress is kept.");
     }
+    // No number means all of them.
     let want = want.unwrap_or(available);
     if want == 0 || want > available {
         return refuse(format!("{available} paid month(s) have not started; ask for 1 to {available}."));
@@ -311,6 +351,7 @@ pub fn unstarted(
         lines.push(line(e, k, 0, true)?);
     }
     // The first month on the request begins `want` months before the period ends.
+    // After this time the request no longer matches what is unstarted.
     let until = paid_until.map(|p| p - MONTH * want);
     Ok(Offer { kind: Kind::Unstarted, months: want, lines, until })
 }
@@ -330,6 +371,7 @@ pub fn scale_of(unit: &str) -> Option<u32> {
     None
 }
 
+/// A number that may be written as a string, as providers do.
 fn number(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
@@ -337,18 +379,22 @@ fn number(v: &Value) -> Option<u64> {
 /// What a purchase received, from its ledger evidence (`paid` is recorded by the ledger from what the provider
 /// reported). `amount_pence` is the checkout's amount, the fallback for providers paid in pence.
 pub fn received(provider: &str, evidence: &Value, amount_pence: u64) -> Option<Received> {
+    // Pounds and pence, the fallback for providers paid in the checkout's own amount.
     let gbp = || Some(Received { minor: amount_pence, unit: "GBP".into(), scale: Some(2) });
     match provider {
+        // Card and bank providers paid in pounds unless the evidence says otherwise.
         crate::square::ID | crate::gocardless::ID => {
             match (number(&evidence["paid"]["amountMinor"]), evidence["paid"]["currency"].as_str()) {
                 (Some(minor), Some(c)) => Some(Received { minor, unit: c.into(), scale: scale_of(c) }),
                 _ => gbp(),
             }
         }
+        // Paddle reports the buyer's currency and the grand total.
         crate::paddle::ID => {
             let c = evidence["currency"].as_str()?;
             Some(Received { minor: number(&evidence["totals"]["grand_total"])?, unit: c.into(), scale: scale_of(c) })
         }
+        // A coin payment is in the coin's smallest unit.
         crate::chain_payments::ID => {
             let coin = evidence["coinType"].as_str()?;
             Some(Received { minor: number(&evidence["amount"])?, unit: coin.into(), scale: scale_of(coin) })
@@ -357,6 +403,7 @@ pub fn received(provider: &str, evidence: &Value, amount_pence: u64) -> Option<R
             let c = evidence["currency"].as_str()?;
             Some(Received { minor: number(&evidence["amountMinor"])?, unit: c.into(), scale: Some(2) })
         }
+        // Open Payments names the asset and its scale.
         crate::open_payments::ID => {
             let a = &evidence["receiveAmount"];
             match (number(&a["value"]), a["assetCode"].as_str(), a["assetScale"].as_u64()) {
@@ -373,6 +420,7 @@ pub fn received(provider: &str, evidence: &Value, amount_pence: u64) -> Option<R
 /// Where a refund of a purchase goes and how the operator sends it, from its ledger evidence.
 pub fn destination(provider: &str, evidence: &Value, provider_ref: Option<&str>) -> Value {
     match provider {
+        // The `how` of each is what the operator does by hand: refunds are the operator's act, never an automatic one.
         crate::square::ID => json!({
             "how": "Refund the payment in the Square Dashboard (Transactions), for exactly the amount shown.",
             "payment": evidence["payment"], "order": provider_ref, "receipt": evidence["receipt"],
@@ -401,15 +449,20 @@ pub fn destination(provider: &str, evidence: &Value, provider_ref: Option<&str>)
     }
 }
 
+/// Unit tests for the refund rules, with the worked examples in the comments.
 #[cfg(test)]
 mod tests {
     use super::*;
     use time::macros::datetime;
 
+    /// The fixed time the tests run at.
     const NOW: OffsetDateTime = datetime!(2026-11-18 12:00 UTC);
+    /// Square's fees, for the examples.
     const SQUARE: Fees = Fees { fixed_pence: 25, percent_bps: 140 };
+    /// No fees.
     const NONE: Fees = Fees { fixed_pence: 0, percent_bps: 0 };
 
+    /// A purchase entry for the tests: held in full, paid in pounds.
     fn purchase(months: u32, pence: u64, at: OffsetDateTime, start: OffsetDateTime, fees: Fees) -> Entry {
         Entry {
             id: Uuid::new_v4(),
@@ -429,6 +482,7 @@ mod tests {
         }
     }
 
+    /// A cancellation gives back the amount less the days begun (a day begun counts) and the fee share, rounded in the operator's favour.
     #[test]
     fn a_cancellation_gives_back_all_but_the_days_used_and_the_fee_share() {
         // 12 months for £36, bought 3 days ago and started then: 3 days at £3 ÷ 30 = 30p; the fee 25p + 1.4 % of
@@ -444,6 +498,7 @@ mod tests {
         assert_eq!(o.lines[0].days_used, 4);
     }
 
+    /// A purchase stacked after months already paid has no days used.
     #[test]
     fn a_purchase_that_has_not_started_loses_no_days() {
         // Stacked after months already paid: it starts in two months, so no day of it is used.
@@ -454,6 +509,7 @@ mod tests {
         assert_eq!((l.fee_minor, l.amount_minor), (51, 1749));
     }
 
+    /// Cancelling is refused after 14 days and after a refund.
     #[test]
     fn cancelling_is_only_within_14_days_and_once() {
         let mut e = purchase(12, 3600, NOW - Duration::days(14), NOW - Duration::days(14), SQUARE);
@@ -463,6 +519,7 @@ mod tests {
         assert!(cancel(&e, NOW).unwrap_err().0.contains("already"));
     }
 
+    /// A refund that would be nothing after the deductions is refused.
     #[test]
     fn nothing_left_is_refused() {
         // One month bought for 30p (a made-up price), 13 days used and Square's fee: nothing is left.
@@ -470,6 +527,7 @@ mod tests {
         assert!(cancel(&e, NOW).unwrap_err().0.contains("nothing would be left"));
     }
 
+    /// Unstarted months come from the newest purchases first, each at what its own purchase paid, with the fee share of the months taken.
     #[test]
     fn unstarted_months_come_from_the_newest_purchases_first() {
         // Three stacked purchases: 3 months at £3 (old), 6 months at £2.50 (middle), 2 months at £3 (newest). The
@@ -477,6 +535,7 @@ mod tests {
         let a = purchase(3, 900, NOW - Duration::days(60), NOW - Duration::days(60), SQUARE);
         let b = purchase(6, 1500, NOW - Duration::days(30), NOW - Duration::days(30), SQUARE);
         let c = purchase(2, 600, NOW - Duration::days(20), NOW + MONTH * 5, SQUARE);
+        // The period ends seven and a half months from now.
         let until = Some(NOW + MONTH * 7 + MONTH / 2);
         let history = vec![a, b.clone(), c.clone()];
         assert_eq!(refundable_unstarted(&history, until, NOW), 7);
@@ -495,9 +554,11 @@ mod tests {
         assert!(unstarted(&history, until, NOW, Some(8)).is_err());
     }
 
+    /// The month in progress is kept, and months an operator granted are not refundable.
     #[test]
     fn the_month_in_progress_is_kept_and_granted_months_are_not_refunded() {
         let p = purchase(3, 900, NOW - Duration::days(1), NOW - Duration::days(1), SQUARE);
+        // A grant of two months a little later, which gives months but received nothing.
         let mut grant = purchase(2, 0, NOW - Duration::hours(1), NOW + MONTH * 3, NONE);
         grant.kind = "grant".into();
         grant.received = None;
@@ -512,6 +573,7 @@ mod tests {
         assert!(unstarted(&history[..1], Some(NOW + MONTH / 2), NOW, None).is_err());
     }
 
+    /// A coin purchase is refunded in the same coin, pro rata of what was received, rounded down to the smallest unit.
     #[test]
     fn coins_are_refunded_in_the_same_coin_pro_rata_of_what_was_received() {
         let mut e = purchase(6, 1800, NOW - Duration::days(2), NOW + MONTH, NONE);
@@ -526,6 +588,7 @@ mod tests {
         assert_eq!(o.lines[0].amount_minor, 7_123_456_789 / 6, "one sixth, rounded down to the smallest unit");
     }
 
+    /// A fee is charged as a share of what was paid in whatever currency that was, so no exchange rate is needed.
     #[test]
     fn a_fee_is_charged_as_a_share_of_what_was_paid_in_any_currency() {
         // Paddle: 12 months for £36 paid as €41.00; fee 40p + 5 % of £36 = £2.20, so 2.20/36 of what was paid.
@@ -543,6 +606,7 @@ mod tests {
         assert_eq!((l.unit.as_str(), l.fee_minor, l.used_minor, l.amount_minor), ("EUR", 251, 12, 4100 - 251 - 12));
     }
 
+    /// Chain Payments' platform fee is the fee share, and a bank refund carries its charge once, as a share of what was paid.
     #[test]
     fn chain_payments_fee_share_is_its_platform_fee_and_bank_refunds_carry_their_charge() {
         // 0.2 % of 7.5 SUI stays with the platform treasury: the recipient received 99.8 %, and that comes back.
@@ -563,6 +627,7 @@ mod tests {
         assert!(cancel(&b, NOW).unwrap_err().0.contains("nothing would be left"));
     }
 
+    /// A late payment comes back whole within 30 days and not otherwise.
     #[test]
     fn a_late_payment_comes_back_whole_within_30_days() {
         let mut e = purchase(3, 900, NOW - Duration::days(29), NOW + MONTH * 3, SQUARE);
@@ -574,6 +639,7 @@ mod tests {
         assert!(unapplied(&e, NOW).is_err());
     }
 
+    /// What was received is read from each provider's evidence, with a fallback in pounds for card and bank providers, and nothing when the evidence says nothing.
     #[test]
     fn what_was_received_is_read_from_the_evidence() {
         assert_eq!(received("square", &json!({}), 900).unwrap().minor, 900);

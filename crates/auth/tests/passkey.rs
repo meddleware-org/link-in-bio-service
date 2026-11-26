@@ -7,13 +7,17 @@ use uuid::Uuid;
 use webauthn_authenticator_rs::WebauthnAuthenticator;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
+/// The relying party host the tests use.
 const RP: &str = "app.example.link";
+/// Its origin.
 const ORIGIN: &str = "https://app.example.link";
 
+/// Any serialisable value as JSON, the form the service stores and the browser sends.
 fn json<T: serde::Serialize>(v: &T) -> serde_json::Value {
     serde_json::to_value(v).unwrap()
 }
 
+/// A registration and a sign-in by handle succeed against a software authenticator, with the state passed through JSON between the steps; the same registration response cannot be replayed, an assertion cannot be used for another account, and cannot be replayed against a new ceremony.
 #[test]
 fn register_then_sign_in_by_handle() {
     let pk = Passkeys::new(RP, ORIGIN, "Link in Bio").unwrap();
@@ -45,6 +49,7 @@ fn register_then_sign_in_by_handle() {
     assert!(pk.finish_login(&assertion, &fresh, account, &updated).is_err());
 }
 
+/// The registration options require user verification, so an authenticator that cannot verify the person refuses.
 #[test]
 fn user_verification_is_required() {
     let pk = Passkeys::new(RP, ORIGIN, "Link in Bio").unwrap();
@@ -55,6 +60,7 @@ fn user_verification_is_required() {
     assert!(device.do_registration(Url::parse(ORIGIN).unwrap(), serde_json::from_value(options).unwrap()).is_err());
 }
 
+/// A registration made on a different origin (a tenant's page) does not verify, if the authenticator makes one at all.
 #[test]
 fn another_origin_is_refused() {
     let pk = Passkeys::new(RP, ORIGIN, "Link in Bio").unwrap();
@@ -68,6 +74,7 @@ fn another_origin_is_refused() {
     }
 }
 
+/// A sign-in without a handle asks for user verification and carries no mediation field.
 #[test]
 fn discoverable_options_have_no_mediation() {
     let pk = Passkeys::new(RP, ORIGIN, "Link in Bio").unwrap();

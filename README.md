@@ -55,4 +55,12 @@ Links are `https:` or `mailto:` only; `identity: true` marks your own profiles (
 
 ## Development
 
-See [CLAUDE.md](CLAUDE.md). Licence: [0BSD](LICENSE).
+```bash
+bash scripts/test-postgres.sh start && . "${TMPDIR:-/tmp}/link-in-bio-test-pg/env.sh"   # a throwaway PostgreSQL 18 with TLS (DOCKER=podman works)
+cargo fmt --check && cargo clippy --workspace --all-targets --locked -- -D warnings      # a missing doc comment on any item fails the build
+cargo test --workspace --locked                                                          # the database tests skip without TEST_DATABASE_URL; CI forbids a skip
+bash scripts/test-postgres.sh stop
+cd page && npm ci && npm run check:vendored && npm run lint:css && npm run test:e2e      # the page: vendored files, styles, browsers
+```
+
+How to propose a change: [CONTRIBUTING.md](CONTRIBUTING.md). The project's invariants and layout: [CLAUDE.md](CLAUDE.md). Licence: [0BSD](LICENSE).

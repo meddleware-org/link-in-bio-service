@@ -27,8 +27,11 @@ use super::internal::{Matched, apply_event, match_credits};
 use super::metrics::Metrics;
 use super::{Shared, now};
 
+/// How many published versions of each page are kept.
 pub const KEEP_VERSIONS: i64 = 20;
+/// How long audit entries are kept.
 pub const AUDIT_KEEP: Duration = Duration::days(730);
+/// How long decided reports and appeals are kept.
 pub const CASES_KEEP: Duration = Duration::days(730);
 /// The longest DNS-over-HTTPS answer read (a TXT lookup is well under a kilobyte).
 const DOH_MAX_BYTES: usize = 64 * 1024;
@@ -40,14 +43,19 @@ pub const CHECKOUT_LIFETIME: Duration = Duration::days(2);
 /// When each slower duty last ran (in this process).
 #[derive(Default)]
 pub struct Schedule {
+    /// When the bank feeds were last polled.
     feeds: Option<Instant>,
+    /// When the hourly duties last ran.
     hourly: Option<Instant>,
+    /// When the six-hourly duties last ran.
     six_hourly: Option<Instant>,
+    /// When the daily duties last ran.
     daily: Option<Instant>,
     /// Web Risk list updates that failed in a row (the retry waits longer each time).
     web_risk_failures: u32,
 }
 
+/// Whether a slower duty is due: true the first time and whenever `every` has passed, and then the clock restarts.
 fn due(last: &mut Option<Instant>, every: StdDuration) -> bool {
     if last.is_none_or(|t| t.elapsed() >= every) {
         *last = Some(Instant::now());
@@ -57,12 +65,15 @@ fn due(last: &mut Option<Instant>, every: StdDuration) -> bool {
     }
 }
 
+/// Record a failed duty: counted, and logged with its name and the error (never any request body).
 fn failed(app: &Shared, duty: &str, e: impl std::fmt::Display) {
     Metrics::inc(&app.metrics.job_failures);
     tracing::error!(duty, error = %e, "worker duty failed");
 }
 
+/// Lift the suspensions whose time is up, and audit each.
 pub async fn lift_suspensions(app: &Shared) {
+    // The sweep returns the accounts it reinstated.
     match app.store.lift_expired_suspensions(now()).await {
         Ok(ids) => {
             for id in ids {
@@ -76,11 +87,15 @@ pub async fn lift_suspensions(app: &Shared) {
 /// Updates each Web Risk list that is due, then reloads this process's copy. A failure waits 15 minutes, doubling up to
 /// 8 hours (Web Risk's back-off), and keeps the lists as they were.
 pub async fn update_web_risk(app: &Shared, s: &mut Schedule) {
+    // The retry doubles with each failure in a row, from 15 minutes up to 8 hours.
     // Update mode only: in lookup mode no list is kept and `computeDiff` is never called.
+    // Only update mode keeps lists.
     let Some(w) = &app.screener.update else { return };
     let n = now();
+    // 15, 30, 60, 120, 240 or 480 minutes, capped at 8 hours.
     let retry = Duration::minutes(15) * 2i32.pow(s.web_risk_failures.min(5));
     let mut changed = false;
+    // Each of the three lists on its own schedule.
     for threat in link_in_bio_safety::webrisk::THREAT_TYPES {
         match link_in_bio_safety::update_list(w, &app.store, threat, n, retry.min(Duration::hours(8))).await {
             Ok(link_in_bio_safety::UpdateOutcome::Updated(entries)) => {
@@ -95,10 +110,12 @@ pub async fn update_web_risk(app: &Shared, s: &mut Schedule) {
             Ok(link_in_bio_safety::UpdateOutcome::CapReached) => {
                 tracing::warn!(threat, "web risk monthly cap reached; the list is not updated");
             }
+            // Not due yet: nothing to do.
             Ok(link_in_bio_safety::UpdateOutcome::NotDue) => {}
             Err(e) => failed(app, "web-risk-lists", e),
         }
     }
+    // A changed list is reloaded into this process at once.
     if changed && let Err(e) = w.refresh(&app.store, true).await {
         failed(app, "web-risk-lists", e);
     }
@@ -109,6 +126,7 @@ pub async fn update_web_risk(app: &Shared, s: &mut Schedule) {
 /// wait a week (a publish screens them again if they are stale). Otherwise every due link is checked, locally.
 pub async fn rescreen(app: &Shared, limit: i64) {
     let n = now();
+    // Lookup mode only rechecks links a published page shows; other modes check every due link locally.
     let due = if app.screener.lookup.is_some() {
         app.store.screens_due_on_published(n, limit, n + link_in_bio_safety::RESCAN_CLEAN_LOOKUP).await
     } else {
@@ -116,6 +134,7 @@ pub async fn rescreen(app: &Shared, limit: i64) {
     };
     match due {
         Ok(due) => {
+            // Each due link is screened and recorded.
             for s in due {
                 match app.screener.recheck(&app.store, &s.url, n).await {
                     Ok(Some(_)) => Metrics::inc(&app.metrics.screenings),
@@ -132,14 +151,19 @@ pub async fn rescreen(app: &Shared, limit: i64) {
     }
 }
 
+/// Ask the provider about each checkout no notification closed (open for 30 minutes), apply a payment once, close the expired ones, and give up on one open for two days.
 pub async fn reconcile(app: &Shared) {
+    // A payment found this way uses the same ledger key as a notification would, so it is never counted twice.
     let n = now();
+    // At most 50 old open checkouts a pass.
     let stale = match app.store.stale_checkouts(n - RECONCILE_AFTER, 50).await {
         Ok(s) => s,
         Err(e) => return failed(app, "reconcile", e),
     };
     for c in stale {
+        // A provider that is no longer switched on is skipped.
         let Some(p) = app.billing.provider(&c.provider) else { continue };
+        // What the provider says about the checkout now.
         match p.checkout_outcome(&c.provider_ref).await {
             Ok(Outcome::Paid) => {
                 // What was paid, as the provider reports it now (checked against the checkout like a notification).
@@ -162,9 +186,11 @@ pub async fn reconcile(app: &Shared) {
                     failed(app, "reconcile", e);
                 }
             }
+            // The provider says it is over.
             Ok(Outcome::Expired | Outcome::Failed) => {
                 let _ = app.store.close_checkout(c.id, "expired", n).await;
             }
+            // Still open after two days: given up.
             Ok(_) if c.created_at < n - CHECKOUT_LIFETIME => {
                 let _ = app.store.close_checkout(c.id, "expired", n).await;
             }
@@ -177,9 +203,13 @@ pub async fn reconcile(app: &Shared) {
 /// The bank feeds the configuration names, with their keys and tokens read from their files. Only the worker builds
 /// them, so the other roles need none of these secrets.
 pub fn bank_feeds(config: &HostedConfig) -> Result<Vec<Box<dyn BankFeed>>, String> {
+    // Only the worker reads these files, so no other process needs the bank credentials.
+    // A secret from its mounted file; the error names the file.
     let read = |f: &str| std::fs::read_to_string(f).map(|s| s.trim().to_string()).map_err(|e| format!("{f}: {e}"));
+    // An RSA key from its mounted PEM file.
     let key = |f: &str| RsaKey::from_pem(&read(f)?).map_err(|e| format!("{f}: {e}"));
     let mut out: Vec<Box<dyn BankFeed>> = Vec::new();
+    // One feed for each configured bank.
     for f in &config.bank_feeds {
         let http = link_in_bio_billing::http_client();
         out.push(match f {
@@ -225,12 +255,15 @@ pub fn bank_feeds(config: &HostedConfig) -> Result<Vec<Box<dyn BankFeed>>, Strin
 /// One poll of every bank feed: credits matched against bank-transfer checkouts, the cursor kept per feed. A feed
 /// that fails keeps its cursor (and says why in the console's overview).
 pub async fn poll_bank_feeds(app: &Shared, feeds: &[Box<dyn BankFeed>]) {
+    // Credits are matched and the cursor saved per feed; a failed feed keeps its cursor and records why.
     for f in feeds {
         let n = now();
+        // Where the feed left off.
         let from = match app.store.bank_feed(f.id()).await {
             Ok(r) => r.map(|r| FeedState { cursor: r.cursor, state: r.state }).unwrap_or_default(),
             Err(e) => return failed(app, "bank-feeds", e),
         };
+        // A failure is recorded and the next feed is polled.
         let batch = match f.fetch(&from, n).await {
             Ok(b) => b,
             Err(e) => {
@@ -239,6 +272,7 @@ pub async fn poll_bank_feeds(app: &Shared, feeds: &[Box<dyn BankFeed>]) {
                 continue;
             }
         };
+        // Credits that name a checkout pay it; short, foreign and unknown ones are only reported.
         let Matched { paid, short, unknown } = match match_credits(app, &batch.credits).await {
             Ok(m) => m,
             Err(e) => {
@@ -246,6 +280,7 @@ pub async fn poll_bank_feeds(app: &Shared, feeds: &[Box<dyn BankFeed>]) {
                 continue;
             }
         };
+        // A poll that found nothing for a checkout leaves no audit entry.
         if !paid.is_empty() || !short.is_empty() {
             let _ = app
                 .store
@@ -267,6 +302,7 @@ pub async fn poll_bank_feeds(app: &Shared, feeds: &[Box<dyn BankFeed>]) {
 
 /// Whether a DNS-over-HTTPS answer (`application/dns-json`) holds the TXT value.
 pub fn txt_holds(answer: &Value, token: &str) -> bool {
+    // Type 16 is a TXT record; its value comes in quotes.
     answer["Answer"].as_array().is_some_and(|a| {
         a.iter()
             .filter(|r| r["type"].as_u64() == Some(16))
@@ -274,16 +310,21 @@ pub fn txt_holds(answer: &Value, token: &str) -> bool {
     })
 }
 
+/// Check the custom domains that are pending or last checked more than a day ago: the TXT record names the account's token.
 pub async fn check_domains(app: &Shared, http: &reqwest::Client) {
+    // The lookup goes through a public DNS-over-HTTPS resolver, so the service needs no resolver of its own and sends only the host name.
+    // Custom domains switched off: nothing to check.
     if app.config.custom_hostname_cap == 0 {
         return;
     }
     let n = now();
+    // At most 50 domains a pass.
     let due = match app.store.domains_due(n - Duration::hours(24), 50).await {
         Ok(d) => d,
         Err(e) => return failed(app, "domains", e),
     };
     for d in due {
+        // The record is on a fixed label under the domain.
         let name = format!("{DOMAIN_TXT_LABEL}.{}", d.hostname);
         let Ok(mut url) = url::Url::parse("https://cloudflare-dns.com/dns-query") else { return };
         url.query_pairs_mut().append_pair("name", &name).append_pair("type", "TXT");
@@ -295,6 +336,7 @@ pub async fn check_domains(app: &Shared, http: &reqwest::Client) {
             Err(_) => None,
         };
         let Some(answer) = answer else { continue };
+        // Verified when the token is there; a verified domain that loses it fails; a pending one stays pending.
         let status = if txt_holds(&answer, &d.token) {
             "verified"
         } else if d.status == "verified" {
@@ -305,13 +347,16 @@ pub async fn check_domains(app: &Shared, http: &reqwest::Client) {
         if let Err(e) = app.store.set_domain_status(&d.hostname, status, n).await {
             failed(app, "domains", e);
         }
+        // A change of state makes this process forget the host's page.
         if status != d.status {
             app.pages.forget(&d.hostname).await;
         }
     }
 }
 
+/// Fetch the last seven days of ThreatFox indicators and replace the stored set; an empty answer leaves the old set.
 pub async fn sync_threatfox(app: &Shared, http: &reqwest::Client) {
+    // No key means no ThreatFox sync.
     let Some(file) = &app.config.threatfox_key_file else { return };
     let Ok(key) = std::fs::read_to_string(file) else { return failed(app, "threatfox", "cannot read the key file") };
     match link_in_bio_safety::fetch_threatfox(http, "https://threatfox-api.abuse.ch/api/v1/", key.trim(), 7).await {
@@ -325,8 +370,10 @@ pub async fn sync_threatfox(app: &Shared, http: &reqwest::Client) {
     }
 }
 
+/// The daily clean-up: old page versions, unused pictures and screens, and expired or old rows.
 pub async fn prune(app: &Shared) {
     let n = now();
+    // Each clean-up is attempted; a failure of one does not stop the others.
     for r in [
         app.store.prune_versions(KEEP_VERSIONS).await,
         app.store.prune_assets().await,
@@ -341,10 +388,12 @@ pub async fn prune(app: &Shared) {
 
 /// One pass of every duty that is due.
 pub async fn tick(app: &Shared, http: &reqwest::Client, s: &mut Schedule, feeds: &[Box<dyn BankFeed>]) {
+    // The duties that run every pass.
     lift_suspensions(app).await;
     update_web_risk(app, s).await;
     rescreen(app, 100).await;
     reconcile(app).await;
+    // The bank feeds on their own interval.
     if !feeds.is_empty() && due(&mut s.feeds, StdDuration::from_secs(app.config.bank_feed_poll_secs)) {
         poll_bank_feeds(app, feeds).await;
     }
@@ -361,6 +410,7 @@ pub async fn tick(app: &Shared, http: &reqwest::Client, s: &mut Schedule, feeds:
 
 /// Runs until `stop` resolves, holding the single-writer lock. `feeds` are the bank feeds ([`bank_feeds`]).
 pub async fn run(app: Shared, feeds: Vec<Box<dyn BankFeed>>, stop: impl std::future::Future<Output = ()>) {
+    // The lock is a database advisory lock, so only one worker runs the duties even if several start.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let http = reqwest::Client::builder()
         .user_agent(concat!("link-in-bio/", env!("CARGO_PKG_VERSION")))
@@ -368,7 +418,9 @@ pub async fn run(app: Shared, feeds: Vec<Box<dyn BankFeed>>, stop: impl std::fut
         .timeout(StdDuration::from_secs(10))
         .build()
         .unwrap_or_default();
+    // The stop signal is polled from several places.
     tokio::pin!(stop);
+    // Wait for the single-writer lock, trying again every 15 seconds.
     let _lock = loop {
         match app.store.try_worker_lock().await {
             Ok(Some(c)) => break c,
@@ -383,6 +435,7 @@ pub async fn run(app: Shared, feeds: Vec<Box<dyn BankFeed>>, stop: impl std::fut
     tracing::info!("worker running");
     let mut schedule = Schedule::default();
     loop {
+        // A pass every minute.
         tick(&app, &http, &mut schedule, &feeds).await;
         tokio::select! {
             _ = &mut stop => return,
@@ -391,10 +444,12 @@ pub async fn run(app: Shared, feeds: Vec<Box<dyn BankFeed>>, stop: impl std::fut
     }
 }
 
+/// Unit tests for the worker's helpers.
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
+    /// A TXT answer that holds the token verifies; another token or an error answer does not.
     #[test]
     fn txt_records() {
         let a = json!({"Status": 0, "Answer": [{"name": "_link-in-bio.example.org", "type": 16, "data": "\"abc\""}]});

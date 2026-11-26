@@ -14,16 +14,20 @@ use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 /// One signature parameter (`created`, `keyid`, `alg`, …), serialised as an sf-integer or an sf-string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Param {
+    /// A parameter with an integer value, such as `created`.
     Int(&'static str, i64),
+    /// A parameter with a string value, such as `keyid`; quotes and backslashes in it are escaped.
     Str(&'static str, String),
 }
 
 /// The `@signature-params` value: `("c1" "c2" …);p1=…;p2=…`.
 pub fn signature_params(components: &[&str], params: &[Param]) -> String {
+    // The list of covered components in quotes, then each parameter in the order given.
     let mut s = format!("({})", components.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(" "));
     for p in params {
         match p {
             Param::Int(k, v) => s.push_str(&format!(";{k}={v}")),
+            // String values are quoted with backslash and quote escaped, as structured fields require.
             Param::Str(k, v) => s.push_str(&format!(";{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))),
         }
     }
@@ -32,10 +36,12 @@ pub fn signature_params(components: &[&str], params: &[Param]) -> String {
 
 /// The signature base (RFC 9421 §2.5) for `(component, value)` pairs and the serialised parameters.
 pub fn signature_base(components: &[(&str, String)], params: &str) -> String {
+    // The base is one line per component, then the parameters.
     let mut s = String::new();
     for (name, value) in components {
         s.push_str(&format!("\"{name}\": {value}\n"));
     }
+    // The last line of the base is the parameters themselves, which binds them into the signature.
     s.push_str(&format!("\"@signature-params\": {params}"));
     s
 }
@@ -53,12 +59,14 @@ pub fn content_digest_sha256(body: &[u8]) -> String {
 /// Whether a `Content-Digest` value holds a matching `sha-512` or `sha-256` digest of `body` (others are ignored;
 /// at least one known one must be present, and every known one must match).
 pub fn content_digest_valid(value: &str, body: &[u8]) -> bool {
+    // At least one known digest must be present.
     let mut seen = false;
     for member in value.split(',') {
         let Some((alg, v)) = member.trim().split_once('=') else { return false };
         let want = match alg.trim() {
             "sha-512" => content_digest_sha512(body),
             "sha-256" => content_digest_sha256(body),
+            // Digests of other algorithms are ignored, not failed.
             _ => continue,
         };
         seen = true;
@@ -72,6 +80,7 @@ pub fn content_digest_valid(value: &str, body: &[u8]) -> bool {
 /// The parts of a request a signature covers.
 #[derive(Debug, Clone)]
 pub struct Message<'a> {
+    /// The request method.
     pub method: &'a str,
     /// The absolute request URI, as sent.
     pub target_uri: &'a str,
@@ -82,10 +91,12 @@ pub struct Message<'a> {
 impl Message<'_> {
     /// The value of a component, or `None` when the message does not have it.
     pub fn component(&self, name: &str) -> Option<String> {
+        // Derived components come from the parsed target address.
         let url = url::Url::parse(self.target_uri).ok();
         match name {
             "@method" => Some(self.method.to_ascii_uppercase()),
             "@target-uri" => Some(self.target_uri.to_string()),
+            // The authority is the lower-case host, with the port only when it is not the default.
             "@authority" => url.as_ref().and_then(|u| {
                 let host = u.host_str()?.to_ascii_lowercase();
                 Some(match u.port() {
@@ -94,7 +105,9 @@ impl Message<'_> {
                 })
             }),
             "@path" => url.map(|u| u.path().to_string()),
+            // The query component always starts with a question mark, even when it is empty.
             "@query" => url.map(|u| format!("?{}", u.query().unwrap_or(""))),
+            // A header field: its values trimmed and, if repeated, joined with a comma and a space.
             h if !h.starts_with('@') => {
                 let values: Vec<&str> = self.headers.iter().filter(|(k, _)| k == h).map(|(_, v)| v.trim()).collect();
                 (!values.is_empty()).then(|| values.join(", "))
@@ -105,7 +118,9 @@ impl Message<'_> {
 
     /// The signature base for these components and parameters.
     pub fn base(&self, components: &[&str], params: &[Param]) -> Option<(String, String)> {
+        // The covered components and their values, in order.
         let mut pairs = Vec::new();
+        // A component the message does not have makes the whole base impossible.
         for c in components {
             pairs.push((*c, self.component(c)?));
         }
@@ -123,6 +138,7 @@ pub fn sign_ed25519(
     params: &[Param],
 ) -> Option<(String, String)> {
     let (base, p) = msg.base(components, params)?;
+    // Ed25519 signs the base as bytes.
     let sig = key.sign(base.as_bytes());
     Some((format!("{label}={p}"), format!("{label}=:{}:", STANDARD.encode(sig.as_ref()))))
 }
@@ -131,18 +147,25 @@ pub fn sign_ed25519(
 /// the `keyid` and `created` values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputMember {
+    /// The member's label, which names its signature in the `Signature` field.
     pub label: String,
+    /// The covered components, in order.
     pub components: Vec<String>,
+    /// The component list and parameters exactly as they were serialised, because that text is part of what was signed.
     pub params: String,
+    /// The key the signer says it used.
     pub keyid: Option<String>,
+    /// When the signer says it signed, in Unix seconds.
     pub created: Option<i64>,
 }
 
 /// Reads the members of a `Signature-Input` field (inner lists of plain component names; no component parameters).
 pub fn parse_signature_input(value: &str) -> Vec<InputMember> {
     let mut out = Vec::new();
+    // The part of the field not read yet.
     let mut rest = value.trim();
     while !rest.is_empty() {
+        // Each member is `label=(components);params`, separated by commas.
         let Some((label, after)) = rest.split_once('=') else { break };
         let after = after.trim_start();
         let Some(close) = after.find(')') else { break };
@@ -151,14 +174,17 @@ pub fn parse_signature_input(value: &str) -> Vec<InputMember> {
         // Parameters run to the next top-level comma (strings here never contain one in practice; keep it strict).
         let end = tail.find(',').unwrap_or(tail.len());
         let params_str = tail[..end].trim_end();
+        // The component names without the quotes.
         let components: Vec<String> = list
             .trim_start_matches('(')
             .trim_end_matches(')')
             .split_whitespace()
             .map(|c| c.trim_matches('"').to_string())
             .collect();
+        // The two parameters the verifier reads.
         let mut keyid = None;
         let mut created = None;
+        // Only the two parameters the verifier needs are read out; the rest stay in the text that is signed.
         for p in params_str.split(';').filter(|p| !p.is_empty()) {
             match p.split_once('=') {
                 Some(("keyid", v)) => keyid = Some(v.trim_matches('"').to_string()),
@@ -180,6 +206,7 @@ pub fn parse_signature_input(value: &str) -> Vec<InputMember> {
 
 /// The signature bytes for `label` in a `Signature` field.
 pub fn signature_for(value: &str, label: &str) -> Option<Vec<u8>> {
+    // The member with this label.
     value.split(',').find_map(|m| {
         let (l, v) = m.trim().split_once('=')?;
         if l.trim() != label {
@@ -192,6 +219,7 @@ pub fn signature_for(value: &str, label: &str) -> Option<Vec<u8>> {
 /// Verifies the signature labelled `label` on a message with an ed25519 public key (32 bytes). Returns the parsed
 /// input member when it holds.
 pub fn verify_ed25519(msg: &Message<'_>, label: &str, public: &[u8]) -> Option<InputMember> {
+    // The signature is found through the message's own fields.
     let input = msg.component("signature-input")?;
     let member = parse_signature_input(&input).into_iter().find(|m| m.label == label)?;
     let sig = signature_for(&msg.component("signature")?, label)?;
@@ -200,6 +228,7 @@ pub fn verify_ed25519(msg: &Message<'_>, label: &str, public: &[u8]) -> Option<I
         pairs.push((c.as_str(), msg.component(c)?));
     }
     let base = signature_base(&pairs, &member.params);
+    // Verification fails closed: any problem is `None`.
     UnparsedPublicKey::new(&ED25519, public).verify(base.as_bytes(), &sig).ok()?;
     Some(member)
 }
@@ -208,10 +237,12 @@ pub fn verify_ed25519(msg: &Message<'_>, label: &str, public: &[u8]) -> Option<I
 /// authorization server's nonce, the interaction reference and the grant endpoint URI, joined by single newlines,
 /// hashed, and encoded as URL-safe base64 without padding.
 pub fn interaction_hash(client_nonce: &str, server_nonce: &str, interact_ref: &str, grant_endpoint: &str) -> String {
+    // The four values joined by newlines, as the RFC defines the hash input.
     let base = format!("{client_nonce}\n{server_nonce}\n{interact_ref}\n{grant_endpoint}");
     URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, base.as_bytes()))
 }
 
+/// Unit tests for signatures and digests, checked against the examples the RFCs publish.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,10 +252,12 @@ mod tests {
         crate::keys::ed25519_from_pem(&crate::keys::tests::rfc9421_test_key()).unwrap()
     }
 
+    /// Header fields from name and value pairs.
     fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
+    /// The signature base, the signature-input and the signature value equal the published example, it verifies as received, and changing a covered header breaks it.
     #[test]
     fn rfc_9421_b_2_6_ed25519() {
         // The test-request of RFC 9421 B.2, signed as in B.2.6.
@@ -270,6 +303,7 @@ mod tests {
         assert!(verify_ed25519(&Message { headers: &altered, ..msg }, "sig-b26", &public).is_none());
     }
 
+    /// The published example holds when uncovered parts change (a parameter added, a header added), and repeated Accept fields are joined before they are signed.
     #[test]
     fn rfc_9421_b_4_transformations() {
         // B.4: the same signature holds when uncovered parts change; repeated Accept fields are joined.
@@ -301,6 +335,7 @@ mod tests {
         }
     }
 
+    /// The digests equal the published values; a list with a matching known digest is valid, one that does not match is not, and a value with no known digest is not.
     #[test]
     fn content_digests_of_rfc_9530_and_9421() {
         let body = br#"{"hello": "world"}"#;
@@ -318,6 +353,7 @@ mod tests {
         assert!(!content_digest_valid("md5=:AAAA:", body), "no known digest");
     }
 
+    /// The interaction hash equals the value the RFC publishes for its example.
     #[test]
     fn gnap_interaction_hash_of_rfc_9635() {
         assert_eq!(
@@ -331,6 +367,7 @@ mod tests {
         );
     }
 
+    /// A field with two members parses into both, with the parameters as they were written.
     #[test]
     fn signature_input_parsing() {
         let v = "sig1=(\"@method\" \"@target-uri\");created=1;keyid=\"k\", sig2=(\"@method\");created=2";

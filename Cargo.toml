@@ -1,13 +1,20 @@
+# Link in Bio's Cargo workspace: eight crates that build one binary, `link-in-bio`.
+# The crates: core (the page document, renderer and interop documents; pure), assets (the picture pipeline), store (every SQL
+# statement), auth (passkeys, wallet sign-in, sessions), billing (the payment port and its adapters), safety (link screening),
+# api (the HTTP routers and the worker) and cli (the binary). Dependencies point downwards only: cli on api on the rest, and core on nothing.
 [workspace]
 resolver = "3"
 members = ["crates/core", "crates/assets", "crates/store", "crates/auth", "crates/billing", "crates/safety", "crates/api", "crates/cli"]
 
+# Fields every crate inherits, so a release changes one version in one place.
 [workspace.package]
 version = "0.0.8"
 edition = "2024"
 rust-version = "1.94"
+# The licence of every Meddleware repository.
 license = "0BSD"
 repository = "https://github.com/meddleware-org/link-in-bio-service"
+# Never published to crates.io: the service ships as a container image.
 publish = false
 
 # Exact pins, as in the rest of the fleet: a version changes only through a reviewed Cargo.lock update.
@@ -20,18 +27,23 @@ link-in-bio-auth = { path = "crates/auth" }
 link-in-bio-billing = { path = "crates/billing" }
 link-in-bio-safety = { path = "crates/safety" }
 
+# JSON documents and their (de)serialisation.
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.154", features = ["preserve_order"] }
 thiserror = "=2.0.21"
+# Links, addresses and hosts.
 url = "=2.5.8"
 unicode-segmentation = "=1.13.3"
 unicode-normalization = "=0.1.26"
+# The page's HTML, built with automatic escaping.
 maud = "=0.27.0"
 sha2 = "=0.11.1"
 hex = "=0.4.3"
+# Pictures: decoding the raster formats a person may upload, and rasterising the operator's own SVG.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 resvg = { version = "=0.50.0", default-features = false }
 pulldown-cmark = { version = "=0.13.6", default-features = false, features = ["html"] }
+# The HTTP stack.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tower-log"] }
 tower = { version = "=0.5.3", default-features = false, features = ["util", "limit", "timeout"] }
 tower-http = { version = "=0.7.1", default-features = false, features = ["timeout", "limit"] }
@@ -39,32 +51,48 @@ tokio = { version = "=1.54.1", default-features = false }
 clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "json", "env-filter", "ansi"] }
+# Property tests of the parser and the renderer.
 proptest = "=1.12.0"
+# The database driver, with the TLS stack and the migration runner, and no other driver.
 sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "time", "uuid"] }
+# Time, ids, encodings and the crypto the sign-in and the billing adapters use.
 time = { version = "=0.3.55", default-features = false, features = ["std", "formatting", "parsing", "macros"] }
 uuid = { version = "=1.29.0", default-features = false, features = ["std", "v4", "serde"] }
 base64 = "=0.23.1"
 ring = "=0.17.14"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+# Outbound HTTP to payment providers, banks, wallets and the screening services.
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2"] }
+# Lets the payment port be a trait object.
 async-trait = "=0.1.89"
 # Passkeys (kanidm's WebAuthn implementation; MPL-2.0, listed in deny.toml as a reviewed exception).
 webauthn-rs = { version = "=0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+# The access gate's core crate, whose Sui signature verifier the wallet sign-in reuses.
 access-gate-gateway-core = "=0.0.33"
 
+# Lints every crate inherits through `[lints] workspace = true`.
 [workspace.lints.rust]
+# No `unsafe` anywhere in the workspace.
 unsafe_code = "forbid"
+# Every item has a doc comment, private ones and fields included (the workspace documentation standard, D144).
+missing_docs = "deny"
 
 [workspace.lints.clippy]
+# The documentation standard's other half: private items need docs too.
+missing_docs_in_private_items = "deny"
+# Leftover debugging and unfinished code fail the build instead of reaching a release.
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
 
+# Settings for the binary that ships in the image.
 [profile.release]
 # Arithmetic overflow aborts instead of wrapping silently, even in release builds.
 overflow-checks = true
 # A panic stops the process (Kubernetes restarts the container with clean state).
 panic = "abort"
+# Link-time optimisation with one code-generation unit: slower to build, smaller and faster to run.
 lto = true
 codegen-units = 1
+# Debug symbols are not shipped.
 strip = true

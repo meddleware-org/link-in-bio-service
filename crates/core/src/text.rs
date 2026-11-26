@@ -7,15 +7,25 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Why a string was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextError {
+    /// Nothing was left after trimming, and an empty value is not allowed here.
     Empty,
-    TooLong { max: usize },
+    /// More than `max` user-perceived characters, or an unreasonable number of bytes for that many.
+    TooLong {
+        /// The limit that was passed, in user-perceived characters.
+        max: usize,
+    },
+    /// A control character, which includes line breaks and tabs.
     Control,
+    /// A bidirectional override, embedding or isolate, which can make text read differently from how it is stored.
     Bidi,
+    /// An invisible character, a separator or a noncharacter.
     Invisible,
+    /// A private-use character, which has no agreed meaning.
     PrivateUse,
 }
 
 impl TextError {
+    /// The stable code other software can match on.
     pub fn code(self) -> &'static str {
         match self {
             Self::Empty => "empty",
@@ -27,6 +37,7 @@ impl TextError {
         }
     }
 
+    /// A sentence for the person editing the page, saying what is wrong and how to fix it.
     pub fn message(self) -> String {
         match self {
             Self::Empty => "This cannot be empty.".into(),
@@ -45,20 +56,24 @@ const BYTES_PER_GRAPHEME: usize = 32;
 
 /// Normalises and checks one line of text. `max` counts user-perceived characters (grapheme clusters).
 pub fn clean_line(input: &str, max: usize, allow_empty: bool) -> Result<String, TextError> {
+    // Normalise to NFC first, so the same text typed two ways is one string.
     let s: String = input.nfc().collect();
     let s = s.trim().to_string();
     if s.is_empty() {
         return if allow_empty { Ok(s) } else { Err(TextError::Empty) };
     }
+    // Every character is checked, so one hidden character anywhere refuses the whole string.
     for c in s.chars() {
         check_char(c)?;
     }
+    // Two limits: the visible length, and a byte budget so a flood of combining marks cannot hide inside the visible limit.
     if s.graphemes(true).count() > max || s.len() > max * BYTES_PER_GRAPHEME {
         return Err(TextError::TooLong { max });
     }
     Ok(s)
 }
 
+/// Refuse one character that could make text pretend to be something else, by its code point.
 fn check_char(c: char) -> Result<(), TextError> {
     let u = c as u32;
     match u {
@@ -92,16 +107,19 @@ pub fn graphemes(s: &str) -> usize {
     s.graphemes(true).count()
 }
 
+/// Unit tests for the text rules.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Surrounding space is trimmed and a letter with a combining accent becomes the precomposed letter.
     #[test]
     fn trims_and_normalises() {
         // "e" + combining acute becomes the precomposed é.
         assert_eq!(clean_line("  e\u{0301}  ", 10, false).unwrap(), "\u{00e9}");
     }
 
+    /// Direction controls, line breaks, invisible and private-use characters are each refused with their own error, and empty text is refused unless empty is allowed.
     #[test]
     fn refuses_hostile_characters() {
         assert_eq!(clean_line("abc\u{202E}def", 10, false), Err(TextError::Bidi));
@@ -113,6 +131,7 @@ mod tests {
         assert_eq!(clean_line("   ", 10, true), Ok(String::new()));
     }
 
+    /// The limit counts what a reader sees, so a family emoji is one character, while the count still bounds the bytes.
     #[test]
     fn counts_graphemes_not_bytes() {
         // A family emoji is one grapheme of many code points.

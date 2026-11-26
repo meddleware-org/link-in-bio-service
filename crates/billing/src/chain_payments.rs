@@ -20,13 +20,16 @@ use crate::{
     BillingError, BillingProvider, CheckoutRequest, CheckoutStart, Fees, Method, Outcome, ProviderEvent, Seller,
 };
 
+/// The provider id recorded in the ledger and used as the prefix of the method ids.
 pub const ID: &str = "chain-payments";
+/// The webhook header that carries the signature, lower-cased as the router passes header names.
 pub const SIGNATURE_HEADER: &str = "chain-payments-signature";
 /// Notifications older (or newer) than this are refused.
 pub const MAX_AGE_SECS: u64 = 300;
 /// The period one unit buys, the same average month as the on-chain ledger and the store.
 pub const MONTH_MS: u64 = 2_629_800_000;
 
+/// How to reach Chain Payments and which of its methods to offer.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The merchant API (in-cluster), e.g. `http://chain-payments-api.chain-payments.svc.cluster.local:8081`.
@@ -35,6 +38,7 @@ pub struct Config {
     pub public_api: String,
     /// The origin the buyer's browser calls (the kit's `baseUrl`), e.g. `https://chain-payments.meddleware.dev`.
     pub checkout_origin: String,
+    /// The merchant API key, sent as a bearer token to the merchant API only.
     pub api_key: String,
     /// The Chain Payments method ids to offer and their labels, e.g. `("sui-testnet:SUI", "SUI")`.
     pub methods: Vec<(String, String)>,
@@ -42,17 +46,23 @@ pub struct Config {
     pub webhook_key: Option<String>,
 }
 
+/// The adapter.
 pub struct ChainPayments {
+    /// The settings.
     config: Config,
+    /// The client for the merchant and public APIs.
     http: reqwest::Client,
+    /// The webhook's public key: set at start from the configuration, or fetched once on first use.
     key: OnceCell<Vec<u8>>,
 }
 
+/// Wrap any error as a provider-unavailable error (its text, never a request body).
 fn unavailable(e: impl std::fmt::Display) -> BillingError {
     BillingError::Unavailable(e.to_string())
 }
 
 impl ChainPayments {
+    /// Build the adapter. A configured webhook key must be 32 bytes in hex, which is checked here so a typo stops the start-up.
     pub fn new(config: Config, http: reqwest::Client) -> Result<Self, BillingError> {
         let key = OnceCell::new();
         if let Some(k) = &config.webhook_key {
@@ -77,11 +87,12 @@ impl ChainPayments {
             .unwrap_or_default()
     }
 
+    /// The webhook public key: the configured one, or the one the service publishes, fetched once and kept.
     async fn webhook_key(&self) -> Result<&Vec<u8>, BillingError> {
         self.key
             .get_or_try_init(|| async {
                 let url = format!("{}/v1/webhook-key", self.config.public_api.trim_end_matches('/'));
-                let resp = self.http.get(&url).send().await.map_err(unavailable)?;
+                let resp = self.http.get(&url).send().await.map_err(crate::transport)?;
                 let v: Value = serde_json::from_slice(&crate::read_limited(resp, crate::MAX_ANSWER_BYTES).await?)
                     .map_err(unavailable)?;
                 v["publicKey"]
@@ -93,21 +104,23 @@ impl ChainPayments {
             .await
     }
 
+    /// A merchant API address for a path.
     fn merchant(&self, path: &str) -> String {
         format!("{}{path}", self.config.merchant_api.trim_end_matches('/'))
     }
 }
 
-/// The ledger's event id for a paid session.
 /// What the Chain Payments package keeps of each payment for the platform treasury, in basis points (0.2 %).
 pub const PLATFORM_FEE_BPS: u32 = 20;
 
+/// The ledger's event id for a paid session.
 pub fn paid_event_id(session: &str) -> String {
     format!("paid:{session}")
 }
 
 /// Checks a `Chain-Payments-Signature` header against a body.
 pub fn signature_valid(public: &[u8], header: &str, body: &[u8], now_unix: u64) -> bool {
+    // The timestamp and the signature, both required.
     let mut t = None;
     let mut sig = None;
     for part in header.split(',') {
@@ -118,20 +131,24 @@ pub fn signature_valid(public: &[u8], header: &str, body: &[u8], now_unix: u64) 
         }
     }
     let (Some(t), Some(sig)) = (t, sig) else { return false };
+    // A signature too old or too far in the future is refused, which stops a recorded webhook being replayed later.
     if now_unix.abs_diff(t) > MAX_AGE_SECS {
         return false;
     }
     let mut msg = format!("{t}.").into_bytes();
     msg.extend_from_slice(body);
+    // Ed25519 over `<t>.<body>`.
     UnparsedPublicKey::new(&ED25519, public).verify(&msg, &sig).is_ok()
 }
 
 #[async_trait::async_trait]
 impl BillingProvider for ChainPayments {
+    /// The provider id.
     fn id(&self) -> &'static str {
         ID
     }
 
+    /// One method for each configured coin, sold by the operator, with the platform fee as its only fee.
     fn methods(&self) -> Vec<Method> {
         self.config
             .methods
@@ -149,7 +166,9 @@ impl BillingProvider for ChainPayments {
             .collect()
     }
 
+    /// Start a Chain Payments session: the amount in pence, the months as units and the account's billing reference as the subscription reference; the service returns the session the buyer pays in the browser.
     async fn create_checkout(&self, req: &CheckoutRequest) -> Result<CheckoutStart, BillingError> {
+        // The method must be this provider's and one the configuration offers.
         let method = req.method.strip_prefix(&format!("{ID}:")).ok_or(BillingError::NotOffered)?;
         if !self.config.methods.iter().any(|(m, _)| m == method) {
             return Err(BillingError::NotOffered);
@@ -165,15 +184,17 @@ impl BillingProvider for ChainPayments {
         });
         let r = self
             .http
+            // The merchant API creates the session; it is reached in-cluster.
             .post(self.merchant("/v1/merchant/sessions"))
             .bearer_auth(&self.config.api_key)
             .json(&body)
             .send()
             .await
-            .map_err(unavailable)?;
+            .map_err(crate::transport)?;
         let status = r.status();
         let v: Value =
             serde_json::from_slice(&crate::read_limited(r, crate::MAX_ANSWER_BYTES).await?).map_err(unavailable)?;
+        // A refusal carries the service's own message (an error string), never the request.
         if !status.is_success() {
             return Err(BillingError::Refused(v["error"].as_str().unwrap_or("refused").to_string()));
         }
@@ -184,13 +205,16 @@ impl BillingProvider for ChainPayments {
         })
     }
 
+    /// Verify and read a webhook: a paid session, or a payment that arrived for a session already closed. Any other event is acknowledged and ignored.
     async fn verify_notification(
         &self,
         headers: &BTreeMap<String, String>,
         body: &[u8],
         now: OffsetDateTime,
     ) -> Result<Vec<ProviderEvent>, BillingError> {
+        // A request without the signature is not authentic.
         let header = headers.get(SIGNATURE_HEADER).ok_or(BillingError::Unauthentic)?;
+        // The key is fetched only if it was not configured.
         let key = self.webhook_key().await?;
         if !signature_valid(key, header, body, now.unix_timestamp().max(0) as u64) {
             return Err(BillingError::Unauthentic);
@@ -205,6 +229,7 @@ impl BillingProvider for ChainPayments {
             // Events this adapter does not act on are acknowledged and ignored.
             _ => return Ok(Vec::new()),
         };
+        // What the service says about the payment, kept as tax and accounting evidence.
         let evidence = json!({
             "webhook": webhook_id,
             "method": data["method"], "coinType": data["coinType"], "amount": data["amount"], "price": data["price"],
@@ -228,7 +253,9 @@ impl BillingProvider for ChainPayments {
         }])
     }
 
+    /// Ask the service how a session stands: a session the service no longer knows counts as expired.
     async fn checkout_outcome(&self, provider_ref: &str) -> Result<Outcome, BillingError> {
+        // A session id is 32 hex characters; checking it here keeps anything else out of the request path.
         if !provider_ref.bytes().all(|b| b.is_ascii_hexdigit()) || provider_ref.len() != 32 {
             return Err(BillingError::Malformed("not a session id".into()));
         }
@@ -238,7 +265,8 @@ impl BillingProvider for ChainPayments {
             .bearer_auth(&self.config.api_key)
             .send()
             .await
-            .map_err(unavailable)?;
+            .map_err(crate::transport)?;
+        // A session the service has forgotten can no longer be paid.
         if r.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(Outcome::Expired);
         }
@@ -246,6 +274,7 @@ impl BillingProvider for ChainPayments {
             serde_json::from_slice(&crate::read_limited(r, crate::MAX_ANSWER_BYTES).await?).map_err(unavailable)?;
         Ok(match v["status"].as_str() {
             Some("paid") => Outcome::Paid,
+            // A cancelled session is the same as an expired one for the account.
             Some("expired") | Some("cancelled") => Outcome::Expired,
             _ => Outcome::Open,
         })

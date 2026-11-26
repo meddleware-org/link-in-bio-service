@@ -6,6 +6,7 @@ use link_in_bio_core::{interop, parse};
 use proptest::prelude::*;
 use serde_json::Value;
 
+/// Parse options for a vector's owner: the operator's page is not held to the reserved handles; any other value is a tenant page, which is.
 fn opts(owner: Option<&str>) -> ParseOptions {
     match owner {
         Some("operator") => ParseOptions { owner: Owner::Operator, check_reserved: false },
@@ -13,21 +14,26 @@ fn opts(owner: Option<&str>) -> ParseOptions {
     }
 }
 
+/// A list sorted, so two lists of codes can be compared without caring about the order they were found in.
 fn sorted(mut v: Vec<String>) -> Vec<String> {
     v.sort();
     v
 }
 
+/// Run every case of the shared vectors file through the parser and compare the accepted or refused outcome, the error codes and the warning codes. The cases are plain data, so another implementation of the parser can be run against the same file.
 #[test]
 fn shared_vectors() {
+    // The vectors file is compiled in, so the test needs no path.
     let file: Value = serde_json::from_str(include_str!("../../../fixtures/manifests.json")).unwrap();
     for case in file["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
+        // A case is either raw text (for input that is not valid JSON) or a document.
         let bytes = match case.get("text") {
             Some(t) => t.as_str().unwrap().as_bytes().to_vec(),
             None => serde_json::to_vec(&case["document"]).unwrap(),
         };
         let expect = &case["expect"];
+        // The expected codes under a key, or none.
         let codes = |k: &str| -> Vec<String> {
             expect[k]
                 .as_array()
@@ -37,11 +43,13 @@ fn shared_vectors() {
         match parse(&bytes, opts(case["owner"].as_str())) {
             Ok(p) => {
                 assert!(expect["ok"].as_bool().unwrap(), "{name}: expected refusal, got {:?}", p.manifest);
+                // Accepted: the warning codes must match exactly.
                 let got = sorted(p.warnings.iter().map(|w| w.code.to_string()).collect());
                 assert_eq!(got, sorted(codes("warnings")), "{name}: warnings");
             }
             Err(errors) => {
                 assert!(!expect["ok"].as_bool().unwrap(), "{name}: expected acceptance, got {errors:?}");
+                // Refused: the distinct error codes must match; a repeated code is not compared by count.
                 let got = sorted(errors.iter().map(|e| e.code.to_string()).collect());
                 let mut want = sorted(codes("codes"));
                 want.dedup();
@@ -53,6 +61,7 @@ fn shared_vectors() {
     }
 }
 
+/// A page context for the property tests: a tenant page with an actor and no picture.
 fn cx() -> PageContext {
     PageContext {
         canonical: "https://ada.example.org/".into(),
@@ -69,6 +78,7 @@ fn cx() -> PageContext {
 }
 
 proptest! {
+    // Four hundred random cases for each property.
     #![proptest_config(ProptestConfig::with_cases(400))]
 
     /// Whatever text a person types, if it is accepted it appears in the page only as text: never as markup.
@@ -79,6 +89,7 @@ proptest! {
             "identity": { "displayName": name, "handle": "ada", "bio": bio },
             "items": [{ "id": "a", "title": title, "url": "https://example.org/" }]
         });
+        // Only accepted documents are rendered; a refused one never reaches the renderer.
         if let Ok(p) = parse(&serde_json::to_vec(&doc).unwrap(), ParseOptions::default()) {
             // The same page with plain words in place of the typed text: escaping adds no markup, so the number of
             // tags (every `<` in the document) must be identical.
@@ -91,6 +102,7 @@ proptest! {
             let html = render_page(&p.manifest, &cx());
             let reference = render_page(&plain, &cx());
             prop_assert_eq!(html.matches('<').count(), reference.matches('<').count());
+            // The JSON-LD block, which sits inside a script element, must never contain a `<`.
             let jsonld = interop::json_ld_for_html(&p.manifest, &cx());
             prop_assert!(!jsonld.contains('<'));
         }
@@ -103,7 +115,9 @@ proptest! {
     }
 }
 
+/// Any JSON value, with the keys the parser reads over-represented so that deep paths are reached, and nesting limited so a case stays small.
 fn arb_json() -> impl Strategy<Value = Value> {
+    // The values that end a branch: null, booleans, numbers, text, a valid link and the number 1.
     let leaf = prop_oneof![
         Just(Value::Null),
         any::<bool>().prop_map(Value::Bool),
@@ -112,6 +126,7 @@ fn arb_json() -> impl Strategy<Value = Value> {
         Just(Value::String("https://example.org/".into())),
         Just(Value::from(1)),
     ];
+    // Arrays and objects of those, up to four levels deep.
     leaf.prop_recursive(4, 64, 8, |inner| {
         prop_oneof![
             prop::collection::vec(inner.clone(), 0..8).prop_map(Value::Array),

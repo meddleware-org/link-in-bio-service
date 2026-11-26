@@ -11,19 +11,35 @@ pub const TEXT_MIN: f64 = 7.0;
 /// Minimum contrast for interface edges and focus indicators (WCAG 1.4.11).
 pub const UI_MIN: f64 = 3.0;
 
+/// Declare one theme option: an enum whose variants are named by a fixed string, with its list of all values, its name,
+/// parsing from a name, the names for the editor, a default, and serialisation as the name. A document can only ever
+/// choose among these values, which is what keeps the theme from being free CSS.
 macro_rules! options {
     ($(#[$m:meta])* $name:ident { $($var:ident => $s:literal),+ $(,)? } default $def:ident) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub enum $name { $($var),+ }
+        pub enum $name {
+            $(
+                #[doc = concat!("The `", $s, "` choice.")]
+                $var
+            ),+
+        }
         impl $name {
+            /// Every value, in declaration order.
             pub const ALL: &'static [$name] = &[$($name::$var),+];
+            /// The value's name, as written in a page document and in the page's `data-*` attribute.
             pub fn as_str(self) -> &'static str { match self { $($name::$var => $s),+ } }
+            /// The value with this name, or `None` for any name outside the set.
             pub fn parse(s: &str) -> Option<Self> { match s { $($s => Some($name::$var),)+ _ => None } }
+            /// Every name, for the editor and for error messages that list the valid choices.
             pub fn names() -> Vec<&'static str> { Self::ALL.iter().map(|v| v.as_str()).collect() }
         }
-        impl Default for $name { fn default() -> Self { $name::$def } }
+        impl Default for $name {
+            /// The choice a document gets when it does not make one.
+            fn default() -> Self { $name::$def }
+        }
         impl Serialize for $name {
+            /// A value is written as its name.
             fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> { s.serialize_str(self.as_str()) }
         }
     };
@@ -41,24 +57,41 @@ options!(
         Season => "season", Red => "red", Orange => "orange", Yellow => "yellow", Green => "green", Blue => "blue",
         Terracotta => "terracotta", Moss => "moss", Slate => "slate",
     } default Season);
-options!(Buttons { Filled => "filled", Outline => "outline", Plain => "plain" } default Outline);
-options!(Radius { Xs => "xs", Sm => "sm", Md => "md", Lg => "lg" } default Md);
-options!(Density { Comfortable => "comfortable", Compact => "compact" } default Comfortable);
-options!(Layout { List => "list", Cards => "cards" } default List);
+options!(
+    /// How link buttons are drawn: with a filled background, an outline, or plain text. The choice decides which contrast rule applies to the accent.
+    Buttons { Filled => "filled", Outline => "outline", Plain => "plain" } default Outline);
+options!(
+    /// Corner rounding, from small to large.
+    Radius { Xs => "xs", Sm => "sm", Md => "md", Lg => "lg" } default Md);
+options!(
+    /// Spacing: comfortable or compact.
+    Density { Comfortable => "comfortable", Compact => "compact" } default Comfortable);
+options!(
+    /// Whether links are a plain list or cards.
+    Layout { List => "list", Cards => "cards" } default List);
 options!(
     /// System font stacks only: no web fonts are ever loaded.
     Font { Sans => "sans", Serif => "serif", Rounded => "rounded", Mono => "mono" } default Sans);
 
+/// The whole theme: one choice from each option, all of them from the fixed sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Theme {
+    /// Light, dark, or follow the visitor's device.
     pub color_mode: ColorMode,
+    /// A seasonal palette, or none.
     pub season: Season,
+    /// The accent hue.
     pub accent: Accent,
+    /// How buttons are drawn.
     pub buttons: Buttons,
+    /// Corner rounding.
     pub radius: Radius,
+    /// Spacing.
     pub density: Density,
+    /// List or cards.
     pub layout: Layout,
+    /// Which system font stack.
     pub font: Font,
 }
 
@@ -77,6 +110,7 @@ impl ColorMode {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Resolved {
+    /// The accent colour.
     #[serde(serialize_with = "ser_rgb")]
     pub accent: Rgb,
     /// Text drawn on the accent (filled buttons).
@@ -86,6 +120,7 @@ pub struct Resolved {
     pub text_ratio: f64,
 }
 
+/// Write a colour as its `#rrggbb` hex string.
 fn ser_rgb<S: serde::Serializer>(c: &Rgb, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&c.hex())
 }
@@ -111,9 +146,13 @@ fn candidates(t: &Tokens, accent: Accent, season: Season, mode: Mode) -> Vec<(Rg
 /// Picks the accent for one mode, or returns the best contrast reached when nothing passes.
 pub fn resolve_mode(accent: Accent, buttons: Buttons, season: Season, mode: Mode) -> Result<Resolved, f64> {
     let t = Tokens::get();
+    // The three backgrounds the page can draw on in this mode; an accent used as text must reach the minimum on every one.
     let canvases = ["bg", "surface", "lift"].map(|r| t.role(mode, r));
+    // The neutrals tried for the label on a filled button: white, a dark grey and near black.
     let label_candidates = [t.ramps["neutral"]["000"], t.ramps["neutral"]["800"], t.ramps["neutral"]["950"]];
+    // The best contrast any candidate reached, reported when none passes.
     let mut best = 0.0_f64;
+    // Candidates are tried in order of preference; the first that passes wins, so the most natural shade is used.
     for (shade, fixed_on) in candidates(t, accent, season, mode) {
         let outcome = match buttons {
             Buttons::Filled => {
@@ -131,6 +170,7 @@ pub fn resolve_mode(accent: Accent, buttons: Buttons, season: Season, mode: Mode
             }
             Buttons::Outline | Buttons::Plain => {
                 // The accent is the text colour (and, for outline, the edge) on every canvas the page uses.
+                // The weakest canvas decides, so the accent is readable on all of them.
                 let ratio = canvases.iter().map(|c| c.contrast(shade)).fold(f64::INFINITY, f64::min);
                 (ratio, fixed_on.unwrap_or(label_candidates[0]))
             }
@@ -146,13 +186,17 @@ pub fn resolve_mode(accent: Accent, buttons: Buttons, season: Season, mode: Mode
 /// Why a theme was refused, in plain words, with the fix.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ContrastFailure {
+    /// The colour mode that failed (`light` or `dark`).
     pub mode: &'static str,
+    /// The best text contrast any shade reached, rounded to two decimals.
     pub best_ratio: f64,
+    /// A sentence naming the combination and how to fix it.
     pub message: String,
 }
 
 /// Checks a whole theme in every mode its colour mode can show.
 pub fn check(theme: &Theme) -> Result<Vec<(Mode, Resolved)>, Vec<ContrastFailure>> {
+    // The resolved colours per mode, and the failures, for the modes this colour mode can show.
     let mut ok = Vec::new();
     let mut failures = Vec::new();
     for &mode in theme.color_mode.modes() {
@@ -168,12 +212,14 @@ pub fn check(theme: &Theme) -> Result<Vec<(Mode, Resolved)>, Vec<ContrastFailure
     if failures.is_empty() { Ok(ok) } else { Err(failures) }
 }
 
+/// The plain-words reason a combination failed, with the alternatives that would pass: other buttons, another accent, or showing the page in one mode only.
 fn fix_message(theme: &Theme, mode: Mode, best: f64) -> String {
     let what = match theme.accent {
         Accent::Season if theme.season == Season::None => "The default accent".to_string(),
         Accent::Season => format!("The {} accent", theme.season.as_str()),
         a => format!("The {} accent", a.as_str()),
     };
+    // Other button styles that do pass for this accent in this mode.
     let alternatives: Vec<&str> = Buttons::ALL
         .iter()
         .filter(|b| **b != theme.buttons && resolve_mode(theme.accent, **b, theme.season, mode).is_ok())
@@ -184,6 +230,7 @@ fn fix_message(theme: &Theme, mode: Mode, best: f64) -> String {
     } else {
         format!("choose {} buttons or another accent", alternatives.join(" or "))
     };
+    // Only a page that follows the device can drop one mode; a fixed mode is already one.
     let only = match (theme.color_mode, mode) {
         (ColorMode::System, Mode::Dark) => ", or show the page in light mode only",
         (ColorMode::System, Mode::Light) => ", or show the page in dark mode only",
@@ -200,10 +247,15 @@ fn fix_message(theme: &Theme, mode: Mode, best: f64) -> String {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OptionRow {
+    /// The accent hue.
     pub accent: Accent,
+    /// The button style.
     pub buttons: Buttons,
+    /// The seasonal palette, or none.
     pub season: Season,
+    /// The resolved colours in light mode, or `None` when the combination fails there.
     pub light: Option<Resolved>,
+    /// The resolved colours in dark mode, or `None` when the combination fails there.
     pub dark: Option<Resolved>,
 }
 
@@ -229,14 +281,17 @@ pub fn option_table() -> Vec<OptionRow> {
 /// The CSS that turns `data-accent`/`data-buttons` (per mode) into `--lib-accent`/`--lib-on-accent`. A combination
 /// that fails in a mode gets no rule for that mode; the parser refuses such a theme, so no page needs one.
 pub fn accent_css() -> String {
+    // The rules for light mode, for dark mode, and for the system mode inside a dark-scheme query.
     let mut light = String::new();
     let mut dark = String::new();
     let mut system = String::new();
     for row in option_table() {
         // A season-coloured accent follows the season attribute; rules for hues do not depend on the season.
+        // A hue does not depend on the season, so only the no-season row is written for it.
         if row.accent != Accent::Season && row.season != Season::None {
             continue;
         }
+        // A season accent is selected by the season attribute, or by its absence for the default.
         let season_sel = if row.accent == Accent::Season && row.season != Season::None {
             format!("[data-season=\"{}\"]", row.season.as_str())
         } else if row.accent == Accent::Season {
@@ -265,6 +320,7 @@ pub fn accent_css() -> String {
 /// Every rule of the token files that applies to `[data-theme="dark"]`, repeated for `[data-theme="system"]` inside a
 /// `prefers-color-scheme: dark` query, so the system mode works without JavaScript.
 pub fn system_mode_css(token_css: &[&str]) -> String {
+    // Every dark rule is repeated for the system mode inside a dark-scheme query, so the system mode needs no script.
     let mut out = String::from("@media (prefers-color-scheme: dark) {\n");
     for css in token_css {
         for (selector, body) in crate::tokens::css_rules(css) {
@@ -283,15 +339,18 @@ pub fn system_mode_css(token_css: &[&str]) -> String {
     out
 }
 
+/// Unit tests for the theme.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The default theme meets the contrast rule in both modes.
     #[test]
     fn default_theme_passes_in_both_modes() {
         assert!(check(&Theme::default()).is_ok());
     }
 
+    /// Every combination that passes reaches the 7:1 text minimum, and every combination that fails is refused with a message that says what to choose.
     #[test]
     fn every_passing_row_reaches_aaa_and_every_failing_row_says_how_to_fix_it() {
         for row in option_table() {
@@ -314,6 +373,7 @@ mod tests {
         }
     }
 
+    /// No hue is unusable: each has at least one button style that passes in each mode.
     #[test]
     fn each_hue_has_at_least_one_passing_button_style_per_mode() {
         for &accent in Accent::ALL {
@@ -326,6 +386,7 @@ mod tests {
         }
     }
 
+    /// The system-mode CSS repeats the dark rules, season rules included, and holds no class-based selector.
     #[test]
     fn system_css_mirrors_the_dark_rules() {
         let css = system_mode_css(&[crate::tokens::TOKENS_CSS, crate::tokens::SEASONS_CSS]);

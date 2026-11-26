@@ -11,6 +11,10 @@
   AUDIT_TEMPLATE_A11Y.md (2026-11-01) + AUDIT_TEMPLATE_SUI_CLIENT.md (2026-10-08, the wallet sign-in's signature rows
   only) + AUDIT_TEMPLATE_VUE.md (2026-11-01, B.VUE-1 hosting headers only) + AUDIT_TEMPLATE_TS.md (2026-11-01, the
   `page/` build and test tooling only)
+**Added 2026-11-26 (Part B documentation pass):** AUDIT_TEMPLATE_DOCS.md (2026-11-20); AUDIT_TEMPLATE_RFC.md (2026-11-19), ●: the open-format
+  documents, WebFinger, security.txt, HTTP message signatures, GNAP, the Access JWT; AUDIT_TEMPLATE_IOP.md (2026-11-19), ●: the account export and
+  deletion, the page format, the published OpenAPI files, the dependencies; AUDIT_TEMPLATE_PRIV.md (2026-11-20), ●: the visitor's browser, the
+  account's data, the third-party link screening; AUDIT_TEMPLATE_CONF.md (2026-11-26), ●: the settings that can carry a credential.
 **Deployment status:** `v0.0.4` tagged (image `quay.io/meddleware-org/link-in-bio-service`, signed by CI). The workspace's
   `config/images.yaml` and `post-bootstrap/link-in-bio/overlays/default` pinned `0.0.3`
   (`sha256:4a7fbc5c…`) at review; the hosted service runs on testnet with every switch closed (`SIGNUP_MODE=closed`,
@@ -22,7 +26,7 @@
   what HTML is served under the product's domain for every tenant. A sign-in flaw takes over accounts; a ledger flaw gives
   away or takes away paid time; a renderer flaw runs a tenant's script for every visitor. Realised ceiling at this pass:
   **Low** (F30–F34; F1 and F2 were Medium, F25–F29 Low, all RESOLVED).
-**Status:** first-pass baseline
+**Status:** first-pass baseline; Part B documentation pass 2026-11-26 (F35 and F37 RESOLVED, F36 DEFERRED, FU-0206)
 
 **Toolchain:** `rust-version = "1.94"` (MSRV job), stable in CI   **Edition:** 2024
 **Crates published:** no (`publish = false`)
@@ -127,8 +131,8 @@ boundaries are well drawn:
 
 **Open:** none above Info but F30–F34 (each dispositioned below).
 
-**Dispositions (34 findings):** RESOLVED 17 · ADJUDICATED 4 · ACCEPTED-RISK 1 · DEFERRED 0 · Positive 12.
-**Counts by severity:** Medium 2 · Low 13 · Info 7 · Positive 12.
+**Dispositions (37 findings):** RESOLVED 19 · ADJUDICATED 4 · ACCEPTED-RISK 1 · DEFERRED 1 · Positive 12.
+**Counts by severity:** Medium 2 · Low 15 · Info 8 · Positive 12.
 
 **Posture:** a careful design with the right primitives at every boundary, now with least privilege between the service's
 own processes and amount checks on the card providers' notifications before real money flows.
@@ -802,6 +806,79 @@ paid for. Not worth a lock.
 **Impact:** Bounded by 30 reports a minute per address at the ingress, 4000-character details and a 24 h alert; reports change
 nothing by themselves (an operator decides).
 
+### F35 — Drift: no `CONTRIBUTING.md`, the doc lints off, most items, fields and files undocumented
+
+**Severity:** Low   **Disposition:** RESOLVED (2026-11-26, unreleased)
+**Where:** the repository root had no `CONTRIBUTING.md`; the workspace lints did not require doc comments, and most struct fields, enum variants, private items, workflows, scripts and the page's own files had none. Three comments had drifted from their code: the doc of `ceil_div` in `refunds.rs` described an older rounding, the docs of `find` and `debtor_of` in `bank_transfer.rs` were swapped, and a doc in `chain_payments.rs` sat on the wrong item.
+**Remediation / evidence:** `CONTRIBUTING.md` is written; `missing_docs` and `clippy::missing_docs_in_private_items` are denied in the workspace lints and clippy passes with `-D warnings`; every item, field and variant is documented, and every file carries a header and line-level comments (`node scripts/check-docs.mjs --report link-in-bio-service` in the workspace: every measured file meets the standard). The three drifted comments are corrected. Applied migrations are excluded because their checksums include comments. The page's stylesheet and script are now commented line by line, so `crates/core/src/assets.rs` strips the comments when it embeds them (a visitor downloads only the code); the test `shipped_files_carry_no_comments` pins that the stripping removes comments and nothing else.
+
+### F36 — The account export leaves out older versions' documents and the picture
+**Severity:** Info   **Disposition:** DEFERRED (FU-0206)
+**Where:** `hosted/app.rs::me_export` (`GET /api/v1/me/export`).
+**Issue:** the export carries the draft and published page documents (the open JSON format), the version numbers and times, the sign-in method names, wallets, domains, billing, decisions and appeals. It does not carry the document of each older version (they are stored: `lib.page_versions.manifest`) or the picture's bytes (the document names the picture by hash; `GET /api/v1/assets/<hash>.<ext>` serves it without a session, so it can be fetched, but the export does not say so).
+**Impact:** none today (the current page is complete, and nobody is locked in); a person who wants their whole history out has to ask.
+**Remediation / evidence:** FU-0206 adds the version documents and a picture reference, with a round-trip test (export, then import through `PUT /api/v1/page`), and agrees the format with the content hub's export (FU-0205).
+
+### F37 — A failed call to a provider repeated the address that was called
+**Severity:** Low   **Disposition:** RESOLVED (2026-11-26, unreleased)
+**Where:** `crates/billing/src/lib.rs::unavailable` and its copies in the payment and bank-feed adapters, which wrapped the HTTP client's error text. The client's text for a failed request ends with the full address, query included (`error sending request for url (…)`).
+**Issue:** the address of a provider (`CHAIN_PAYMENTS_API_BASE`, the bank-feed bases, a wallet address's server) is an operator setting and can carry a private path or query. A refused connection or a timeout put it into the error, and the error reached the logs (`tracing` calls in `hosted/app.rs`, `hosted/internal.rs` and the worker) and, for a bank feed, the stored `last_error` of its status row.
+**Impact:** the text is seen only by the operator (the API answers the caller with a fixed message), so nothing leaks to a visitor; but it breaks the platform's no-echo rule (D146) and would persist an address in the database.
+**Remediation / evidence:** a new `transport()` wraps every `reqwest` error with the address removed (`Error::without_url`); the call sites that wrapped a client error now use it, and the three adapters' unused copies of `unavailable` are gone. The test `a_transport_failure_never_repeats_the_address` makes a real connection fail against a stand-in path and query secret and fails on the old code with the whole address in the message.
+
+### Part B documentation pass (2026-11-26)
+
+Scope: every tracked file of the repository (the eight crates, the migrations, the tests, the scripts, the workflows, the page's sources and tooling, the manifests and the documents; 151 files, 115 measured by the documentation standard's file measure, 18 excluded: the lockfiles, the licence text, the migrations, images and vendored files) read against the workspace's
+`docs/operations/DOCUMENTATION_STANDARD.md` and annotated (Part B Phase 1, the thirtieth repository, the fifth Rust one); the DOCS, RFC, IOP, PRIV and CONF lenses applied for the first time.
+Before editing: the baseline is the audit's last recorded figure; it was not re-run separately before the first edit. After: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` with `missing_docs` and `clippy::missing_docs_in_private_items` now **denied** in the workspace lints, and `cargo test --workspace` (172 passed, 0 failed, 0 ignored, against a PostgreSQL 18 with TLS started by `scripts/test-postgres.sh` under podman, so no database test skipped).
+The Rust diff is comment-only (compared with comment lines stripped) apart from struct and enum variants whose fields were written out one per line so each can carry a doc comment, the argument docs on the command-line definitions (which clap shows as `--help` text), the `#[doc]` attributes the enum-generating macros in `icons.rs` and `theme.rs` emit, the stripping of comments from the embedded page files and its test, the F37 fix (`transport()` and its test), and the workflow step name `Generate the SBOM of the binary` (it generated one SBOM and said two). Compared with comments, white space and trailing commas removed, every other Rust file is identical to `HEAD`. The applied migrations are untouched.
+**Not run here:** `cargo deny`, `cargo llvm-cov`, the image build and `scripts/smoke.sh`, and the browser tests (they need Docker, Playwright's browsers or network access; the changes to those files are comments, and the two YAML workflows parse; the vendored-files check, which needs only the installed packages, passes).
+
+#### B.RFC-1 Standards inventory
+
+| Standard | Where | Evidence |
+| --- | --- | --- |
+| Link sets (RFC 9264, `application/linkset+json`) with the Profile Links profile; `rel=me` uses the microformats extension relation until `me` is registered with IANA | `crates/core/src/interop.rs`, `spec/profile-links-v1.md` | the vectors in `crates/core/tests/vectors.rs`, the page tests |
+| WebFinger (RFC 7033) JRD for `acct:<handle>@<domain>`; a read-only ActivityPub actor; Nostr NIP-05; the AT Protocol handle file | `interop.rs`, `static_mode.rs` | the interop tests, `e2e/page.spec.ts` |
+| `security.txt` (RFC 9116) with an RFC 3339 `Expires` | `interop.rs` | the interop tests |
+| microformats2 h-card and schema.org `ProfilePage` JSON-LD | `render.rs`, `interop.rs` | `e2e/page.spec.ts` |
+| HTTP semantics: strict CSP, `Referrer-Policy`, `nosniff`, immutable caching of hashed assets, `405` for other methods | `crates/api/src/headers.rs`, `static_mode.rs` | `e2e/page.spec.ts`, `scripts/smoke.sh` |
+| JWT (RFC 7519) verified with RS256 against the Access key set, with the JWT best current practice (RFC 8725) | `crates/api/src/hosted/jwt.rs` | the `jwt` tests |
+| HTTP Message Signatures (RFC 9421) with ed25519, `Content-Digest` (RFC 9530), the GNAP interaction hash (RFC 9635 §4.2.3), JWK for ed25519 (RFC 8037), PEM (RFC 7468) | `crates/billing/src/httpsig.rs`, `keys.rs`, `open_payments.rs` | the RFC examples in the `httpsig` tests |
+| OAuth 2.0 client assertion (RFC 7523) signed RS256, for Revolut Business | `crates/billing/src/bank_feed/revolut.rs` | `tests/conformance.rs` |
+| WebAuthn Level 3 through `webauthn-rs`, user verification required; CAIP-122 / EIP-4361 sign-in text with Sui's personal-message intent | `crates/auth` | `tests/passkey.rs`, `sign_in_round_trip` |
+| Timestamps in RFC 3339 | the interop documents, the API, the export | the date tests |
+| OpenAPI, generated from the route table | `crates/api/src/hosted/openapi.rs`, `openapi/` | the test that fails when the committed files differ |
+| OCI image and distribution, Sigstore keyless signing, SPDX and CycloneDX SBOMs, SLSA provenance from BuildKit | `docker-publish.yml`, `scripts/check-index.sh`, `check-sbom.sh` | the publish run, the gate scripts and their tests |
+
+**B.RFC-2 Non-final standards:** none on a request path. The `me` link relation is not yet registered (the page uses the microformats relation until it is, see `REL_ME`). **B.RFC-3 Deviations:** the app and console APIs answer errors in the project's own JSON shape, not RFC 9457 problem details (it is the shape the editor and the published client read; changing it would break them), so it is a recorded deviation, not a defect.
+
+#### B.IOP Interoperability, portability and exit
+
+- **Portability and exit:** a page is one JSON document in a published, versioned format (the manifest, with limits printed by `link-in-bio schema` and served at `GET /api/v1/limits`), so a person's page can be taken to any other host that reads it, or served from the static mode of this very binary. `GET /api/v1/me/export` returns the account's data as one JSON download and `DELETE /api/v1/me` erases it (the row stays as `deleted`, so the handle is not reissued, with the billing records the law requires). The export omits the older versions' documents and the picture bytes (F36, FU-0206). What the operator holds beyond accounts (the blocklist, the audit log, the bank-feed cursors) is in the database, which the platform's daily dump covers.
+- **Open API and compatible competition:** every app and console route is in `routes.rs` and described by the committed OpenAPI files, versioned in the path (`/api/v1`). The page format and the Profile Links specification are published, so another server can render or read the same documents. Nothing gives link-in-bio-ui special access beyond the session and the request header every client sends. There is no written deprecation policy beyond the platform's rule that releases before mainnet are patch bumps with the changelog naming what broke.
+- **Dependencies (exit register):** Cloudflare Access (the console sign-in; its replacement is Part F, ADR-0015/0016) and the Cloudflare tunnel, DNS and edge cache; Keto and the database tier (ours); Chain Payments (ours) and the payment providers and banks that are switched on; Google Web Risk and abuse.ch ThreatFox (optional screening); Cloudflare's DNS-over-HTTPS resolver (custom-domain checks); the Sui full node (wallet sign-in); quay.io, Docker Hub and the self-hosted registry; GitHub Actions, crates.io, npm, Sigstore, Trivy and Dependabot.
+- **Incentives:** no telemetry (`DO_NOT_TRACK=1` in the workflows), no ads, no trackers on any page, no redirector or click counting, no sale of data.
+
+#### B.PRIV Privacy honoured
+
+- **A visitor's browser:** a page sets no cookie and stores nothing unless the visitor ticks "Remember on this device", which keeps one `localStorage` key (`lib-color-mode`) and unticking removes it (tested in `e2e/page.spec.ts`). Every page request goes to its own origin (the same file asserts that no request leaves it), with `Referrer-Policy: no-referrer` and links straight to their targets.
+- **The app's browser state:** one cookie, `__Host-lib_session` (a random value whose SHA-256 is stored), set after sign-in or sign-up and cleared by logout.
+- **What is stored about people:** the 18+ declaration, the terms version, the declared and the request country of each purchase (`CF-IPCountry`, as tax evidence), wallet addresses, passkey public keys, report contacts and texts, appeals, refund reasons and the Open Payments buyer wallet addresses. `open_payments_grants.pending` holds a continuation token while a grant is in progress and is cleared when it finishes. The service reads no client IP address (it uses none for limits: that is the ingress's job), and visitors to a page are not recorded.
+- **Third-party requests:** Google Web Risk, when a key is set: in `lookup` mode the **link addresses** of published links are sent to Google, in `update` mode only hash prefixes are (the operator chooses the mode, `docs/HOSTED.md` "Web Risk: two modes", and the key is sent in the query string); abuse.ch ThreatFox, when a key is set (the service downloads indicators and sends no page data); Cloudflare's DNS-over-HTTPS resolver, which learns the custom hostnames being verified; the payment providers, bank feeds and wallet providers that are switched on; Keto and Chain Payments (in-cluster, F32). Errors for these calls use fixed messages and never repeat the address or key.
+- **Logs:** JSON on stdout. The 17 `tracing` calls were read: they log listener addresses, handles, counts, provider names, checkout ids and the error values of database and provider calls; after F37 none of those carries a configured address, and no call is passed a token or page contents.
+
+#### B.CONF Configuration and values
+
+- **Configuration surface:** the environment only, parsed once at start-up (`hosted/config.rs`, `crates/store/src/config.rs`, `crates/api/src/config.rs` and the CLI's arguments; `docs/HOSTED.md` lists every variable and default); secrets are `*_FILE` settings that name a mounted file. A bad value fails naming its key.
+- **Values that can carry a credential:** `DATABASE_URL` (a password), `SUI_RPC_URL` (an address may carry a key), the payment providers' and banks' URLs (`*_API_BASE`), and every `*_FILE` setting's file contents (the files themselves are credentials; the setting holds only a path).
+- **Echo sweep (2026-11-26):** every `format!`, `#[error]` and `tracing` call that takes a configured or caller-supplied value was read. Held: `DatabaseSettings` redacts the password in `Debug` and its errors name the missing part or the refused parameter's **name**, never a value; the URL checks (`safe_url`, `check_https`) answer with fixed messages that name the field and the rule, never the address; the Web Risk, ThreatFox and Access calls fail with fixed text (`Web Risk unreachable`, `ThreatFox unreachable`, `cannot read the key file`). **Not held, now fixed:** the payment and bank-feed adapters repeated the called address in their errors (F37).
+  Echoed on purpose and not credentials: the **file path** in a key-file read error (the operator needs the path to fix a mount), and the value of an enumerated setting that is refused (`SIGNUP_MODE`, `BILLING_PROVIDERS`, `BANK_FEEDS`, `WEB_RISK_MODE`, `ACCOUNT_LIMITS`, the bank-transfer scheme and the `SUI_NETWORK` in the full-node message). Apart from F37, no configured address or credential was found echoed; the redaction tests in `crates/store/src/config.rs` pin the database URL rule.
+- **Duplicated literals (B.CONF-3):** the version in the workspace manifest only (the crates inherit it); the OpenAPI files (checked against the route table by a test); the vendored tokens and sprite (checked by `npm run check:vendored`).
+- **Secrets apart from settings:** the credentials are mounted files from SOPS Secrets, never in the database (it holds only the continuation token above and hashes); examples and tests use `example.org` hosts and fixed test keys.
+
+---
+
 ## Section A — Invariant verification matrix
 
 | # | Invariant | Enforced at | Proven by | Status |
@@ -1094,6 +1171,13 @@ Not covered by tests:
     SECURITY.md); F3 was reported by the deployment work the same day;
   - deferred F25–F29 to FU-0138–FU-0142 and recorded FU-0143 for chain-payments-service;
   - opened OQ1 and OQ2.
+
+- 2026-11-26 — Part B documentation pass at `HEAD` of the repository (v0.0.8, plus the unreleased CI change):
+  - read every tracked file against the documentation standard and annotated it (115 measured files meet it); the lints `missing_docs` and
+    `clippy::missing_docs_in_private_items` are now denied;
+  - corrected three drifted doc comments (F35, RESOLVED), added `CONTRIBUTING.md`, stripped comments from the embedded page files;
+  - applied the RFC, IOP, PRIV and CONF lenses for the first time (the sections above); fixed F37 (the called address in provider errors, with a test) and recorded F36 (DEFERRED, FU-0206);
+  - `cargo fmt --check`, clippy `-D warnings` and `cargo test --workspace` (172 passed, 0 failed, 0 ignored) pass.
 
 ## Pre-save consistency checklist (this pass)
 

@@ -38,6 +38,14 @@ documents other software reads (Profile Links, JSON-LD, WebFinger, ActivityPub, 
 - **No `unsafe`**, and no `unwrap` or `expect` on request paths, except the operating system's random number generator
   in `link-in-bio-auth` (it cannot fail on a running Linux). Release builds keep overflow checks and abort on panic.
 
+## Documentation rules (workspace documentation standard, D144)
+
+Every file has a header and every declaration a doc comment, struct fields and enum variants included (`missing_docs` and
+`clippy::missing_docs_in_private_items` are `deny` in the workspace lints, so clippy fails the build on a gap). Comments say why. Applied SQL
+migrations (`crates/store/migrations/*.sql`) are never edited, comments included, because their checksums are verified. The page's
+stylesheet and script are embedded with their comments stripped (`assets.rs`), so keep comments in `enhance.js` on lines of their own. `node
+scripts/check-docs.mjs --report link-in-bio-service` (in the workspace repository) is the gate. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Layers and commands
 
 | Crate | Holds |

@@ -1,20 +1,29 @@
+# Link in Bio's sign-in crate: passkeys, Sui wallet sign-in, recovery codes, sessions and the CSRF rule. No I/O: the store and the HTTP layer
+# live in other crates, so each method can be swapped without touching the others.
+# The crate's identity.
 [package]
 name = "link-in-bio-auth"
 description = "Link in Bio: passkeys, Sui wallet sign-in, recovery codes, sessions and the CSRF rule (no I/O)."
+# Version, edition, minimum Rust, licence and repository come from the workspace manifest.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Inherited: no crate here is published to crates.io.
 publish.workspace = true
 
+# Runtime dependencies are versioned once, in the workspace manifest.
+# `webauthn-rs` does the passkey protocol; the gateway's core crate verifies the Sui wallet's signature, so one implementation of that rule serves both.
 [dependencies]
 webauthn-rs.workspace = true
 access-gate-gateway-core.workspace = true
+# `ring` is the operating system's random source for tokens and codes; `sha2` hashes what is stored.
 ring.workspace = true
 sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
+# Time, ids and addresses for the challenges and the cookie lifetimes.
 time.workspace = true
 uuid.workspace = true
 url.workspace = true
@@ -22,8 +31,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+# Test-only: a software passkey that plays the part of a person's authenticator.
 [dev-dependencies]
 webauthn-authenticator-rs = { version = "=0.6.2", features = ["softpasskey"] }
 
+# The workspace's lint set, including the documentation lints.
 [lints]
 workspace = true

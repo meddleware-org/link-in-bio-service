@@ -14,14 +14,22 @@ pub const VALID_FOR: Duration = Duration::minutes(5);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Challenge {
+    /// The host the wallet is asked to sign in to (the app's host), which the signed text names so a signature for another site is worthless here.
     pub domain: String,
+    /// The address the sign-in is for.
     pub uri: String,
+    /// The Sui network, which becomes the chain id in the text.
     pub network: String,
+    /// The wallet address in canonical form.
     pub address: String,
+    /// A random value, so each challenge is signed once.
     pub nonce: String,
+    /// The sentence the wallet shows the person.
     pub statement: String,
+    /// When the challenge was made.
     #[serde(with = "rfc3339")]
     pub issued_at: OffsetDateTime,
+    /// When the challenge stops being accepted.
     #[serde(with = "rfc3339")]
     pub expires_at: OffsetDateTime,
 }
@@ -34,9 +42,12 @@ mod rfc3339 {
     use time::macros::format_description;
     use time::{OffsetDateTime, UtcOffset};
 
+    /// An instant as RFC 3339 in UTC, with no fraction, three, six or nine digits, whichever is the shortest that is exact.
     pub fn format(t: OffsetDateTime) -> String {
+        // Always UTC.
         let t = t.to_offset(UtcOffset::UTC);
         let secs = t.format(format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]")).unwrap_or_default();
+        // The shortest of the forms the earlier code wrote that is still exact.
         let fraction = match t.nanosecond() {
             0 => String::new(),
             n if n % 1_000_000 == 0 => format!(".{:03}", n / 1_000_000),
@@ -46,34 +57,42 @@ mod rfc3339 {
         format!("{secs}{fraction}Z")
     }
 
+    /// Write a timestamp as its string form.
     pub fn serialize<S: Serializer>(t: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&format(*t))
     }
 
+    /// Read an RFC 3339 timestamp with any offset, normalised to UTC.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<OffsetDateTime, D::Error> {
         let s = String::deserialize(d)?;
         OffsetDateTime::parse(&s, &Rfc3339).map(|t| t.to_offset(UtcOffset::UTC)).map_err(serde::de::Error::custom)
     }
 }
 
+/// Why a wallet sign-in step failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WalletError {
+    /// The text is not a Sui address.
     #[error("that is not a Sui address")]
     Address,
+    /// The challenge is older than its lifetime.
     #[error("the sign-in request has expired; start again")]
     Expired,
+    /// The signature is malformed, or is not the address's signature over this challenge.
     #[error("the signature does not match the address")]
     Signature,
 }
 
 /// The address in its canonical form (`0x` + 64 lowercase hex), or `None`.
 pub fn canonical_address(a: &str) -> Option<String> {
+    // A short address is padded with zeros and lower-cased, so the same address always has one form.
     let hex = a.strip_prefix("0x")?;
     (!hex.is_empty() && hex.len() <= 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| format!("0x{:0>64}", hex.to_ascii_lowercase()))
 }
 
 impl Challenge {
+    /// A challenge for an address: a random nonce and a lifetime of [`VALID_FOR`]. The address must be a Sui address.
     pub fn new(
         domain: &str,
         uri: &str,
@@ -82,21 +101,25 @@ impl Challenge {
         statement: &str,
         now: OffsetDateTime,
     ) -> Result<Self, WalletError> {
+        // A malformed address is refused before any challenge exists.
         let address = canonical_address(address).ok_or(WalletError::Address)?;
         Ok(Self {
             domain: domain.into(),
             uri: uri.into(),
             network: network.into(),
             address,
+            // 128 random bits.
             nonce: crate::random_hex(16),
             statement: statement.into(),
             issued_at: now,
+            // The lifetime is fixed, not chosen by the caller.
             expires_at: now + VALID_FOR,
         })
     }
 
     /// The exact text the wallet signs (CAIP-122 / EIP-4361 layout with a Sui chain id).
     pub fn message(&self) -> String {
+        // The timestamps in the text have whole seconds in UTC.
         let ts = |t: &OffsetDateTime| {
             t.to_offset(UtcOffset::UTC)
                 .format(format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z"))
@@ -118,9 +141,11 @@ impl Challenge {
 
     /// Checks a wallet's signature (base64 `flag || signature || public key`, as Sui wallets return it).
     pub fn verify(&self, signature_b64: &str, now: OffsetDateTime) -> Result<(), WalletError> {
+        // Expiry is checked first, so an old signature is never even verified.
         if now >= self.expires_at {
             return Err(WalletError::Expired);
         }
+        // The same verifier the access gate uses, so there is one implementation of Sui's signature rules; multisig and zkLogin are refused there.
         if access_gate_gateway_core::sig::verify_personal_message_signature(
             &self.address,
             self.message().as_bytes(),
@@ -133,6 +158,7 @@ impl Challenge {
     }
 }
 
+/// Unit tests for challenges.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,20 +168,25 @@ mod tests {
 
     /// What a Sui wallet does for an ed25519 key: sign the personal-message digest, then `0x00 || sig || pubkey`.
     fn wallet_sign(seed: &[u8; 32], message: &[u8]) -> (String, String) {
+        // A key pair from a fixed seed, so the test is repeatable.
         let kp = Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
         let pk = kp.public_key().as_ref().to_vec();
         let address = access_gate_gateway_core::sig::derive_address(0, &pk);
+        // A Sui personal message is signed as a digest of the message with an intent prefix.
         let digest = access_gate_gateway_core::sig::signing_digest(message);
+        // The flag byte 0 is the ed25519 scheme.
         let mut raw = vec![0u8];
         raw.extend_from_slice(kp.sign(&digest).as_ref());
         raw.extend_from_slice(&pk);
         (address, STANDARD.encode(raw))
     }
 
+    /// A challenge signed by the right key verifies; after its lifetime it is expired, and another key, other text, and non-base64 are each refused.
     #[test]
     fn sign_in_round_trip() {
         let now = OffsetDateTime::now_utc();
         let seed = [9u8; 32];
+        // The address belongs to the key, so the challenge is made for it.
         let (address, _) = wallet_sign(&seed, b"");
         let c = Challenge::new(
             "app.example.link",
@@ -167,18 +198,23 @@ mod tests {
         )
         .unwrap();
         let text = c.message();
+        // The text begins with the domain and names the account, as the sign-in-with-X layout requires.
         assert!(text.starts_with("app.example.link wants you to sign in with your Sui account:\n0x"));
         assert!(text.contains("\nChain ID: sui:testnet\n"));
         let (_, sig) = wallet_sign(&seed, text.as_bytes());
         assert_eq!(c.verify(&sig, now), Ok(()));
+        // At exactly the expiry instant it is already expired.
         assert_eq!(c.verify(&sig, now + VALID_FOR), Err(WalletError::Expired));
+        // A different key signing the right text.
         let (_, other) = wallet_sign(&[8u8; 32], text.as_bytes());
         assert_eq!(c.verify(&other, now), Err(WalletError::Signature));
+        // The right key signing other text.
         let (_, wrong_text) = wallet_sign(&seed, b"something else");
         assert_eq!(c.verify(&wrong_text, now), Err(WalletError::Signature));
         assert_eq!(c.verify("not base64", now), Err(WalletError::Signature));
     }
 
+    /// Challenges stored by the earlier implementation read back and are written back identically, in every fraction width; an offset is normalised to UTC and a non-date is refused.
     #[test]
     fn stored_challenges_read_back() {
         // As the chrono-based code stored it (chrono's serde: RFC 3339, UTC, `Z`, 0/3/6/9 fractional digits).
@@ -220,6 +256,7 @@ mod tests {
         assert!(serde_json::from_value::<Challenge>(v).is_err());
     }
 
+    /// Short addresses are padded, upper case is folded, and a missing prefix or an over-long address is refused.
     #[test]
     fn addresses() {
         assert_eq!(canonical_address("0x2").unwrap(), format!("0x{}2", "0".repeat(63)));
