@@ -3250,6 +3250,8 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<(), DbError> {
         // One row per sign-in; the primary key (the state hash) makes a repeated state value impossible.
+        // The time is the caller's, so tests can place a sign-in in the past.
+        // The state and binding values are hashes; the nonce and verifier are the provider-bound secrets of this one sign-in.
         sqlx::query(
             "INSERT INTO lib.admin_login_attempts (state_hash, binding_hash, nonce, verifier, created_at) VALUES ($1, $2, $3, $4, $5)",
         )
@@ -3271,6 +3273,7 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<Option<AdminLogin>, DbError> {
         // DELETE ... RETURNING takes the row and removes it in one statement, so two racing callbacks cannot both use it.
+        // Freshness is judged below, after the row is gone, so a stale row cannot be tried again either.
         let row = sqlx::query(
             "DELETE FROM lib.admin_login_attempts WHERE state_hash = $1 RETURNING binding_hash, nonce, verifier, created_at",
         )
@@ -3288,7 +3291,7 @@ impl Store {
         }))
     }
 
-    /// Create a session for a completed sign-in. Only the hash of the cookie's identifier is stored.
+    /// Create a session for a completed sign-in. Only the hash of the cookie's identifier is stored (the identifier itself exists only in the browser's cookie).
     pub async fn create_admin_session(
         &self,
         id_hash: &str,
@@ -3298,6 +3301,7 @@ impl Store {
         id_token: &str,
         now: OffsetDateTime,
     ) -> Result<(), DbError> {
+        // Created and last-seen start equal (the same bound value), so a new session is idle for zero seconds.
         sqlx::query(
             "INSERT INTO lib.admin_sessions (id_hash, subject, provider_sid, display_name, id_token, created_at, last_seen_at)
              VALUES ($1, $2, $3, $4, $5, $6, $6)",
@@ -3367,6 +3371,7 @@ impl Store {
 
     /// End every session of a person (back-channel logout naming only a `sub`).
     pub async fn end_admin_sessions_by_subject(&self, subject: &str) -> Result<u64, DbError> {
+        // Every session of one person, whatever browser it is in.
         Ok(sqlx::query("DELETE FROM lib.admin_sessions WHERE subject = $1")
             .bind(subject)
             .execute(&self.pool)
@@ -3383,6 +3388,7 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<u64, DbError> {
         // Sign-ins that were started and never finished.
+        // The sign-in lifetime is short (minutes), so what is found here was abandoned.
         let logins = sqlx::query("DELETE FROM lib.admin_login_attempts WHERE created_at <= $1")
             .bind(now - login_max_age)
             .execute(&self.pool)
@@ -3396,6 +3402,7 @@ impl Store {
             .execute(&self.pool)
             .await?
             .rows_affected();
+        // The caller only logs how many rows went.
         Ok(logins + sessions)
     }
 }
