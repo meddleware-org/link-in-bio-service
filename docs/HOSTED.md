@@ -66,7 +66,11 @@ in the environment. Every switch starts at its safest value, and each one can on
 | `WISE_TOKEN_FILE`, `WISE_PROFILE_ID`, `WISE_SCA_KEY_FILE`, `WISE_API_BASE` (`https://api.wise-sandbox.com`), `WISE_API_VERSION` (`2026Q4`) | required when `wise` is a feed (the SCA key whenever Wise asks for SCA: UK and EEA profiles) | an API token, the business profile, and the RSA private key (PEM) whose public key is uploaded to Wise, which signs Wise's one-time token; statements are read as camt.053 for every standard balance |
 | `BUNQ_API_KEY_FILE`, `BUNQ_KEY_FILE`, `BUNQ_PERMITTED_IPS`, `BUNQ_API_BASE` (`https://public-api.sandbox.bunq.com/v1`) | required when `bunq` is a feed (the IPs optional) | the API key, the RSA private key (PEM) the installation registers and every request is signed with, and the IPs the device may call from (unset: bunq binds the address it is registered from) |
 | `REVOLUT_CLIENT_ID`, `REVOLUT_ISSUER`, `REVOLUT_KEY_FILE`, `REVOLUT_REFRESH_TOKEN_FILE`, `REVOLUT_API_BASE` (`https://sandbox-b2b.revolut.com/api/1.0`) | required when `revolut` is a feed | the client id, the redirect URI's host (the assertion's `iss`), the RSA private key (PEM) whose certificate is uploaded in Revolut Business, and the refresh token (`link-in-bio bank-feed revolut-token`) |
-| `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, `KETO_READ_URL`, `ADMIN_ORIGIN` | none (the console answers 503) | the operator console's gate |
+| `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, `KETO_READ_URL`, `ADMIN_ORIGIN` | none (the console answers 503) | the operator console's gate (Cloudflare Access). Not read when `ADMIN_AUTH=oidc` |
+| `ADMIN_AUTH` | `access` | which sign-in paths the console accepts: `access`, `both` (an OpenID Connect session is preferred, Access still works) or `oidc`. Only the console process reads it |
+| `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET_FILE`, `AUTHZ_URL`, `ADMIN_ORIGIN` | required unless `ADMIN_AUTH=access` | the platform's identity provider (issuer exactly as its discovery document names it), this console's client id, the file the client secret is mounted as, OpenFGA's store URL for the membership check (`console:<OIDC_RESOURCE>` `member`), and the console's own origin |
+| `OIDC_INTERNAL_BASE`, `AUTHZ_KEY_FILE`, `OIDC_RESOURCE`, `SESSION_IDLE_SECS`, `SESSION_ABSOLUTE_SECS` | none, none, `link-in-bio`, `3600`, `43200` | the in-cluster base URL that replaces the issuer's public origin for the console's own calls, the decision point's pre-shared key file, the resource id, and the session limits |
+| `OIDC_ALLOW_INSECURE` | unset | `1` accepts `http` for the issuer and the origin (local tests only) |
 
 ## Sign-in
 
@@ -358,3 +362,14 @@ No process needs more than table-level grants: the row locks taken (`FOR UPDATE`
 The route tables in `crates/api/src/hosted/routes.rs` generate [`openapi/app.json`](../openapi/app.json) and
 [`openapi/admin.json`](../openapi/admin.json). A test sends a request to every route in the tables and checks that the
 committed documents match them.
+
+
+## The console's sign-in through the platform's identity provider
+
+With `ADMIN_AUTH` at `both` or `oidc` the console process is the confidential OpenID Connect client (a backend for the browser console; the platform workspace's `docs/auth/CONSOLE_SIGNIN.md` is the design):
+
+- `GET /auth/login` records a sign-in (hashes of the `state` and a binding value, the `nonce`, the PKCE verifier; `lib.admin_login_attempts`), sets the `__Host-lib-login` cookie and redirects with `acr_values=phr` and PKCE `S256`.
+- `GET /auth/callback` consumes the state (it works once), checks the binding cookie, the issuer parameter (RFC 9207) and the absence of `error`, exchanges the code with the client secret and the verifier, verifies the ID token with the shared `meddleware-identity` crate (signature, issuer, audience, nonce, expiry, `acr` = `phr`), asks the decision point whether the person is a `member` of `console:link-in-bio` (AuthZEN to OpenFGA; allow cached 30 s, deny 5 s; no answer is 503), and only then makes the session: a new 256-bit identifier in `__Host-lib-admin`, its SHA-256 in `lib.admin_sessions`, 12 hours absolute, 1 hour idle.
+- Every `/api/v1/admin` request with a session cookie re-checks membership, so removing a person's tuple ends their access within 30 seconds.
+- `POST /auth/logout` (CSRF-checked) deletes the session and answers `{"redirect": <the provider's end-session URL>}`; `POST /auth/backchannel-logout` takes the provider's signed logout token and ends the named session (cluster-internal only: the Ingress never routes it).
+- `GET /api/v1/admin/me` says `via`: `access` or `oidc`. `ADMIN_AUTH=access` behaves exactly as before and the `/auth/*` routes answer 404.

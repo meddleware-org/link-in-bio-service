@@ -159,6 +159,22 @@ pub const APP_ROUTES: &[Route] = &[
     ),
 ];
 
+// The table is read by the route-exposure check of the platform workspace (post-bootstrap/link-in-bio), which compares the Ingress with it.
+/// The sign-in routes of the console process (host link-in-bio-admin.). They exist only when `ADMIN_AUTH` is `both` or `oidc`; otherwise each answers 404. Outside the
+/// operator gate, since the person calling is not signed in yet, and outside the OpenAPI documents (they are browser redirects, not API). `/auth/backchannel-logout` is
+/// called by the identity provider inside the cluster and is never routed by the Ingress.
+pub const AUTH_ROUTES: &[Route] = &[
+    r(Get, "/auth/login", Public, "Start a sign-in: redirect to the identity provider"),
+    r(Get, "/auth/callback", Public, "Finish a sign-in: exchange the code, verify the ID token, make the session"),
+    r(Post, "/auth/logout", Operator, "End the session; the answer names the provider's logout URL"),
+    r(
+        Post,
+        "/auth/backchannel-logout",
+        Public,
+        "The provider reports an ended session (signed logout token); cluster-internal only",
+    ),
+];
+
 /// Every route of the admin API (the operator console's API).
 pub const ADMIN_ROUTES: &[Route] = &[
     // The operator's own details and the overview.

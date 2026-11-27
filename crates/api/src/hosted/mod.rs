@@ -29,6 +29,10 @@ pub mod jwt;
 pub mod limits;
 /// The counters behind `/metrics`.
 pub mod metrics;
+/// Sign-in through the platform's OpenID Connect provider (the console's second way in).
+pub mod oidc;
+/// The `/auth/*` routes of that sign-in.
+pub mod oidc_routes;
 /// The OpenAPI documents, built from the route tables.
 pub mod openapi;
 /// Tenant pages by host.
@@ -42,6 +46,10 @@ pub mod routes;
 #[cfg(test)]
 mod tests;
 
+/// The console's OpenID Connect sign-in against a fake provider and a fake policy decision point.
+#[cfg(test)]
+mod oidc_tests;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +61,17 @@ use link_in_bio_store::Store;
 
 pub use config::{AccountLimits, HostedConfig, Keys, LimitsPreset, SignupMode, WebRiskMode};
 pub use error::{ApiError, ApiResult};
+
+impl App {
+    /// The console's own origin, from whichever sign-in path is configured (the OpenID Connect settings first), or `None` when the console is not configured at all.
+    pub fn admin_origin(&self) -> Option<&str> {
+        self.oidc
+            .as_ref()
+            .filter(|_| self.admin_auth.accepts_session())
+            .map(|o| o.admin_origin())
+            .or_else(|| self.access.as_ref().filter(|_| self.admin_auth.accepts_access()).map(|a| a.admin_origin()))
+    }
+}
 
 /// The state every process role of the hosted service shares: the store, the configuration, billing, passkeys, the link screener and the caches. Roles use only the parts they need.
 pub struct App {
@@ -70,8 +89,12 @@ pub struct App {
     pub metrics: metrics::Metrics,
     /// The cache of built tenant pages.
     pub pages: pages::PageCache,
-    /// The operator's sign-in, when the console is configured.
+    /// The operator's Cloudflare Access sign-in, when the console is configured for it.
     pub access: Option<Arc<access::Admins>>,
+    /// Which sign-in paths the console accepts.
+    pub admin_auth: access::AdminAuth,
+    /// The operator's OpenID Connect sign-in, when a mode accepts it.
+    pub oidc: Option<Arc<oidc::Oidc>>,
     /// The Open Payments adapter (also in `billing`), for the steps of its checkout beyond the port.
     pub open_payments: Option<Arc<link_in_bio_billing::open_payments::OpenPayments>>,
     /// Pictures are decoded one at a time per process, off the async workers: one decode may use up to twice
@@ -225,6 +248,31 @@ impl App {
                 admin_origin: a.admin_origin.clone(),
             })
         });
+        // The OpenID Connect sign-in, when a mode accepts it: the two secrets are read from their mounted files.
+        let oidc = match config.oidc.as_ref() {
+            Some(o) => Some(
+                oidc::Oidc::new(oidc::OidcConfig {
+                    issuer: o.issuer.clone(),
+                    client_id: o.client_id.clone(),
+                    client_secret: read_secret(&o.client_secret_file)?,
+                    admin_origin: o.admin_origin.clone(),
+                    redirect_uri: format!("{}/auth/callback", o.admin_origin),
+                    post_logout_uri: format!("{}/", o.admin_origin),
+                    internal_base: o.internal_base.clone(),
+                    authz_base: o.authz_url.clone(),
+                    authz_key: o.authz_key_file.as_deref().map(read_secret).transpose()?,
+                    resource: o.resource.clone(),
+                    cookie_name: "__Host-lib-admin".into(),
+                    binding_cookie_name: "__Host-lib-login".into(),
+                    idle: Duration::from_secs(o.idle_secs),
+                    absolute: Duration::from_secs(o.absolute_secs),
+                    allow_insecure: o.allow_insecure,
+                })
+                .map_err(|_| "cannot build the sign-in client".to_string())?,
+            ),
+            None => None,
+        };
+        let admin_auth = config.admin_auth;
         // Pictures are decoded one at a time.
         Ok(Self {
             store,
@@ -235,6 +283,8 @@ impl App {
             metrics: metrics::Metrics::default(),
             pages: pages::PageCache::new(page_cache),
             access,
+            admin_auth,
+            oidc,
             open_payments,
             pictures: tokio::sync::Semaphore::new(1),
         })

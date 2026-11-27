@@ -286,7 +286,21 @@ fn run(cli: Cli) -> Result<(), String> {
                 let app = hosted_app(pool, role)?;
                 match m {
                     Mode::Pages => serve(hosted::pages::router(app), listen).await,
-                    Mode::Admin => serve(hosted::admin::router(app), listen).await,
+                    Mode::Admin => {
+                        // Expired sign-ins and sessions are removed every ten minutes (they are never accepted after they expire; this only keeps the tables small).
+                        if let Some(o) = app.oidc.clone() {
+                            let store = app.store.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                                    if let Err(e) = o.purge(&store).await {
+                                        tracing::warn!(error = %e, "purging expired console sessions failed");
+                                    }
+                                }
+                            });
+                        }
+                        serve(hosted::admin::router(app), listen).await
+                    }
                     _ => {
                         // The app also serves the internal port (provider notifications, metrics).
                         let internal: SocketAddr = std::env::var("INTERNAL_LISTEN_ADDR")
@@ -555,6 +569,9 @@ fn hosted_env(role: Role, get: impl Fn(&str) -> Option<String>) -> impl Fn(&str)
     move |k: &str| match k {
         "BILLING_PROVIDERS" if pages => Some("manual".into()),
         "BANK_FEEDS" if pages => None,
+        // Only the console signs operators in: every other role sees the default (Access only), so a shared ConfigMap that switches the console to OpenID Connect never makes the
+        // page server, the app or the worker require settings and secret files that only the console has.
+        "ADMIN_AUTH" if role != Role::Console => None,
         // No secret file path reaches the page server.
         _ if pages && k.ends_with("_FILE") => None,
         _ => get(k),
@@ -601,6 +618,17 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod hosted_env_tests {
     use super::Role;
+
+    /// Only the console sees `ADMIN_AUTH`; every other role keeps the default (Access only), whatever the shared configuration says.
+    #[test]
+    fn only_the_console_sees_the_admin_auth_switch() {
+        // A shared configuration that switches the console to OpenID Connect.
+        let shared = |k: &str| (k == "ADMIN_AUTH").then(|| "oidc".to_string());
+        assert_eq!(super::hosted_env(Role::Console, shared)("ADMIN_AUTH").as_deref(), Some("oidc"));
+        for role in [Role::Pages, Role::App] {
+            assert_eq!(super::hosted_env(role, shared)("ADMIN_AUTH"), None);
+        }
+    }
 
     /// The page server's environment names only the manual provider and no bank feed, and every other role sees the shared one.
     #[test]

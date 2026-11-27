@@ -45,6 +45,8 @@ base64.workspace = true
 ring.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+# The platform's identity contract in Rust (ID and logout tokens, discovery, PKCE, AuthZEN), shared with content-hub-service.
+meddleware-identity.workspace = true
 
 # Test-only: a runtime for the async tests, a body reader for the router tests, and a software passkey that plays the part of a person's authenticator. Pinned exactly, like the rest.
 [dev-dependencies]
@@ -54,6 +56,8 @@ sqlx.workspace = true
 webauthn-authenticator-rs = { version = "=0.6.2", features = ["softpasskey"] }
 webauthn-rs.workspace = true
 access-gate-gateway-core.workspace = true
+# The throw-away signer, for the sign-in tests against a fake provider.
+meddleware-identity = { workspace = true, features = ["testing"] }
 
 # The workspace's lint set, including the documentation lints.
 [lints]

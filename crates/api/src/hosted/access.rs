@@ -4,6 +4,9 @@
 //! 2. **Identity**: `Cf-Access-Jwt-Assertion` verifies against the Access team's JWKS (cached; refreshed when a token
 //!    names an unknown key, at most every 30 s). → 401
 //! 3. **Role**: Keto says `LinkInBio:admin#member@<subject>` (cached 30 s allowed, 5 s denied). → 403; Keto down → 503.
+//!
+//! A second way in exists beside it while Cloudflare Access is being replaced (`ADMIN_AUTH`, [`AdminAuth`]): a session made by the platform's OpenID Connect provider
+//! ([`super::oidc`], routes in [`super::oidc_routes`]), whose role check is the policy decision point (OpenFGA) instead of Keto.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -71,6 +74,49 @@ pub struct AccessConfig {
     pub admin_origin: String,
 }
 
+/// Which sign-in paths the console accepts (`ADMIN_AUTH`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAuth {
+    /// Only the Cloudflare Access token (what ran before the migration; the safe rollback).
+    Access,
+    /// A session from the OpenID Connect provider is preferred; the Access token still works. The soak mode.
+    Both,
+    /// Only the OpenID Connect session; the Access token is ignored.
+    Oidc,
+}
+
+impl AdminAuth {
+    /// Read the setting's value (`access`, `both` or `oidc`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "access" => Some(Self::Access),
+            "both" => Some(Self::Both),
+            "oidc" => Some(Self::Oidc),
+            _ => None,
+        }
+    }
+
+    /// Whether a session cookie is looked at.
+    pub fn accepts_session(self) -> bool {
+        self != Self::Access
+    }
+
+    /// Whether the Access token is looked at.
+    pub fn accepts_access(self) -> bool {
+        self != Self::Oidc
+    }
+}
+
+/// How the operator signed in (`GET /api/v1/admin/me` shows it, so the soak week can see which path is in use).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    /// The Cloudflare Access token.
+    Access,
+    /// A session made by the OpenID Connect provider.
+    Oidc,
+}
+
 /// The operator, attached to each admin request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operator {
@@ -78,6 +124,8 @@ pub struct Operator {
     pub subject: String,
     /// The name to show.
     pub display_name: String,
+    /// Which sign-in path was used.
+    pub via: Via,
 }
 
 /// The operator sign-in checker: it verifies tokens, caches the keys and the role answers, and refreshes the keys when a token names one it does not know.
@@ -122,6 +170,11 @@ impl Admins {
             last_refresh: Mutex::new(None),
             roles: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The console's origin, which a write must come from.
+    pub fn admin_origin(&self) -> &str {
+        &self.cfg.admin_origin
     }
 
     /// Fetch the key set (at most every 30 seconds unless forced); a fixed set needs no fetch.
@@ -173,7 +226,7 @@ impl Admins {
             tracing::info!(reason = %e, "access token refused");
             ApiError::Unauthorized
         })?;
-        Ok(Operator { subject: verified.subject, display_name: verified.display_name })
+        Ok(Operator { subject: verified.subject, display_name: verified.display_name, via: Via::Access })
     }
 
     /// Whether the subject has the operator role, from the cache or from Keto; a role service that is down is an error, not a "no".
@@ -220,28 +273,60 @@ pub fn csrf_ok(method: &Method, headers: &HeaderMap, origin: &str) -> bool {
     headers.contains_key(CSRF_HEADER) && headers.get("origin").and_then(|o| o.to_str().ok()) == Some(origin)
 }
 
-/// The middleware of every admin route. Without an Access configuration the console is closed (503).
+/// The person behind a session cookie, when the OpenID Connect path is accepted and the browser sent a live session. Their role is the policy decision point's:
+/// not a member is 403, no answer is 503. An unknown or expired session is no session (`None`), so the other path or a 401 follows.
+async fn identify_by_session(app: &Shared, headers: &HeaderMap) -> Result<Option<Operator>, ApiError> {
+    let Some(o) = app.oidc.as_ref().filter(|_| app.admin_auth.accepts_session()) else { return Ok(None) };
+    let Some(id) = cookie_of(headers, o.cookie_name()) else { return Ok(None) };
+    let Some(found) = o.identify(&app.store, id).await? else { return Ok(None) };
+    if o.is_member(&found.subject).await? {
+        Ok(Some(found))
+    } else {
+        Err(ApiError::Forbidden("not an operator of Link in Bio"))
+    }
+}
+
+/// The person behind a Cloudflare Access token, when that path is accepted and configured and the header is present. Their role is Keto's.
+async fn identify_by_access(app: &Shared, headers: &HeaderMap) -> Result<Option<Operator>, ApiError> {
+    let Some(admins) = app.access.as_ref().filter(|_| app.admin_auth.accepts_access()) else { return Ok(None) };
+    let Some(token) = headers.get(ACCESS_JWT_HEADER).and_then(|v| v.to_str().ok()) else { return Ok(None) };
+    let op = admins.identify(token).await?;
+    if admins.is_admin(&op.subject).await? {
+        Ok(Some(op))
+    } else {
+        Err(ApiError::Forbidden("not an operator of Link in Bio"))
+    }
+}
+
+/// The session cookie's value in the request's `Cookie` headers, if there is one.
+pub(super) fn cookie_of<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|h| meddleware_identity::session::cookie_value(h, name))
+        .filter(|v| !v.is_empty())
+}
+
+/// The middleware of every admin route. Without any configured sign-in the console is closed (503).
 pub async fn require_admin(State(app): State<Shared>, mut req: Request, next: Next) -> Response {
-    // Without a sign-in configuration the console is closed.
-    let Some(admins) = app.access.clone() else {
+    // The origin a write must come from: the OpenID Connect settings' when that path is on, else the Access settings'. Without either the console is closed.
+    let Some(origin) = app.admin_origin().map(str::to_owned) else {
         return ApiError::Unavailable("the console is not configured").into_response();
     };
-    if !csrf_ok(req.method(), req.headers(), &admins.cfg.admin_origin) {
+    if !csrf_ok(req.method(), req.headers(), &origin) {
         return ApiError::Forbidden("cross-site request refused").into_response();
     }
-    // No token means not authenticated.
-    let Some(token) = req.headers().get(ACCESS_JWT_HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned) else {
-        return ApiError::Unauthorized.into_response();
-    };
-    let op = match admins.identify(&token).await {
-        Ok(o) => o,
+    // A session from the OpenID Connect provider is preferred; the Access token is the other path, used when no live session came with the request.
+    let op = match identify_by_session(&app, req.headers()).await {
+        Ok(Some(o)) => o,
+        Ok(None) => match identify_by_access(&app, req.headers()).await {
+            Ok(Some(o)) => o,
+            Ok(None) => return ApiError::Unauthorized.into_response(),
+            Err(e) => return e.into_response(),
+        },
         Err(e) => return e.into_response(),
     };
-    match admins.is_admin(&op.subject).await {
-        Ok(true) => {}
-        Ok(false) => return ApiError::Forbidden("not an operator of Link in Bio").into_response(),
-        Err(e) => return e.into_response(),
-    }
     // The handlers read the operator from the request.
     req.extensions_mut().insert(op);
     next.run(req).await

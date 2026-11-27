@@ -42,7 +42,7 @@ fn account_row(a: &Account) -> Value {
 
 /// The operator who is signed in.
 async fn me(Extension(op): Extension<Operator>) -> Json<Value> {
-    Json(json!({ "subject": op.subject, "name": op.display_name }))
+    Json(json!({ "subject": op.subject, "name": op.display_name, "via": op.via }))
 }
 
 /// Counts, queues, the switches and Web Risk's budget for the console's front page.
@@ -1007,6 +1007,8 @@ pub fn router(app: Shared) -> Router {
         .route("/healthz", get(|| async { "ok\n" }))
         // A JSON 404 for any other path.
         .fallback(|| async { ApiError::NoRoute.into_response() })
+        // The sign-in routes (404 unless a mode accepts OpenID Connect), outside the gate.
+        .merge(super::oidc_routes::router())
         // Every answer, including errors, gets the no-store headers.
         .layer(middleware::from_fn(no_store))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))

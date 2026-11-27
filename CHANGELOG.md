@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## [0.0.10] - 2026-11-27
+
+- **The console signs operators in through the platform's OpenID Connect provider (ADR-0016 stage 6).** New `ADMIN_AUTH` setting (`access` default, `both`, `oidc`). The console process is a confidential client: `/auth/login`, `/auth/callback`, `/auth/logout` and a cluster-internal `/auth/backchannel-logout`; authorization code with PKCE `S256`, the issuer check of RFC 9207, an ID token verified by the shared `meddleware-identity` crate (the `phr` class required), membership decided by the policy decision point (AuthZEN to OpenFGA, allow cached 30 s, deny 5 s, fail closed), a server-side session (`__Host-lib-admin`, 12 hours absolute, 1 hour idle, new identifier at every sign-in). `GET /api/v1/admin/me` gains `via`. Migration 0007 adds `lib.admin_login_attempts` and `lib.admin_sessions` (hashes only). `ADMIN_AUTH=access` behaves exactly as 0.0.9.
+- `deny.toml` allows one git source: the identity contract repository (`meddleware-identity`, pinned by tag and `Cargo.lock`).
+
 ## [0.0.9] - 2026-11-27
 
 - **Documentation pass (workspace documentation standard, D144).** Every file has a header and line-level comments, and every item,

@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 // The site configuration is the static mode's, reused for every tenant page.
 use crate::config::{SiteConfig, SiteConfigFile};
 
+use super::access::AdminAuth;
+
 /// Who may create an account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -119,6 +121,10 @@ pub struct HostedConfig {
     pub bank_feed_poll_secs: u64,
     /// The operator console's sign-in settings, when configured.
     pub access: Option<AccessEnv>,
+    /// Which sign-in paths the console accepts (`ADMIN_AUTH`: `access` by default, `both`, `oidc`).
+    pub admin_auth: AdminAuth,
+    /// The OpenID Connect sign-in settings, present when `ADMIN_AUTH` is `both` or `oidc`.
+    pub oidc: Option<OidcEnv>,
 }
 
 /// Which Web Risk API screens links. Never both in one Google project: once a project calls `threatLists.computeDiff`,
@@ -316,6 +322,33 @@ pub struct AccessEnv {
     pub keto_read_url: String,
     /// The console's origin.
     pub admin_origin: String,
+}
+
+/// The console's sign-in through the platform's OpenID Connect provider (docs/auth/CONSOLE_SIGNIN.md in the platform workspace). The two secrets are files, never variables.
+#[derive(Debug, Clone)]
+pub struct OidcEnv {
+    /// The provider's issuer URL, exactly as its discovery document names it.
+    pub issuer: String,
+    /// This console's client id at the provider.
+    pub client_id: String,
+    /// The file the client secret is mounted as.
+    pub client_secret_file: String,
+    /// The in-cluster base URL that replaces the issuer's public origin for the console's own calls.
+    pub internal_base: Option<String>,
+    /// The policy decision point's store URL.
+    pub authz_url: String,
+    /// The file holding the decision point's pre-shared key, if any.
+    pub authz_key_file: Option<String>,
+    /// The resource id of this console in the policy model (`console:<resource>`).
+    pub resource: String,
+    /// The console's own origin.
+    pub admin_origin: String,
+    /// How long a session may sit unused, in seconds.
+    pub idle_secs: u64,
+    /// How long a session may live, in seconds.
+    pub absolute_secs: u64,
+    /// Development and tests only: accept `http` for the issuer and the origin.
+    pub allow_insecure: bool,
 }
 
 /// A host name, lower-cased and checked; the error names the setting, not the value.
@@ -661,8 +694,14 @@ impl HostedConfig {
         }
         // Between five minutes and a day, fifteen minutes by default.
         let bank_feed_poll_secs = number(&get, "BANK_FEED_POLL_SECS", 900u64, 300, 86_400)?;
-        // The console's sign-in is configured only when both the team domain and the audience are set.
-        let access = match (get("ACCESS_TEAM_DOMAIN"), get("ACCESS_AUD")) {
+        // Which sign-in paths the console accepts; `access` when unset, which is what ran before the migration.
+        let admin_auth = match get("ADMIN_AUTH").as_deref().map(str::trim) {
+            None | Some("") => AdminAuth::Access,
+            Some(v) => AdminAuth::parse(v)
+                .ok_or_else(|| HostedConfigError::Invalid("ADMIN_AUTH", "must be access, both or oidc".into()))?,
+        };
+        // The console's sign-in is configured only when both the team domain and the audience are set (and not read at all when only OpenID Connect is accepted).
+        let access = match (get("ACCESS_TEAM_DOMAIN").filter(|_| admin_auth.accepts_access()), get("ACCESS_AUD")) {
             // The team domain is both the token issuer and where its signing keys are fetched: https only, or the keys
             // could be swapped on the way.
             // The identity keys come from this address, so it must be https.
@@ -676,6 +715,36 @@ impl HostedConfig {
                 admin_origin: get("ADMIN_ORIGIN").ok_or(HostedConfigError::Missing("ADMIN_ORIGIN"))?,
             }),
             _ => None,
+        };
+        // The OpenID Connect sign-in: required when a mode accepts it, and then the https issuer and origin, unless this is a local test.
+        let oidc = if admin_auth.accepts_session() {
+            let allow_insecure = get("OIDC_ALLOW_INSECURE").is_some_and(|v| v == "1");
+            let url = |var: &'static str| -> Result<String, HostedConfigError> {
+                let v = get(var).filter(|x| !x.trim().is_empty()).ok_or(HostedConfigError::Missing(var))?;
+                let v = v.trim().trim_end_matches('/').to_string();
+                if v.starts_with("https://") || (allow_insecure && v.starts_with("http://")) {
+                    Ok(v)
+                } else {
+                    Err(HostedConfigError::Invalid(var, "must be https".into()))
+                }
+            };
+            let need =
+                |var: &'static str| get(var).filter(|x| !x.trim().is_empty()).ok_or(HostedConfigError::Missing(var));
+            Some(OidcEnv {
+                issuer: url("OIDC_ISSUER")?,
+                client_id: need("OIDC_CLIENT_ID")?,
+                client_secret_file: need("OIDC_CLIENT_SECRET_FILE")?,
+                internal_base: get("OIDC_INTERNAL_BASE").filter(|v| !v.trim().is_empty()),
+                authz_url: need("AUTHZ_URL")?,
+                authz_key_file: get("AUTHZ_KEY_FILE").filter(|v| !v.trim().is_empty()),
+                resource: get("OIDC_RESOURCE").filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "link-in-bio".into()),
+                admin_origin: url("ADMIN_ORIGIN")?,
+                idle_secs: number(&get, "SESSION_IDLE_SECS", 3600u64, 60, 604_800)?,
+                absolute_secs: number(&get, "SESSION_ABSOLUTE_SECS", 43_200u64, 60, 604_800)?,
+                allow_insecure,
+            })
+        } else {
+            None
         };
         // The site template every tenant page uses, from a file, or a minimal one.
         let site: SiteConfigFile = match get("SITE_CONFIG") {
@@ -786,6 +855,8 @@ impl HostedConfig {
             bank_feeds,
             bank_feed_poll_secs,
             access,
+            admin_auth,
+            oidc,
         })
     }
 

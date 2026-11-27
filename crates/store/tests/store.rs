@@ -833,3 +833,131 @@ async fn a_writer_cannot_rewrite_the_audit_log_or_change_the_schema() {
     writer.close().await;
     roles.drop_all().await;
 }
+
+/// A sign-in in progress works once, and a stale one is refused and still consumed.
+#[tokio::test]
+async fn an_admin_login_attempt_is_consumed_by_its_first_use() {
+    let Some(s) = store().await else { return };
+    let now = OffsetDateTime::now_utc();
+    let v = "v".repeat(43);
+    s.begin_admin_login("state-hash-0123456789", "binding-hash-012345", "nonce-0123456789abcdef", &v, now)
+        .await
+        .unwrap();
+    let first = s.take_admin_login("state-hash-0123456789", Duration::minutes(10), now).await.unwrap().expect("fresh");
+    assert_eq!((first.binding_hash.as_str(), first.nonce.as_str()), ("binding-hash-012345", "nonce-0123456789abcdef"));
+    assert!(
+        s.take_admin_login("state-hash-0123456789", Duration::minutes(10), now).await.unwrap().is_none(),
+        "works once"
+    );
+    assert!(s.take_admin_login("never-made-0123456789", Duration::minutes(10), now).await.unwrap().is_none());
+    // Older than the limit: refused, and the row is gone afterwards.
+    s.begin_admin_login(
+        "state-old-0123456789a",
+        "binding-hash-012345",
+        "nonce-0123456789abcdef",
+        &v,
+        now - Duration::minutes(11),
+    )
+    .await
+    .unwrap();
+    assert!(s.take_admin_login("state-old-0123456789a", Duration::minutes(10), now).await.unwrap().is_none());
+    assert!(
+        s.take_admin_login("state-old-0123456789a", Duration::minutes(60), now).await.unwrap().is_none(),
+        "consumed even though stale"
+    );
+}
+
+/// A session lives inside both limits; the idle limit counts from the last use, the absolute limit from sign-in.
+#[tokio::test]
+async fn an_admin_session_lives_inside_its_idle_and_absolute_limits() {
+    let Some(s) = store().await else { return };
+    let t0 = OffsetDateTime::now_utc();
+    let (idle, absolute) = (Duration::hours(1), Duration::hours(12));
+    s.create_admin_session("session-hash-0123456", "sub-1", "sid-1", "meddler", "id.token.value", t0).await.unwrap();
+    let seen = s
+        .use_admin_session("session-hash-0123456", idle, absolute, t0 + Duration::minutes(5))
+        .await
+        .unwrap()
+        .expect("found");
+    assert_eq!(
+        (seen.subject.as_str(), seen.display_name.as_str(), seen.id_token.as_str()),
+        ("sub-1", "meddler", "id.token.value")
+    );
+    // Used at +5 min: idle for 59 minutes after that is fine, 61 is not.
+    assert!(
+        s.use_admin_session("session-hash-0123456", idle, absolute, t0 + Duration::minutes(64))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        s.use_admin_session("session-hash-0123456", idle, absolute, t0 + Duration::minutes(64) + Duration::minutes(61))
+            .await
+            .unwrap()
+            .is_none(),
+        "idle"
+    );
+    // A kept-alive session still ends at the absolute limit.
+    s.create_admin_session("session-hash-abcdefg", "sub-2", "", "meddler", "tok", t0).await.unwrap();
+    for h in 1..=11 {
+        assert!(
+            s.use_admin_session("session-hash-abcdefg", idle, absolute, t0 + Duration::minutes(50 * h))
+                .await
+                .unwrap()
+                .is_some()
+                || h > 14
+        );
+    }
+    assert!(
+        s.use_admin_session("session-hash-abcdefg", idle, absolute, t0 + Duration::hours(13)).await.unwrap().is_none(),
+        "absolute"
+    );
+    assert!(s.use_admin_session("unknown-hash-0123456", idle, absolute, t0).await.unwrap().is_none());
+}
+
+/// Sign-out and both back-channel forms end the right sessions and no others; the purge removes the expired.
+#[tokio::test]
+async fn admin_sign_out_back_channel_logout_and_purge() {
+    let Some(s) = store().await else { return };
+    let now = OffsetDateTime::now_utc();
+    for (hash, sub, sid) in [
+        ("hash-a-0123456789012", "sub-1", "sid-a"),
+        ("hash-b-0123456789012", "sub-1", "sid-b"),
+        ("hash-c-0123456789012", "sub-2", "sid-c"),
+        ("hash-d-0123456789012", "sub-3", ""),
+    ] {
+        s.create_admin_session(hash, sub, sid, "name", "tok", now).await.unwrap();
+    }
+    assert_eq!(s.end_admin_sessions_by_provider_session("sid-a").await.unwrap(), 1);
+    assert_eq!(s.end_admin_sessions_by_provider_session("").await.unwrap(), 0, "an empty sid names no session");
+    assert_eq!(s.end_admin_sessions_by_subject("sub-1").await.unwrap(), 1, "the rest of sub-1");
+    assert!(s.end_admin_session("hash-c-0123456789012").await.unwrap().is_some());
+    assert!(s.end_admin_session("hash-c-0123456789012").await.unwrap().is_none());
+    // Only sub-3's session is left; it is purged once past the idle limit.
+    s.begin_admin_login(
+        "state-old-0123456789a",
+        "binding-hash-012345",
+        "nonce-0123456789abcdef",
+        &"v".repeat(43),
+        now - Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.purge_admin_sessions(Duration::minutes(10), Duration::hours(1), Duration::hours(12), now).await.unwrap(),
+        1,
+        "the stale sign-in only"
+    );
+    assert_eq!(
+        s.purge_admin_sessions(
+            Duration::minutes(10),
+            Duration::hours(1),
+            Duration::hours(12),
+            now + Duration::hours(2)
+        )
+        .await
+        .unwrap(),
+        1,
+        "then the idle session"
+    );
+}

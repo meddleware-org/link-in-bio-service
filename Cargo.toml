@@ -8,7 +8,7 @@ members = ["crates/core", "crates/assets", "crates/store", "crates/auth", "crate
 
 # Fields every crate inherits, so a release changes one version in one place.
 [workspace.package]
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
 rust-version = "1.94"
 # The licence of every Meddleware repository.
@@ -19,6 +19,9 @@ publish = false
 
 # Exact pins, as in the rest of the fleet: a version changes only through a reviewed Cargo.lock update.
 [workspace.dependencies]
+# The platform's identity contract in Rust (ID and logout tokens, discovery, PKCE, AuthZEN), shared with content-hub-service. A git tag, not crates.io (the crate is not
+# published), so the exact commit is fixed by Cargo.lock and deny.toml names this one repository as an allowed git source.
+meddleware-identity = { git = "https://github.com/meddleware-org/identity-contract", tag = "v0.0.6" }
 link-in-bio-core = { path = "crates/core" }
 link-in-bio-assets = { path = "crates/assets" }
 link-in-bio-api = { path = "crates/api" }

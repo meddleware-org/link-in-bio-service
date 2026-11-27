@@ -3214,3 +3214,188 @@ async fn insert_account(
         Err(e) => Err(e.into()),
     }
 }
+
+/// A sign-in of the operator console that the callback is completing (see [`Store::take_admin_login`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminLogin {
+    /// SHA-256 of the binding cookie's value.
+    pub binding_hash: String,
+    /// The `nonce` the ID token must carry.
+    pub nonce: String,
+    /// The PKCE verifier.
+    pub verifier: String,
+}
+
+/// A live operator-console session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminSession {
+    /// The provider's `sub`.
+    pub subject: String,
+    /// The name shown.
+    pub display_name: String,
+    /// The ID token, for the provider's logout.
+    pub id_token: String,
+}
+
+impl Store {
+    // ── operator console sessions (schema 7) ───────────────────────────────
+
+    /// Record a sign-in in progress.
+    pub async fn begin_admin_login(
+        &self,
+        state_hash: &str,
+        binding_hash: &str,
+        nonce: &str,
+        verifier: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        // One row per sign-in; the primary key (the state hash) makes a repeated state value impossible.
+        sqlx::query(
+            "INSERT INTO lib.admin_login_attempts (state_hash, binding_hash, nonce, verifier, created_at) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(state_hash)
+        .bind(binding_hash)
+        .bind(nonce)
+        .bind(verifier)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Consume a sign-in: the row is deleted whether or not it is still fresh, so a state value never works twice. `None` when there is no such row or it is older than `max_age`.
+    pub async fn take_admin_login(
+        &self,
+        state_hash: &str,
+        max_age: Duration,
+        now: OffsetDateTime,
+    ) -> Result<Option<AdminLogin>, DbError> {
+        // DELETE ... RETURNING takes the row and removes it in one statement, so two racing callbacks cannot both use it.
+        let row = sqlx::query(
+            "DELETE FROM lib.admin_login_attempts WHERE state_hash = $1 RETURNING binding_hash, nonce, verifier, created_at",
+        )
+        .bind(state_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        // A stale row was consumed above but is reported as absent.
+        Ok(row.and_then(|r| {
+            let created: OffsetDateTime = r.get("created_at");
+            (created > now - max_age).then(|| AdminLogin {
+                binding_hash: r.get("binding_hash"),
+                nonce: r.get("nonce"),
+                verifier: r.get("verifier"),
+            })
+        }))
+    }
+
+    /// Create a session for a completed sign-in. Only the hash of the cookie's identifier is stored.
+    pub async fn create_admin_session(
+        &self,
+        id_hash: &str,
+        subject: &str,
+        provider_sid: &str,
+        display_name: &str,
+        id_token: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO lib.admin_sessions (id_hash, subject, provider_sid, display_name, id_token, created_at, last_seen_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $6)",
+        )
+        .bind(id_hash)
+        .bind(subject)
+        .bind(provider_sid)
+        .bind(display_name)
+        .bind(id_token)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Find a session inside both its lifetimes (`absolute` since sign-in, `idle` since last use) and mark it used. `None` for an unknown or expired session.
+    pub async fn use_admin_session(
+        &self,
+        id_hash: &str,
+        idle: Duration,
+        absolute: Duration,
+        now: OffsetDateTime,
+    ) -> Result<Option<AdminSession>, DbError> {
+        // One statement checks both lifetimes and marks the session used: an expired session matches no row.
+        let row = sqlx::query(
+            "UPDATE lib.admin_sessions SET last_seen_at = $2
+             WHERE id_hash = $1 AND created_at > $3 AND last_seen_at > $4
+             RETURNING subject, display_name, id_token",
+        )
+        .bind(id_hash)
+        .bind(now)
+        .bind(now - absolute)
+        .bind(now - idle)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| AdminSession {
+            subject: r.get("subject"),
+            display_name: r.get("display_name"),
+            id_token: r.get("id_token"),
+        }))
+    }
+
+    /// End one session (sign-out) and return what the provider's logout needs, or `None` when there was none.
+    pub async fn end_admin_session(&self, id_hash: &str) -> Result<Option<AdminSession>, DbError> {
+        // Delete and return in one statement: the provider's logout needs the stored ID token.
+        let row =
+            sqlx::query("DELETE FROM lib.admin_sessions WHERE id_hash = $1 RETURNING subject, display_name, id_token")
+                .bind(id_hash)
+                .fetch_optional(&self.pool)
+                .await?;
+        // The caller shows the name and uses the stored token for the provider's logout; nothing else is read back.
+        Ok(row.map(|r| AdminSession {
+            subject: r.get("subject"),
+            display_name: r.get("display_name"),
+            id_token: r.get("id_token"),
+        }))
+    }
+
+    /// End the sessions of one provider session (back-channel logout naming a `sid`). An empty id never matches: sessions made without one must not all end because one logout token carried none.
+    pub async fn end_admin_sessions_by_provider_session(&self, provider_sid: &str) -> Result<u64, DbError> {
+        Ok(sqlx::query("DELETE FROM lib.admin_sessions WHERE provider_sid = $1 AND provider_sid <> ''")
+            .bind(provider_sid)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
+    /// End every session of a person (back-channel logout naming only a `sub`).
+    pub async fn end_admin_sessions_by_subject(&self, subject: &str) -> Result<u64, DbError> {
+        Ok(sqlx::query("DELETE FROM lib.admin_sessions WHERE subject = $1")
+            .bind(subject)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
+    /// Delete what has expired: sign-ins older than `login_max_age` and sessions outside either lifetime. Returns the rows removed.
+    pub async fn purge_admin_sessions(
+        &self,
+        login_max_age: Duration,
+        idle: Duration,
+        absolute: Duration,
+        now: OffsetDateTime,
+    ) -> Result<u64, DbError> {
+        // Sign-ins that were started and never finished.
+        let logins = sqlx::query("DELETE FROM lib.admin_login_attempts WHERE created_at <= $1")
+            .bind(now - login_max_age)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        // Sessions past their absolute or idle limit (they could not be used anyway; this keeps the table small).
+        // Either limit alone is enough to delete one.
+        let sessions = sqlx::query("DELETE FROM lib.admin_sessions WHERE created_at <= $1 OR last_seen_at <= $2")
+            .bind(now - absolute)
+            .bind(now - idle)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(logins + sessions)
+    }
+}
