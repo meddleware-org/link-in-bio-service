@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.0.9] - 2026-11-27
+
 - **Documentation pass (workspace documentation standard, D144).** Every file has a header and line-level comments, and every item,
   struct field and enum variant has a doc comment; `missing_docs` and `clippy::missing_docs_in_private_items` are `deny` in the workspace
   lints. `CONTRIBUTING.md` is new. Applied migrations are untouched (their checksums include comments). Doc fixes found on the way: a
