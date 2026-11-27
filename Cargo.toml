@@ -32,7 +32,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.154", features = ["preserve_order"] }
 thiserror = "=2.0.21"
 # Links, addresses and hosts.
-url = "=2.5.8"
+url = "=2.5.9"
 unicode-segmentation = "=1.13.3"
 unicode-normalization = "=0.1.26"
 # The page's HTML, built with automatic escaping.
