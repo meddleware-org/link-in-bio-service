@@ -167,7 +167,7 @@ fn oidc_config(fake: &Fake) -> OidcConfig {
         client_id: CLIENT.0.into(),
         client_secret: CLIENT.1.into(),
         redirect_uri: format!("{ORIGIN}/auth/callback"),
-        post_logout_uri: format!("{ORIGIN}/"),
+        post_logout_uri: format!("{ORIGIN}/admin/"),
         internal_base: None,
         authz_base: format!("{}/stores/s", fake.base),
         authz_key: Some("pdp-key".into()),
@@ -382,7 +382,7 @@ async fn a_complete_sign_in_opens_the_api_and_sign_out_ends_it() {
     let url = out.body["redirect"].as_str().expect("redirect");
     assert!(url.starts_with(&format!("{}/protocol/openid-connect/logout?", e.fake.issuer())), "{url}");
     assert!(!param(url, "id_token_hint").is_empty());
-    assert_eq!(param(url, "post_logout_redirect_uri"), format!("{ORIGIN}/"));
+    assert_eq!(param(url, "post_logout_redirect_uri"), format!("{ORIGIN}/admin/"));
     assert!(out.cookies.iter().any(|c| c.starts_with("__Host-lib-admin=;") && c.contains("Max-Age=0")));
     assert_eq!(
         call(&e, "GET", "/api/v1/admin/me", &[("cookie", session)], None).await.status,

@@ -70,8 +70,9 @@ async fn callback(
     // The browser's binding cookie, if it sent one.
     let binding = cookie_of(&headers, o.binding_cookie_name());
     let done = o.complete(&state.store, &pairs, binding).await?;
-    // The console is at the root of this host; the session cookie is set and the sign-in cookie cleared in the same answer.
-    Ok(plain(StatusCode::FOUND, Some("/"), &[&done.session_cookie, &done.clear_binding], Body::empty()))
+    // The console's pages are under /admin/ on this host (the root is the account app's page, which this host does not serve an API for); the session cookie is set and the
+    // sign-in cookie cleared in the same answer.
+    Ok(plain(StatusCode::FOUND, Some("/admin/"), &[&done.session_cookie, &done.clear_binding], Body::empty()))
 }
 
 /// `POST /auth/logout`: the console calls it with `fetch` (so the CSRF header and `Origin` are present) and then opens the URL in the answer.

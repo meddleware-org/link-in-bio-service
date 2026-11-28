@@ -257,7 +257,8 @@ impl App {
                     client_secret: read_secret(&o.client_secret_file)?,
                     admin_origin: o.admin_origin.clone(),
                     redirect_uri: format!("{}/auth/callback", o.admin_origin),
-                    post_logout_uri: format!("{}/", o.admin_origin),
+                    // The console's own pages, not the root (the account app's page).
+                    post_logout_uri: format!("{}/admin/", o.admin_origin),
                     internal_base: o.internal_base.clone(),
                     authz_base: o.authz_url.clone(),
                     authz_key: o.authz_key_file.as_deref().map(read_secret).transpose()?,

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## [0.0.12] - 2026-11-28
+
+- A completed sign-in (and a sign-out) now leaves the browser at `/admin/`, the console's own pages, instead of `/`, which is the account app's page: the console host serves no app API, so the app's page showed "This server does not offer that." The Keycloak client's post-logout address is `/admin/` too.
+
 ## [0.0.11] - 2026-11-27
 
 - (The tag `v0.0.10` was pushed first, but its release stopped at the verification step, because the committed OpenAPI documents carry the crate version and were not regenerated; nothing was published under it. This is the same change, released as 0.0.11.)
