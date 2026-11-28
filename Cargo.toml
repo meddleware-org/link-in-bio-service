@@ -51,23 +51,23 @@ axum = { version = "=0.8.9", default-features = false, features = ["http1", "jso
 tower = { version = "=0.5.3", default-features = false, features = ["util", "limit", "timeout"] }
 tower-http = { version = "=0.7.1", default-features = false, features = ["timeout", "limit"] }
 tokio = { version = "=1.54.1", default-features = false }
-clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+clap = { version = "=4.6.10", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "json", "env-filter", "ansi"] }
 # Property tests of the parser and the renderer.
 proptest = "=1.12.0"
 # The database driver, with the TLS stack and the migration runner, and no other driver.
-sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "time", "uuid"] }
+sqlx = { version = "=0.9.1", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "time", "uuid"] }
 # Time, ids, encodings and the crypto the sign-in and the billing adapters use.
 time = { version = "=0.3.55", default-features = false, features = ["std", "formatting", "parsing", "macros"] }
-uuid = { version = "=1.29.0", default-features = false, features = ["std", "v4", "serde"] }
+uuid = { version = "=1.29.3", default-features = false, features = ["std", "v4", "serde"] }
 base64 = "=0.23.1"
 ring = "=0.17.14"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Outbound HTTP to payment providers, banks, wallets and the screening services.
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2"] }
 # Lets the payment port be a trait object.
-async-trait = "=0.1.89"
+async-trait = "=0.1.92"
 # Passkeys (kanidm's WebAuthn implementation; MPL-2.0, listed in deny.toml as a reviewed exception).
 webauthn-rs = { version = "=0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 # The access gate's core crate, whose Sui signature verifier the wallet sign-in reuses.
