@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Link in Bio admin API",
-    "version": "0.0.12",
+    "version": "0.0.13",
     "description": "The operator console's API, behind Cloudflare Access and the LinkInBio Keto role.",
     "license": {
       "name": "0BSD",

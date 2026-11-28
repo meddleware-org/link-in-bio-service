@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## [0.0.13] - 2026-11-28
+
+- A 401 from a console that accepts OpenID Connect sessions (`ADMIN_AUTH` `both` or `oidc`) names where a sign-in starts (`"signIn": "/auth/login"`), so the console UI can offer a sign-in link instead of asking for a reload; an Access-only console answers as before. Used by link-in-bio-ui 0.0.8.
+
 ## [0.0.12] - 2026-11-28
 
 - A completed sign-in (and a sign-out) now leaves the browser at `/admin/`, the console's own pages, instead of `/`, which is the account app's page: the console host serves no app API, so the app's page showed "This server does not offer that." The Keycloak client's post-logout address is `/admin/` too.

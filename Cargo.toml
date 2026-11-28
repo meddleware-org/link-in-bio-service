@@ -8,7 +8,7 @@ members = ["crates/core", "crates/assets", "crates/store", "crates/auth", "crate
 
 # Fields every crate inherits, so a release changes one version in one place.
 [workspace.package]
-version = "0.0.12"
+version = "0.0.13"
 edition = "2024"
 rust-version = "1.94"
 # The licence of every Meddleware repository.

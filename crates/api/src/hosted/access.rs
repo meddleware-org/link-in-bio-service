@@ -308,6 +308,27 @@ pub(super) fn cookie_of<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a st
         .filter(|v| !v.is_empty())
 }
 
+/// The 401 answer. When the OpenID Connect path is accepted it also names where a sign-in starts (`signIn`), so the console can send the person there instead of guessing;
+/// a process that accepts only Cloudflare Access says nothing extra (the edge does the sign-in).
+fn unauthorized(app: &Shared) -> Response {
+    // The same answer as every other 401, with the hint added only when this process has the routes.
+    let mut r = ApiError::Unauthorized.into_response();
+    if app.oidc.is_some() && app.admin_auth.accepts_session() {
+        let body = serde_json::json!({ "error": ApiError::Unauthorized.to_string(), "code": "unauthorized", "signIn": "/auth/login" });
+        let status = r.status();
+        let headers = r.headers().clone();
+        r = (status, axum::Json(body)).into_response();
+        *r.headers_mut() = headers_with_json(headers);
+    }
+    r
+}
+
+/// The headers of the original answer (no-store), with the content type of the new JSON body.
+fn headers_with_json(mut h: HeaderMap) -> HeaderMap {
+    h.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json"));
+    h
+}
+
 /// The middleware of every admin route. Without any configured sign-in the console is closed (503).
 pub async fn require_admin(State(app): State<Shared>, mut req: Request, next: Next) -> Response {
     // The origin a write must come from: the OpenID Connect settings' when that path is on, else the Access settings'. Without either the console is closed.
@@ -322,7 +343,7 @@ pub async fn require_admin(State(app): State<Shared>, mut req: Request, next: Ne
         Ok(Some(o)) => o,
         Ok(None) => match identify_by_access(&app, req.headers()).await {
             Ok(Some(o)) => o,
-            Ok(None) => return ApiError::Unauthorized.into_response(),
+            Ok(None) => return unauthorized(&app),
             Err(e) => return e.into_response(),
         },
         Err(e) => return e.into_response(),
